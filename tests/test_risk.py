@@ -427,10 +427,10 @@ def test_block_market_closed() -> None:
     assert blocked_with(run_check(now=saturday, q=quote(ts=saturday)), "market is closed")
 
 
-def test_block_live_with_delayed_data_for_stocks() -> None:
-    assert blocked_with(run_check(mode=Mode.LIVE, delayed=True), "delayed market data")
-    assert blocked_with(run_check(mode=Mode.LIVE, q=quote(delayed=True)), "delayed market data")
-    assert run_check(mode=Mode.PAPER, delayed=True).approved
+@pytest.mark.parametrize("mode", list(Mode))
+def test_block_all_modes_with_delayed_data_for_stocks(mode: Mode) -> None:
+    assert blocked_with(run_check(mode=mode, delayed=True), "delayed market data")
+    assert blocked_with(run_check(mode=mode, q=quote(delayed=True)), "delayed market data")
 
 
 def test_crypto_allowed_live_with_delayed_data() -> None:
@@ -458,7 +458,9 @@ def test_block_stale_quote() -> None:
 
 def test_delayed_quote_gets_extra_age() -> None:
     q = quote(ts=NOW - timedelta(minutes=10), delayed=True)
-    assert run_check(q=q).approved
+    verdict = run_check(q=q)
+    assert blocked_with(verdict, "delayed market data")
+    assert not any("stale" in reason for reason in verdict.reasons)
 
 
 def test_block_qty_rounds_to_zero() -> None:
@@ -569,14 +571,17 @@ def test_soft_halt_at_target() -> None:
     assert rm.halt_reason(account=account(equity=599), day=day()) is None
 
 
-def test_profit_target_defaults_to_a_percent_of_start_equity() -> None:
-    """1.5% of start equity, not a fixed $100 (~16% of a $600 account)."""
+def test_profit_target_is_off_by_default_and_a_percent_of_start_equity() -> None:
+    """No default target (owner decision); a chosen percent is of start equity."""
     fresh = RiskLimits()
-    assert fresh.daily_profit_target_pct == 1.5
+    assert fresh.daily_profit_target_pct == 0.0
     assert fresh.daily_profit_target_usd is None
-    assert fresh.profit_target_usd(600) == pytest.approx(9.0)
-    assert fresh.profit_target_usd(None) == 0.0
-    rm = RiskManager(fresh)
+    assert fresh.profit_target_usd(600) == 0.0
+    assert RiskManager(fresh).halt_reason(account=account(equity=900.0), day=day()) is None
+    chosen = RiskLimits(daily_profit_target_pct=1.5)
+    assert chosen.profit_target_usd(600) == pytest.approx(9.0)
+    assert chosen.profit_target_usd(None) == 0.0
+    rm = RiskManager(chosen)
     # 1.5% of the $500 start is $7.50.
     reason = rm.halt_reason(account=account(equity=507.5), day=day())
     assert reason is not None and reason.startswith(HALT_TARGET) and "1.5%" in reason
@@ -585,7 +590,7 @@ def test_profit_target_defaults_to_a_percent_of_start_equity() -> None:
     legacy = RiskLimits.model_validate({"daily_profit_target_usd": 80, "max_daily_loss_pct": 6})
     assert legacy.daily_profit_target_pct is None
     assert legacy.profit_target_usd(600) == 80
-    again = RiskLimits.model_validate_json(fresh.model_dump_json())
+    again = RiskLimits.model_validate_json(chosen.model_dump_json())
     assert again.daily_profit_target_pct == 1.5
     assert again.profit_target_usd(600) == pytest.approx(9.0)
 
@@ -601,22 +606,23 @@ def _legacy_settings_json(*, usd: object, pct_key: bool = False, pct: object = N
 
 
 def test_untouched_100_dollar_target_migrates_once(db) -> None:
-    """Exactly $100 with no percent key was the old default, not a choice."""
+    """Exactly $100 with no percent key was the old default, not a choice: it becomes the
+    current default, no target."""
     db.set_kv("settings", _legacy_settings_json(usd=100))
     loaded = db.get_settings()
-    assert loaded.risk.daily_profit_target_pct == 1.5
+    assert loaded.risk.daily_profit_target_pct == 0.0
     assert loaded.risk.daily_profit_target_usd is None
-    assert loaded.risk.profit_target_usd(600) == pytest.approx(9.0)
+    assert loaded.risk.profit_target_usd(600) == 0.0
     stored = db.get_kv("settings")
     assert stored is not None
     saved = json.loads(stored)["risk"]
-    assert saved["daily_profit_target_pct"] == 1.5
+    assert saved["daily_profit_target_pct"] == 0.0
     assert saved["daily_profit_target_usd"] is None
-    assert db.get_settings().risk.daily_profit_target_pct == 1.5
+    assert db.get_settings().risk.daily_profit_target_pct == 0.0
     assert db.get_kv("settings") == stored  # one write, then stable
 
     db.set_kv("settings", _legacy_settings_json(usd=100.0))
-    assert db.get_settings().risk.daily_profit_target_pct == 1.5
+    assert db.get_settings().risk.daily_profit_target_pct == 0.0
 
 
 def test_other_dollar_targets_and_explicit_100_are_not_migrated(db) -> None:

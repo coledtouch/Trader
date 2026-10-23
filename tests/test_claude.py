@@ -712,6 +712,12 @@ def test_render_context_includes_target_and_loss_limit():
     assert "2026-10-21 15:00 UTC (11:00 New York)" in text
 
 
+def test_render_context_with_no_profit_target():
+    text = render_context(rich_ctx())  # the default: no target
+    assert "profit target: none (only the daily loss limit stops new entries)" in text
+    assert "$0.00 (0% of start equity)" not in text
+
+
 def test_render_context_measures_the_loss_limit_from_the_resume():
     """After the owner resumes a halted day, the engine measures the loss limit from the
     equity at the resume, so the AI must not be told that nothing is left."""

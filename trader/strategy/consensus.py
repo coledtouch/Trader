@@ -183,6 +183,12 @@ def merge(p: _Side, s: _Side, ctx: DecisionContext) -> DecisionBatch:
         refused=p.batch.refused or s.batch.refused,
         error="; ".join(errors) or None,
         votes={p.name: list(p.batch.decisions), s.name: list(s.batch.decisions)},
+        vote_costs={p.name: p.batch.cost_usd, s.name: s.batch.cost_usd},
+        vote_failures={
+            side.name: side.batch.error or ("refused" if side.batch.refused else "failed")
+            for side in (p, s)
+            if side.failed
+        },
     )
 
 

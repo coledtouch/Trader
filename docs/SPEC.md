@@ -15,7 +15,8 @@ Owner context that shapes the design:
   until IBKR adopts FINRA's 2026 intraday-margin rule).
 - Owner's stated goal: "$100/day minimum". That is ~13–40% per day on this capital. It is
   **not achievable reliably**; chasing it is the classic way small accounts blow up.
-  The app shows the target and progress toward it, but **no code path may increase risk
+  New settings default the optional target to $0 (off); saved targets are retained as
+  secondary references. **No code path may increase risk
   because the bot is behind its target** (no martingale, no "make it back" sizing).
 - Inspiration: a Reddit post where a Grok agent was given a $20K *paper* account and a
   "$1K/day minimum" quota on thin small caps. Lessons from that thread that are
@@ -48,7 +49,11 @@ Safety rules (enforced in code, covered by tests):
   writing; no leverage beyond `max_total_exposure_pct` (≤100%).
 - Hard caps in `trader.models.HARD_CAPS` clamp user settings.
 - Daily loss limit → halt (and flatten if `flatten_on_halt`). Resume requires TOTP.
-- In LIVE mode, block stock entries when market data is delayed.
+- Block stock entries in PAPER and LIVE (and any supplied SIM quote) when the global
+  stock feed or the per-symbol quote is delayed; receipt freshness does not override it.
+- Before paid entry analysis, size and risk-check scanner proposals at their largest
+  permitted size. Journal blocked candidates and exact reasons; final sends and approvals
+  repeat the checks. Existing bot-owned positions may still receive paid exit reviews.
 - Block stock entries when `AccountSnapshot.day_trades_remaining` is known and < 1 (the
   engine first subtracts its own same-day round trips closed in the last 5 minutes: IBKR
   refreshes the counter only every few minutes, 7.5).
@@ -87,6 +92,9 @@ trader/
   engine.py            # Engine: loops, orchestration, journal, reconciliation; build_engine()
   notify.py            # Notifier (ntfy) - optional
   backtest.py          # backtester for the rule-based strategy (CLI entry)
+  capture.py           # bounded local decision-cycle observations for research
+  research.py          # offline paired portfolios through the production Engine
+  performance.py       # account-scoped costs, filled setup statistics and observed drawdown
   broker/
     base.py            # Broker ABC                                     [DONE - shared]
     sim.py             # SimBroker (synthetic market, realistic fills)
@@ -117,10 +125,11 @@ Dockerfile, docker-compose.yml, .env.example, README.md, .github/workflows/ci.ym
   `Bar`, `Quote` (`.price`), `Position`, `AccountSnapshot`, `OrderRequest`, `OrderRecord`,
   `Fill`, `Candidate`, `AIDecision`, `DecisionBatch`, `RiskLimits`, `HARD_CAPS`,
   `LOWER_IS_LOOSER`, `BotSettings`, `RiskVerdict`, `DayStats`, `TradeRecord`,
-  `EngineStatus`, `DecisionContext`.
+  `EngineStatus`, `QuoteHealth`, `OperatingCosts`, `DecisionContext`.
 - `trader/config.py`: `AppConfig` (env prefix `TRADER_`), `get_config()`.
 - `trader/db.py`: `Database` - kv/flags, settings, auth row, sessions, login attempts,
-  audit, decisions, orders, fills, positions_meta, trades, daily_stats, equity.
+  audit, decisions, orders, fills, positions_meta, trades, daily_stats, equity,
+  research_frames. Account reporting begins at kv `journal_account_since`.
 - `trader/broker/base.py`: `Broker` ABC + `BrokerError`; default `round_qty`,
   `close_position`, `flatten_all`.
 
@@ -225,7 +234,8 @@ class RiskManager:
     def effective_limits(self) -> RiskLimits
     def size_entry(self, *, decision: AIDecision, entry: float, stop: float,
                    account: AccountSnapshot, positions: list[Position], day: DayStats,
-                   broker: Broker, allow_fractional: bool) -> tuple[float, list[str]]
+                   broker: Broker, allow_fractional: bool,
+                   open_orders: list[OrderRecord] | None = None) -> tuple[float, list[str]]
     def check(self, req: OrderRequest, *, quote: Quote, account: AccountSnapshot,
               positions: list[Position], open_orders: list[OrderRecord], day: DayStats,
               mode: Mode, data_delayed: bool, broker: Broker,
@@ -236,8 +246,9 @@ class RiskManager:
 Sizing: `risk_usd = start_equity * max_risk_per_trade_pct/100 * size_fraction * streak`
 (streak = 0.5 when `day.loss_streak >= loss_streak_halve_after`), qty = min(risk_usd /
 (entry - stop), max_position_pct·equity/entry, max_order_notional/entry, available cash
-/ entry (settled_cash for cash-like accounts; buying_power capped at equity), remaining
-exposure room / entry), rounded DOWN with `broker.round_qty`. Size never depends on the
+/ entry (minimum of cash, buying_power and equity, less working-buy notional and
+estimated commissions), remaining exposure room after positions and working buys / entry),
+rounded DOWN with `broker.round_qty`. New purchase commission must also fit. Size never depends on the
 daily target or on being behind.
 Entry checks (any failure blocks): halted day; trades_today >= max; open positions >=
 max; already holding the instrument; stop missing or >= entry; target (if given) <=
@@ -245,12 +256,14 @@ entry; reward:risk < min; price < min_price; limit price outside collar vs quote
 notional > max; exposure after fill > max_total_exposure; dollar risk at the stop >
 max_risk_per_trade_pct of start equity; fees (`estimate_commission` BUY at the entry + SELL
 at the target) > max_fee_to_reward_pct of expected reward; stock entry outside entry window or market
-closed; LIVE + delayed data for stocks; day_trades_remaining known and < 1 for stocks;
-quote missing/stale (> 2 × monitor interval for live data); qty rounds to 0.
+closed; delayed data for stocks in every mode; disabled `req.setup`;
+day_trades_remaining known and < 1 for stocks; quote missing/non-finite/crossed/stale
+(> 2 × monitor interval for non-delayed data) or timestamped > 1 s in the future;
+working BUY has no valid price (cash commitment unknown); qty rounds to 0.
 Exits (`is_exit`) are always allowed if they reduce an existing long and never exceed
 the held qty (no accidental shorts).
 Halt reasons: equity <= start_equity × (1 − max_daily_loss_pct/100) → "daily loss limit";
-pnl >= target and stop_trading_at_target → "daily target reached" (a *soft* halt: no new
+pnl >= target with target > 0 and stop_trading_at_target → "daily target reached" (a *soft* halt: no new
 entries, existing positions keep their stops; resets next day).
 
 ### 5.7 `trader/engine.py`
@@ -308,11 +321,17 @@ loop continues; exponential backoff on broker errors; never crash the app):
 - **decision loop** every `cycle_seconds`: skip when halted, disconnected, or nothing is
   tradable now (stocks closed and crypto disabled). Build universe (settings + optional
   scanner movers), fetch bars + quote per instrument (concurrency-limited, per-symbol
-  errors tolerated), run Scanner, build `DecisionContext`. Call the LLM only if there is
-  a candidate scoring >= `llm_min_candidate_score` or an open position the engine opened
+  errors tolerated), run Scanner and journal every emitted candidate (including
+  unaffordable and disabled setups). Size the scanner's proposed ask/stop/target at
+  `size_fraction=1`, reserving working-buy notional and fees, and run the full risk check
+  on the refreshed account/cache. Pending approvals, settling trades, in-flight metadata
+  and unconfirmed halts also exclude entry proposals. Only eligible candidates enter
+  `DecisionContext`. Call the LLM only if there is an eligible
+  candidate scoring >= `llm_min_candidate_score` or an open position the engine opened
   (positions_meta) to manage and
   today's LLM cost < budget; otherwise use the rule-based maker (and log why). Journal
-  the batch (`insert_decision`), update `DayStats.llm_cost`. For each decision: BUY →
+  the batch (`insert_decision`), including full eligibility reasons, capture the bounded
+  research frame with decision-time settings, and update `DayStats.llm_cost`. For each decision: BUY →
   (under the entry lock, on a fresh clock, quote, account, positions and working orders,
   never the pre-LLM context; dropped when older than `DECISION_MAX_AGE`, 7.5) build
   `OrderRequest` (LIMIT at decision limit or quote ask/last; stop/target from the
@@ -323,7 +342,9 @@ loop continues; exponential backoff on broker errors; never crash the app):
   CLOSE → `broker.close_position`, only for a position with positions_meta (otherwise
   journaled BLOCKED "not opened by the bot"). HOLD → nothing.
 - `approve_order` re-runs the full risk check with fresh data before sending; pending
-  approvals expire after 10 minutes (→ CANCELLED, "approval expired").
+  approvals expire after 10 minutes (→ CANCELLED, "approval expired"). A setup disabled
+  after proposal is blocked at send/approval; an explicitly named model setup cannot be
+  silently relabeled as another candidate's setup.
 - All owner actions (start/stop/kill/resume/arm/disarm/approve/reject/settings) are
   written to the audit log by the web layer; engine-originated events (halts, flatten,
   reconnects) are audited with actor "engine".
@@ -335,7 +356,10 @@ loop continues; exponential backoff on broker errors; never crash the app):
 ### 5.8 `trader/notify.py`
 `Notifier(config)` with `async send(title, message, priority="default", tags=None)`; no-op
 when `ntfy_url` is unset; never raises (log failures); 5 s timeout; rate limit duplicate
-messages (same title within 60 s).
+messages (same title within 60 s after successful HTTP 2xx acceptance). A lock plus an
+in-flight title set suppress concurrent duplicates. Failed HTTP/network attempts do not
+start the dedupe window and can retry immediately; cancellation releases the in-flight
+reservation. Topic/token secrets never appear in logs.
 
 ### 5.9 `trader/broker/sim.py`
 `SimBroker(seed, starting_cash, clock=utcnow, commission_plan="tiered", *,
@@ -409,7 +433,7 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
   (or `Referer`) that equals the request's own origin or one of `public_origins`.
 - Step-up: `/api/live/arm`, `/api/bot/resume`, and settings changes that loosen any
   risk limit (vs current; see `LOWER_IS_LOOSER`), enable autopilot while live, switch
-  off `flatten_stocks_before_close`, or leave consensus decisions (another
+  off `flatten_stocks_before_close`, re-enable any previously disabled setup, or leave consensus decisions (another
   `decision_mode`, or `llm_enabled` off while in consensus) require a fresh `totp` field
   in the body (replay-protected).
 - Middleware: TrustedHostMiddleware (`allowed_hosts`), security headers on every
@@ -462,6 +486,9 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
 | POST | `/api/orders/{id}/reject` | - | `OrderRecord`; 409 if not pending |
 | GET | `/api/signals?limit=100&setup=` | - | `[SignalRecord]` (limit ≤ 500) |
 | GET | `/api/signals/stats?days=30` | - | `[SetupStats]` |
+| GET | `/api/performance?days=30` | - | Account-scoped economic report and actual filled-trade setup statistics (days 1–90) |
+| GET | `/api/research?days=30` | - | Replay status, frame count, cached report, limitations and stale-cohort indication |
+| POST | `/api/research/run` | `{"days": 30}` | 202 background replay; 409 if running or no captured cycles; session + CSRF required |
 
 Datetimes serialize as ISO-8601 strings (pydantic `model_dump(mode="json")`).
 Errors: rate-limited login/step-up → 429 `{"detail": "too many failed attempts"}`; PUT
@@ -477,8 +504,10 @@ laptop. No external requests. Files: `login.html` + `login.js`, `index.html` + `
 `sw.js` (cache the static shell only; never cache `/api/*`; network-first for HTML),
 `icon.svg` (+ PNG icons generated if feasible).
 Views (bottom tab bar on phones, top tabs on desktop):
-- **Dashboard**: mode badge (SIM / PAPER / LIVE-SHADOW / LIVE-ARMED, color coded),
-  connection + market-open + delayed-data indicators, equity, today's P&L vs target
+- **Dashboard**: primary all-in P&L/cost completeness, net expectancy and observed
+  drawdown; mode badge (SIM / PAPER / LIVE-SHADOW / LIVE-ARMED, color coded),
+  connection + market-open + delayed-data indicators, per-symbol receipt ages, equity,
+  today's trading P&L with optional secondary target
   (progress bar that also shows the loss limit), trades today / max, LLM cost today /
   budget, open positions (qty, avg, last, unrealized P&L, stop, target), pending
   approvals with Approve / Reject buttons, halt banner with reason, big buttons:
@@ -489,6 +518,7 @@ Views (bottom tab bar on phones, top tabs on desktop):
   block reasons), closed trades (P&L, R), equity chart (inline SVG line chart drawn in
   JS, last 30 days), daily stats table.
 - **Settings**: form for BotSettings incl. nested risk limits, showing hard caps;
+  five `enabled_setups` switches and nullable monthly hosting/data estimates;
   universe editors (comma-separated); save → if the server answers 403
   step_up_required, prompt for a 2FA code and retry; Live trading card: shows whether
   live is allowed by the server, Arm (2FA) / Disarm; audit log list; Logout.
@@ -574,9 +604,9 @@ for the open to settle; time stops; size small.
   passes `last_halt_at`); `quote.spread_pct` missing (for stocks) or > `max_spread_pct`;
   fee check uses `broker.estimate_commission` for BOTH legs (buy at entry, sell at target).
 - **Engine**:
-  - Prefilter the universe before scanning/LLM: skip symbols whose 1 unit (stocks: 1
-    share unless fractional) costs more than the max position size or available cash;
-    skip leveraged ETFs unless allowed. Log skipped symbols once per day, not every cycle.
+  - Exclude leveraged ETFs from the universe unless allowed. Affordability is checked
+    after scanning so unaffordable emitted candidates still reach the signal ledger.
+    Run the full entry eligibility filter before any paid entry analysis (5.7).
   - Track `last_halt_at` per symbol from quotes (`halted=True`).
   - Mark positions at `quote.exit_price` (bid) for unrealized P&L, stops, targets, R.
   - **Signal ledger**: every scanner candidate that passes the scanner's own filters is
@@ -609,10 +639,12 @@ for the open to settle; time stops; size small.
   once on unknown `kid`), `aud` contains `cf_access_aud`, `iss == https://<team_domain>`,
   `exp`/`nbf` with 60 s leeway; reject with 403 otherwise. Implement with `cryptography`
   (no new dependencies). Tests use a locally generated RSA key and a stubbed JWKS fetch.
-- **Frontend**: a **Signals** view (tab) showing `/api/signals/stats` per setup (signals,
-  taken, evaluated, target-first %, avg R at close, MFE/MAE) with a clear "N < 30: too
-  few to judge" badge, plus the latest signals list (time, symbol, setup, score, taken /
-  skip reason, outcome). Dashboard P&L copy: "valued at the bid".
+- **Frontend**: a **Signals** view (tab) showing `/api/signals/stats` gross diagnostics
+  per setup (signals, taken, evaluated, target-first %, avg R at close, MFE/MAE), separate
+  actual filled-trade setup results and paired research replay. Thirty signals are an
+  inspection threshold, never proof of edge; no count certifies profitability. Latest
+  signals show time, symbol, setup, score, taken / exact skip reason and gross outcome.
+  Dashboard trading P&L copy: "valued at the bid".
 - **Deploy/docs**: Cloudflare Tunnel is the primary access path: a `cloudflared` service
   in docker-compose (`cloudflare/cloudflared` image pinned to a version tag, `tunnel
   --no-autoupdate run`, `TUNNEL_TOKEN` from `.env`), public hostname `desk.kaxo.dev` →
@@ -865,9 +897,10 @@ Contracts changed by the confirmed review findings (each has a regression test).
   before the send. A reject during the price fetch cancels the order; it is not sent.
 - **Autopilot** defaults to off (`BotSettings.autopilot`).
 - **`HARD_CAPS["max_order_notional_usd"] = 5000`**.
-- **Daily profit target** is `daily_profit_target_pct` (default 1.5% of start-of-day
-  equity). `Database.get_settings` rewrites a saved blob whose dollar target is the
-  untouched old default of exactly $100 and which has no percent key, to 1.5% (once).
+- **Daily profit target** is `daily_profit_target_pct` (default 0 = off since the merge in
+  7.10). `Database.get_settings` rewrites a saved blob whose dollar target is the
+  untouched old default of exactly $100 and which has no percent key, to that default
+  (once).
   Any other dollar amount, or a blob that already names the percent (even as null),
   keeps that choice, and `RiskLimits.profit_target_usd` still uses the saved dollars
   when the percent is empty. The settings form shows an empty percent or dollar field
@@ -928,3 +961,69 @@ every execution on the account (another client's order id is stored as `perm:<pe
 and `_sync_fills` / `replay_fills` match them to the bot's buys by instrument. The round
 trip, including P&L, is journaled when the app next syncs. The exit reason is inferred
 from the stop or target when this client has no order row for that perm id.
+
+### 7.9 Economic reporting and paired research (2026-10-23)
+
+- `BotSettings.enabled_setups` is a validated list of the five scanner setup names,
+  defaulting to all five; an empty list pauses all setup entries. Removing a setup is
+  tightening; adding one requires fresh TOTP. Disabled candidates remain diagnostics.
+- The daily profit target defaults to off (see 7.7 and 7.10 for the field). Existing
+  saved explicit targets are kept. Target display is secondary to net outcomes.
+- `BotSettings.operating_costs` has nullable `hosting_monthly_usd` and
+  `data_monthly_usd`. Null means unknown, explicit 0 means free. Owner's current hosting
+  dashboard estimate is $24/month; market-data pricing is unknown pending approval.
+- `EngineStatus.quote_health` lists symbol, transport/broker timestamp age, delayed and
+  valid flags from cached observations. A freshly received delayed price is still
+  delayed. No subscription entitlement is inferred from a recent receipt timestamp or
+  the request for data type 1. Type 3 remains useful for diagnostics; verified real-time
+  data is required for meaningful PAPER and LIVE stock entries.
+- `performance_report` scopes history to kv `journal_account_since` (set on initial
+  account bind, account change and SIM construction). Trading P&L aggregates recorded
+  daily equity changes, including open P&L and commissions, with recorded cash-flow
+  baseline adjustments. Filled-trade expectancy already subtracts commissions; do not
+  deduct them again. Subtract recorded AI token-price estimates and calendar-prorated
+  current monthly hosting/data inputs for all-in P&L. Missing monthly inputs leave
+  `all_in_pnl` null and expose `known_cost_pnl`; reconcile estimates with invoices.
+  Costs accrue over recorded coverage, including weekends, not only trading sessions.
+  First-day aggregates can be partial. Drawdown uses daily observations and can miss
+  worse intraday losses; short histories are not annualized.
+- Actual filled-trade setup statistics stay separate from gross signal excursions.
+  Exploratory expectancy intervals resample New York exit-day groups, 500 resamples
+  after at least five observed days. They do not adjust for multiple testing or certify
+  an edge; neither 30 nor 100 signal rows is sufficient evidence by itself.
+- `capture_cycle` stores up to 2,500 compact `scanner_snapshot_v1` research frames,
+  with observed quotes, all scanner candidates, original indicator features, actual batch/votes,
+  decision-time settings, account/mode provenance and a cohort fingerprint. No API
+  credentials are captured. Failure to capture never interrupts trading protection.
+  Each frame's `bars` is empty; scanner-snapshot replay consumes the original candidates
+  and features directly and cannot rescan historical bars. The CSV route performs rescans.
+  `DecisionBatch.vote_costs` and `vote_failures` preserve available per-model economics.
+- `research.replay_experiment` uses independent in-memory portfolios, the production
+  `Engine`, scanner/risk/exits and production consensus logic. It connects to no broker,
+  calls no model API and invents no historical votes. Missing required model votes or
+  per-model costs leave model-cost/all-in comparisons null rather than zero.
+  Replay all-in P&L subtracts model costs only; primary performance reports shared
+  hosting/data estimates separately. No unobserved final liquidation is forced.
+- Captured-vote replay is conditioned on original-account model inputs, not each
+  alternative portfolio. Sparse decision-cycle observations can miss intracycle moves,
+  monitor confirmations and executable exit opportunities. The API selects at most
+  1,000 frames from the latest uninterrupted account/settings cohort; changed cohorts
+  invalidate the cached report. Mixed cohorts are rejected by the replay.
+- CLI: `python -m trader research --database data/trader.db --save-report` uses captured
+  observations; `python -m trader research --csv F=history.csv --settings frozen.json`
+  uses real OHLCV bars with the same Engine and rules only. CSV quotes infer spreads
+  and slippage and cannot reconstruct intrabar execution. The legacy synthetic
+  `backtest` command remains a mechanics check, not profitability validation.
+- POSIX permission tests assert restrictive modes on Unix; Windows checks are conditional
+  because Windows file access is controlled by ACLs, including inherited parent ACLs.
+  A passing Windows suite does not establish Linux deployment permissions.
+
+### 7.10 Merge of 7.7/7.8 (Cursor) and 7.9 (Codex), owner decisions (2026-10-23)
+
+- Both lines were developed in parallel from the same base and merged into
+  `claude/great-cerf-xuihf3`; the server tracks that branch.
+- **Profit target**: the owner chose no default target. The percent field of 7.7 stays
+  (`daily_profit_target_pct`, with the dollar fallback and the one-time $100 migration),
+  with `DEFAULT_DAILY_PROFIT_TARGET_PCT = 0`. A target of 0 never halts.
+- **Settings form**: number fields marked `optional` (7.7) or `nullable` (7.9) both
+  accept an empty value, sent as null.

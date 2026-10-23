@@ -28,7 +28,7 @@ secrets live, what gets logged, and what to do when a device is lost.
  [5] Session protections ----- secure cookie, CSRF token + Origin check, idle timeout
    |
  [6] Step-up 2FA ------------- fresh code to arm live trading, resume after a halt,
-   |                           loosen any risk limit, or enable autopilot while live
+   |                           loosen risk, re-enable a setup, or enable autopilot while live
  [7] Live trading gate ------- TRADER_ALLOW_LIVE=true AND a live account AND "armed"
    |
  [8] Risk manager ------------ hard caps in code, long only, stop on every entry
@@ -45,7 +45,7 @@ secrets live, what gets logged, and what to do when a device is lost.
 | Someone reaches the droplet directly, skipping Cloudflare | Nothing listens on the internet except SSH: ufw allows only SSH, the tunnel is an outbound connection, and the app's port is published on `127.0.0.1` only. With `TRADER_CF_ACCESS_TEAM_DOMAIN`/`TRADER_CF_ACCESS_AUD` set, the app also refuses any request without a valid, signed Cloudflare Access token for your application (checked against your team's public keys, audience, issuer and expiry). Those two values are required when `TRADER_ALLOW_LIVE=true`: the app will not start without them. Paper and simulator mode can leave them empty. Login rate limits use `CF-Connecting-IP` only; a missing header falls back to the socket peer, not `X-Forwarded-For`. |
 | Your password leaks | Useless without the 2FA code. Each code works only once (replay protection). |
 | Another website tries to act with your logged-in browser | Session cookie is `HttpOnly`, `Secure`, `SameSite=Strict` with the `__Host-` prefix; every change needs a CSRF token and a matching `Origin`. Sessions end after 30 minutes without you using the app (the dashboard's automatic refresh does not count, so an unattended open tab signs out too) or after 12 hours. |
-| Someone picks up your unlocked phone with the app open | Arming live trading, resuming after a halt, loosening risk limits (including raising "halve size after N losses"), enabling autopilot while live, leaving consensus decisions and turning off "flatten stocks before the close" all need a **fresh** 2FA code. Disarm, stop and KILL need no code: they never open a position. **Disarm** blocks new entries; the bot keeps managing exits for the positions it opened (stops, targets, time stops, flatten before the close, the daily-loss flatten, re-placing a lost stop), because exits only reduce risk. Positions you opened yourself are never touched. |
+| Someone picks up your unlocked phone with the app open | Arming live trading, resuming after a halt, loosening risk limits (including raising "halve size after N losses"), re-enabling a disabled setup, enabling autopilot while live, leaving consensus decisions and turning off "flatten stocks before the close" all need a **fresh** 2FA code. Disarm, stop and KILL need no code: they never open a position. **Disarm** blocks new entries; the bot keeps managing exits for the positions it opened (stops, targets, time stops, flatten before the close, the daily-loss flatten, re-placing a lost stop), because exits only reduce risk. Positions you opened yourself are never touched. |
 | A bug or a misbehaving AI | Real orders need all three gates in [7]. Every order passes the risk manager; hard caps in code clamp any setting; the AI can only shrink size; every stock entry carries a stop at IBKR; daily loss limit halts trading. See [STRATEGY.md](STRATEGY.md). |
 | Abuse of the IB Gateway API (it has no password of its own) | The gateway publishes no ports and sits on its own Docker network (`broker`) that only the trader and crypto-watchdog containers join ([gnzsnz: leaving localhost](https://github.com/gnzsnz/ib-gateway-docker#leaving-localhost)). The watchdog publishes no ports, runs as the same non-root user, and is not on `edge`. cloudflared is on a separate network (`edge`) with the trader only, so even a tunnel route added in the Cloudflare dashboard (by mistake or by someone with access to your Cloudflare account) cannot reach the gateway's API, VNC, or the watchdog. Never add a `ports:` line to them except the temporary loopback-only VNC in DEPLOY.md, and never put cloudflared on the `broker` network. |
 | Docker bypassing the firewall | Docker-published ports skip ufw ([Docker docs](https://docs.docker.com/engine/network/packet-filtering-firewalls/)). Only `127.0.0.1:8000` is published. An optional DigitalOcean Cloud Firewall sits outside the droplet as a second wall. |
@@ -70,6 +70,28 @@ Anthropic (Claude Console), xAI (console.x.ai) and your e-mail.
 | App 2FA secret | `data/trader.db` | Encrypted with `TRADER_SECRET_KEY`. |
 | Login sessions | `data/trader.db` | Only a SHA-256 hash of each session token is stored. |
 | ntfy topic | `.env` | Mode 600. Alerts contain trading events, not secrets. |
+
+The mode-600 statements above describe the Linux droplet. On Windows, protect the
+project directory, `.env`, journal and backups with Windows ACLs, including inherited
+permissions from the parent directory; Unix `0600` is not a Windows access guarantee.
+The test suite asserts POSIX permission bits only on Unix. Passing Windows tests does
+not verify Linux filesystem modes or the deployment's parent-directory permissions.
+
+Research frames are stored in the same private journal and retain up to 2,500 compact
+scanner snapshots containing account identifiers, quotes, original candidates, indicator
+features, settings and model outputs. Historical bars are not duplicated in snapshots;
+these captures cannot be historically rescanned. They contain no API credentials but are still
+private trading data: protect copies and exports like the journal. Offline replay uses
+in-memory broker portfolios and cached opinions; it connects to no broker and calls no
+AI API. The replay POST requires the ordinary session, Origin and CSRF checks and is
+audited; it cannot arm trading or bypass entry risk controls.
+
+Entry eligibility runs before paid entry analysis and repeats before sends/approvals.
+Delayed stock data blocks PAPER and LIVE entries, independent of receipt age. Turning a
+setup off invalidates its pending entry approvals; exits for held positions continue.
+Failed ntfy deliveries remain immediately retryable, while in-flight duplicates and
+successfully delivered duplicate titles are suppressed. Delivery failures never stop
+position protection.
 
 Honest limits:
 

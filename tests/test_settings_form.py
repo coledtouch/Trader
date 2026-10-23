@@ -96,6 +96,7 @@ globalThis.document = {
 for (const id of [
   'settings-fields', 'llm-note', 'settings-error', 'settings-form', 'settings-status',
   'startstop-btn', 'arm-btn', 'disarm-btn', 'settings-save', 'settings-discard',
+  'research-run',
 ]) {
   const node = document.createElement('div');
   node.setAttribute('id', id);
@@ -168,7 +169,7 @@ console.log(JSON.stringify({
 def test_empty_profit_target_fields_are_editable() -> None:
     fresh = BotSettings().model_dump(mode="json")
     shown = _run_form(fresh)
-    assert shown["shown"]["pct"] == "1.5"
+    assert shown["shown"]["pct"] == "0"  # the owner's default: no target
     assert shown["shown"]["usd"] == ""
     assert shown["shown"]["pctOptional"] == "true"
     assert shown["shown"]["usdOptional"] == "true"

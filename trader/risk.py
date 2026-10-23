@@ -84,6 +84,10 @@ def quote_problem(quote: Quote) -> str | None:
     ask) and bids far from the last trade / mid are typical of bad ticks, thin pre-market
     books and stale feeds; acting on them would sell (or value the account) at a price
     that is not really there."""
+    for name in ("bid", "ask", "last"):
+        value = getattr(quote, name)
+        if value is not None and not math.isfinite(value):
+            return f"non-finite {name}"
     bid, ask = quote.bid, quote.ask
     if bid is not None and ask is not None and bid > 0 and ask > 0 and bid > ask:
         return f"crossed quote (bid {bid:g} > ask {ask:g})"
@@ -122,6 +126,21 @@ def working_buy_notional(open_orders: list[OrderRecord]) -> float:
     return total
 
 
+def working_buy_fees(open_orders: list[OrderRecord], broker: Broker) -> float:
+    """Reserve commission as well as notional while a buy is still working."""
+    return sum(
+        broker.estimate_commission(
+            o.request.instrument,
+            max(0.0, o.request.qty - o.filled_qty),
+            o.request.limit_price or o.avg_fill_price or 0.0,
+        )
+        for o in open_orders
+        if o.status in OPEN_ORDER_STATUSES
+        and o.request.side == Side.BUY
+        and o.request.qty > o.filled_qty
+    )
+
+
 def _aware(ts: datetime) -> datetime:
     return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
 
@@ -157,6 +176,7 @@ class RiskManager:
         day: DayStats,
         broker: Broker,
         allow_fractional: bool,
+        open_orders: list[OrderRecord] | None = None,
     ) -> tuple[float, list[str]]:
         """Largest quantity every limit allows, rounded down. Returns (qty, notes); qty is 0
         when nothing fits, and the last note says why."""
@@ -177,9 +197,13 @@ class RiskManager:
             risk_usd *= STREAK_FACTOR
             notes.append(f"{day.loss_streak} losses in a row: size halved")
 
-        cash = available_cash(account)
-        exposure_room = lim.max_total_exposure_pct / 100 * equity - sum(
-            position_value(p) for p in positions
+        committed = working_buy_notional(open_orders or [])
+        reserved_fees = working_buy_fees(open_orders or [], broker)
+        cash = max(0.0, available_cash(account) - committed - reserved_fees)
+        exposure_room = (
+            lim.max_total_exposure_pct / 100 * equity
+            - sum(position_value(p) for p in positions)
+            - committed
         )
         limits_qty = {
             f"risk ${risk_usd:.2f}": risk_usd / (entry - stop),
@@ -291,6 +315,8 @@ class RiskManager:
             reasons.append("stock trading is disabled in settings")
         if not is_stock and not settings.trade_crypto:
             reasons.append("crypto trading is disabled in settings")
+        if req.setup and req.setup not in settings.enabled_setups:
+            reasons.append(f"setup {req.setup} is disabled in settings")
         if day.halted:
             reasons.append(f"trading halted: {day.halt_reason or 'halted'}")
         if day.trades >= lim.max_trades_per_day:
@@ -303,6 +329,17 @@ class RiskManager:
             and o.request.side == Side.BUY
             and not o.request.is_exit
         }
+        for working in open_orders:
+            if (
+                working.status in OPEN_ORDER_STATUSES
+                and working.request.side == Side.BUY
+                and working.request.qty > working.filled_qty
+                and not _finite_positive(working.request.limit_price or working.avg_fill_price)
+            ):
+                reasons.append(
+                    f"working buy for {working.request.instrument.symbol} has no valid price: "
+                    "cash commitment is unknown"
+                )
         if inst.key in held:
             reasons.append(f"already holding {sym}: never add to a position")
         elif inst.key in entries:
@@ -327,6 +364,8 @@ class RiskManager:
             age = _aware(now) - _aware(quote.ts)
             if age > max_age:
                 reasons.append(f"quote for {sym} is stale ({age.total_seconds():.0f}s old)")
+            elif age < timedelta(seconds=-1):
+                reasons.append(f"quote for {sym} is in the future ({-age.total_seconds():.0f}s)")
             if quote.halted:
                 reasons.append(f"{sym} is halted")
             problem = quote_problem(quote)
@@ -344,8 +383,8 @@ class RiskManager:
                     f"{sym} was halted {since.total_seconds() / 60:.0f} min ago "
                     f"(cooldown {lim.halt_cooldown_minutes} min)"
                 )
-        if mode == Mode.LIVE and is_stock and (data_delayed or (quote and quote.delayed)):
-            reasons.append("LIVE mode with delayed market data: stock entries are blocked")
+        if is_stock and (data_delayed or (quote and quote.delayed)):
+            reasons.append("delayed market data: stock entries are blocked in all modes")
         if is_stock:
             if not stock_market_open(now):
                 reasons.append("US stock market is closed")
@@ -433,7 +472,7 @@ class RiskManager:
                     )
                 fee_buy = broker.estimate_commission(inst, qty, entry)
                 need = notional + fee_buy
-                cash = available_cash(account) - committed
+                cash = available_cash(account) - committed - working_buy_fees(open_orders, broker)
                 if need > cash + CASH_TOLERANCE:
                     reasons.append(
                         f"insufficient cash: needs ${need:.2f}, ${max(0.0, cash):.2f} available"

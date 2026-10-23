@@ -266,12 +266,17 @@ class DecisionBatch(BaseModel):
     # Consensus batches: each model's own (validated) decisions, keyed by maker name
     # ("claude", "grok"), so the journal shows how each one voted. Empty otherwise.
     votes: dict[str, list[AIDecision]] = Field(default_factory=dict)
+    # Preserve individual call accounting for paired, offline selection comparisons.
+    # Missing keys on older rows mean unknown, never a free model call.
+    vote_costs: dict[str, float] = Field(default_factory=dict)
+    vote_failures: dict[str, str] = Field(default_factory=dict)
 
 
 # Old built-in dollar target. Saved settings that name some other dollar amount and no
 # percent keep that amount. The untouched default of exactly $100 is migrated to the
-# percent below (about 1.5% of the ~$600 start, not ~16%).
-DEFAULT_DAILY_PROFIT_TARGET_PCT = 1.5
+# percent below. The owner chose no default target (2026-10-23): 0 means off, and only the
+# daily loss limit stops new entries. A target never adds risk.
+DEFAULT_DAILY_PROFIT_TARGET_PCT = 0.0
 LEGACY_DEFAULT_PROFIT_TARGET_USD = 100.0
 
 
@@ -335,7 +340,7 @@ def migrate_legacy_profit_target(raw: str) -> str | None:
 
     Settings saved before the percent target have `daily_profit_target_usd` and no
     percent key. Exactly 100 was the built-in default, not a choice, so it becomes
-    1.5% of start equity. Any other dollar amount is left alone, and a blob that
+    the default percent (0, off). Any other dollar amount is left alone, and a blob that
     already has the percent key (including an explicit null) is left alone so a
     later choice of $100 stays a dollar target. Returns the new JSON, or None when
     nothing changes.
@@ -428,6 +433,25 @@ class ExitRules(BaseModel):
     trail_atr_mult: float = Field(default=0.0, ge=0)
 
 
+SetupName = Literal[
+    "orb_breakout", "vwap_reclaim", "trend_pullback", "rsi_reversion", "volume_spike"
+]
+SETUP_NAMES: tuple[SetupName, ...] = (
+    "orb_breakout",
+    "vwap_reclaim",
+    "trend_pullback",
+    "rsi_reversion",
+    "volume_spike",
+)
+
+
+class OperatingCosts(BaseModel):
+    """Owner-supplied monthly expense estimates; None means not configured, not free."""
+
+    hosting_monthly_usd: float | None = Field(default=None, ge=0, le=100_000, allow_inf_nan=False)
+    data_monthly_usd: float | None = Field(default=None, ge=0, le=100_000, allow_inf_nan=False)
+
+
 class BotSettings(BaseModel):
     """Runtime settings, editable in the UI and stored in the database."""
 
@@ -453,6 +477,8 @@ class BotSettings(BaseModel):
     min_avg_volume: float = Field(default=500_000, ge=0)  # skip illiquid names (shares/day)
     dynamic_universe: bool = False  # add IBKR scanner top movers (needs real-time data)
     allow_fractional_stocks: bool = False
+    enabled_setups: list[SetupName] = Field(default_factory=lambda: list(SETUP_NAMES), max_length=5)
+    operating_costs: OperatingCosts = Field(default_factory=OperatingCosts)
     llm_enabled: bool = True  # master switch: off means rules-only decisions
     # Who decides. "consensus" (default): a BUY goes out only when Claude AND Grok both
     # BUY the same symbol; either one can CLOSE. "claude" / "grok": that model alone.
@@ -506,6 +532,13 @@ class TradeRecord(BaseModel):
     exit_reason: str = ""
 
 
+class QuoteHealth(BaseModel):
+    symbol: str
+    age_seconds: float | None = None
+    delayed: bool = False
+    valid: bool = False
+
+
 class EngineStatus(BaseModel):
     running: bool = False
     mode: Mode = Mode.SIM
@@ -540,6 +573,7 @@ class EngineStatus(BaseModel):
     # Broker market-data problem worth the owner's attention, e.g. IBKR error 10197 (no
     # data while another session of the same login holds it). Affected symbols get no entries.
     data_warning: str | None = None
+    quote_health: list[QuoteHealth] = Field(default_factory=list)
 
 
 class DecisionContext(BaseModel):

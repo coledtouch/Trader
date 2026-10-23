@@ -199,6 +199,13 @@ def test_healthz_and_no_docs(env):
         assert env.client.get(path).status_code == 404
 
 
+@pytest.mark.parametrize("asset", ["app.js?v=8", "login.js?v=8", "styles.css?v=8", "sw.js"])
+def test_executable_shell_assets_revalidate_on_deploy(env, asset):
+    response = env.client.get(f"/static/{asset}")
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "no-cache"
+
+
 def test_security_headers(env):
     for path in ("/healthz", "/login", "/api/session", "/api/status"):
         response = env.client.get(path)
@@ -323,13 +330,20 @@ def test_background_polling_does_not_keep_an_idle_session_alive(monkeypatch):
 
 
 def test_dashboard_marks_its_status_poll_as_background():
-    """SEC-5 (client side): the automatic status refresh sends X-Background, and only it."""
+    """SEC-5 (client side): automatic dashboard/replay polls do not extend idle sessions."""
     from trader.security.auth import BACKGROUND_HEADER
 
     app_js = (Path(__file__).parent.parent / "trader/web/static/app.js").read_text("utf-8")
     assert f"headers['{BACKGROUND_HEADER}'] = '1'" in app_js
-    assert app_js.count("{ background: true }") == 1
     assert "api('GET', '/api/status', undefined, { background: true })" in app_js
+    assert "loadPerformance({ background: true })" in app_js
+    assert (
+        "`/api/performance?days=${encodeURIComponent(days)}`, undefined, { background }" in app_js
+    )
+    assert (
+        "`/api/research?days=${encodeURIComponent(days)}`, undefined, "
+        "{ background: state.researchRunning }" in app_js
+    )
 
 
 def test_login_flow(env):

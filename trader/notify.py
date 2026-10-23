@@ -7,6 +7,7 @@ ever logged.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable, Iterable
@@ -44,6 +45,8 @@ class Notifier:
         self._transport = transport
         self._clock = clock
         self._last_sent: dict[str, float] = {}
+        self._inflight: set[str] = set()
+        self._lock = asyncio.Lock()
 
     @property
     def enabled(self) -> bool:
@@ -60,16 +63,6 @@ class Notifier:
         rate limited (same title within 60 s) or failed (logged)."""
         if not self._url:
             return False
-        now = self._clock()
-        last = self._last_sent.get(title)
-        if last is not None and now - last < DUPLICATE_WINDOW_S:
-            log.debug("notification %r suppressed (sent %.0fs ago)", title, now - last)
-            return False
-        self._last_sent = {
-            t: ts for t, ts in self._last_sent.items() if now - ts < DUPLICATE_WINDOW_S
-        }
-        self._last_sent[title] = now
-
         headers = {
             "Title": _header_text(title, MAX_TITLE) or "AI Trader",
             "Priority": priority if priority in PRIORITIES else "default",
@@ -79,15 +72,29 @@ class Notifier:
             headers["Tags"] = ",".join(tag_list)
         if self._token is not None and self._token.get_secret_value():
             headers["Authorization"] = f"Bearer {self._token.get_secret_value()}"
+        async with self._lock:
+            now = self._clock()
+            self._last_sent = {
+                t: ts for t, ts in self._last_sent.items() if now - ts < DUPLICATE_WINDOW_S
+            }
+            if title in self._last_sent or title in self._inflight:
+                log.debug("notification %r suppressed (recently sent or in flight)", title)
+                return False
+            self._inflight.add(title)
         try:
             async with httpx.AsyncClient(timeout=TIMEOUT_S, transport=self._transport) as client:
                 response = await client.post(
                     self._url, content=message[:MAX_MESSAGE].encode("utf-8"), headers=headers
                 )
-            if response.status_code >= 400:
+            if not response.is_success:
                 log.warning("ntfy rejected notification %r: HTTP %d", title, response.status_code)
                 return False
+            async with self._lock:
+                self._last_sent[title] = self._clock()
             return True
         except Exception as exc:  # never raise: notifications are best effort
             log.warning("ntfy notification %r failed: %s", title, type(exc).__name__)
             return False
+        finally:
+            async with self._lock:
+                self._inflight.discard(title)

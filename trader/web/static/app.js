@@ -30,6 +30,12 @@
     equity: null,
     chartWidth: 0,
     setups: new Set(),
+    performanceBusy: false,
+    performanceLoadedAt: 0,
+    researchRunning: false,
+    researchTimer: null,
+    researchRequest: 0,
+    researchFrames: null,
   };
 
   // ------------------------------------------------------------------ DOM helpers
@@ -172,6 +178,7 @@
     vwap_reclaim: 'VWAP reclaim',
     trend_pullback: 'Trend pullback',
     rsi_reversion: 'RSI reversion',
+    volume_spike: 'Volume spike',
   };
   const setupLabel = (name) => (name ? SETUP_LABELS[name] || humanize(name) : DASH);
 
@@ -554,6 +561,7 @@
       state.updatedAt = new Date();
       setStale(null);
       renderStatus();
+      if (state.view === 'dashboard' && Date.now() - state.performanceLoadedAt > 30000) loadPerformance({ background: true });
     } catch (err) {
       if (!err.fatal) setStale(err.message);
     } finally {
@@ -614,6 +622,7 @@
     renderHalt(s);
     renderMoney(data);
     renderHealth(s);
+    renderQuoteHealth(asList(s.quote_health || data.quote_health));
     renderTiles(data);
     renderPending(asList(data.pending), s);
     renderPositions(asList(data.positions));
@@ -662,59 +671,107 @@
     pnlNode.classList.toggle('neg', toneOf(pnl) === 'neg');
 
     const lim = limits();
-    const target = isNum(s.pnl_target) && s.pnl_target > 0 ? s.pnl_target : null;
     // The server's figure follows a resume (halts are then measured from the resume equity).
     const loss = isNum(s.loss_limit_usd) && s.loss_limit_usd > 0
       ? s.loss_limit_usd
       : lim && isNum(lim.lossPct) && base ? (base * lim.lossPct) / 100 : null;
-    renderMeter(pnl, target, loss);
-    setText($('pnl-loss-label'), loss ? `Loss limit ${signedMoney(-loss)}` : '');
-    setText($('pnl-target-label'), target ? `Target ${signedMoney(target)}` : '');
+    renderMeter(pnl, loss);
+    setText($('pnl-loss-label'), loss ? `Loss limit ${signedMoney(-loss)}` : 'Loss limit unavailable');
 
     let note = '';
     if (pnl !== null && pnl < 0 && loss) {
       note = `${Math.min(100, Math.round((-pnl / loss) * 100))}% of today's loss limit used.`;
-    } else if (pnl !== null && target) {
-      note = `${Math.max(0, Math.round((pnl / target) * 100))}% of the daily target.`;
+    } else if (pnl !== null && loss) {
+      note = 'No daily loss budget used.';
     }
-    if (target) note += `${note ? ' ' : ''}The target is shown for reference: the bot never adds risk to reach it.`;
     setText($('pnl-note'), note);
   }
 
-  function renderMeter(pnl, target, loss) {
+  function renderMeter(pnl, loss) {
     const box = $('pnl-meter');
-    const left = isNum(loss) && loss > 0 ? loss : 0;
-    const right = isNum(target) && target > 0 ? target : 0;
     box.replaceChildren();
-    box.hidden = left + right <= 0;
+    box.hidden = !isNum(loss) || loss <= 0 || !isNum(pnl);
     if (box.hidden) return;
-    const span = left + right;
-    const zero = (left / span) * 100;
-    const value = isNum(pnl) ? Math.min(100, Math.max(0, ((pnl + left) / span) * 100)) : zero;
+    const used = Math.min(100, Math.max(0, (-pnl / loss) * 100));
     const root = svg('svg', { viewBox: '0 0 100 12', preserveAspectRatio: 'none', focusable: 'false' });
-    root.append(
-      svg('rect', { class: 'meter-loss', x: 0, y: 0, width: zero, height: 12 }),
-      svg('rect', { class: 'meter-gain', x: zero, y: 0, width: 100 - zero, height: 12 }),
-    );
-    const width = Math.abs(value - zero);
-    if (width > 0) {
-      root.append(svg('rect', {
-        class: value >= zero ? 'meter-fill-pos' : 'meter-fill-neg',
-        x: Math.min(zero, value),
-        y: 0,
-        width,
-        height: 12,
-      }));
-    }
-    root.append(svg('line', {
-      class: 'meter-zero',
-      x1: zero,
-      x2: zero,
-      y1: 0,
-      y2: 12,
-      'vector-effect': 'non-scaling-stroke',
-    }));
+    root.append(svg('rect', { class: 'meter-loss', x: 0, y: 0, width: 100, height: 12 }));
+    if (used > 0) root.append(svg('rect', { class: 'meter-fill-neg', x: 0, y: 0, width: used, height: 12 }));
     box.append(root);
+  }
+
+  async function loadPerformance({ background = false } = {}) {
+    if (state.performanceBusy) return;
+    state.performanceBusy = true;
+    const days = $('performance-days').value || '30';
+    const box = $('performance-summary');
+    box.setAttribute('aria-busy', 'true');
+    try {
+      const data = await api('GET', `/api/performance?days=${encodeURIComponent(days)}`, undefined, { background });
+      if ($('performance-days').value !== days) return;
+      renderPerformance(data, box);
+      state.performanceLoadedAt = Date.now();
+    } catch (err) {
+      if (!err.fatal) box.replaceChildren(errorLine(`Performance unavailable: ${err.message}`));
+    } finally {
+      state.performanceBusy = false;
+      box.removeAttribute('aria-busy');
+      if ($('performance-days').value !== days) loadPerformance();
+    }
+  }
+
+  function metric(label, value, sub) {
+    return el('div', { class: 'tile' }, [
+      el('dt', { text: label }),
+      el('dd', {}, [value, sub ? el('span', { class: 'tile-sub', text: sub }) : null]),
+    ]);
+  }
+
+  function renderPerformance(p, box) {
+    const costsComplete = p.costs_configured === true;
+    const complete = costsComplete && isNum(p.all_in_pnl);
+    const headline = el('p', {
+      class: `hero-value ${complete ? toneOf(p.all_in_pnl) || '' : 'performance-incomplete'}`,
+      text: complete ? signedMoney(p.all_in_pnl) : costsComplete ? 'Performance unavailable' : 'Costs incomplete',
+    });
+    const warnings = asList(p.warnings).map((text) => el('li', { text }));
+    box.replaceChildren(
+      headline,
+      el('p', { class: 'small muted', text: `${humanize(p.mode || 'unknown')} account · last ${p.days || $('performance-days').value} days · ${isNum(p.closed_trades) ? p.closed_trades : 0} closed trades` }),
+      !costsComplete && isNum(p.known_cost_pnl) ? el('p', { class: 'mt-8', text: `After known costs: ${signedMoney(p.known_cost_pnl)}. This subtotal excludes missing expenses.` }) : '',
+      el('dl', { class: 'tiles mt-12' }, [
+        metric('Trading P&L', pnlSpan(p.trading_pnl), 'After trading commissions'),
+        metric('AI spending', fineMoney(p.ai_cost), 'Recorded token-price estimates'),
+        metric('Hosting estimate', money(p.hosting_cost), 'Prorated monthly input'),
+        metric('Data estimate', money(p.data_cost), 'Prorated monthly input'),
+        metric('Net expectancy', signedMoney(p.net_expectancy), 'Per closed trade, after commissions'),
+        metric('Max drawdown', pct(p.max_drawdown_pct), 'Daily equity; before operating costs'),
+        metric('Profit factor', isNum(p.profit_factor) ? p.profit_factor.toFixed(2) : DASH, 'Closed trades after commissions'),
+        metric('Signal evidence', `${p.evaluated_signals ?? 0} / ${p.signal_count ?? 0}`, 'Evaluated / recorded · before costs'),
+      ]),
+      !costsComplete ? el('p', { class: 'inline-warn', text: 'Enter monthly hosting and market-data costs in Settings to complete this report. Enter 0 explicitly for a free service.' })
+        : !complete ? el('p', { class: 'inline-warn', text: 'Complete account equity observations are needed before profit after costs can be calculated.' }) : '',
+      el('details', { class: 'more mt-12' }, [
+        el('summary', { text: 'Reporting notes and limitations' }),
+        el('p', { class: 'small muted mt-8', text: 'Trading P&L includes realized and unrealized changes recorded in the account journal, adjusted for recorded cash flows. Monthly costs are estimates for the recorded coverage period.' }),
+        warnings.length ? el('ul', { class: 'performance-warnings mt-8' }, warnings) : null,
+      ]),
+      el('p', { class: 'small muted mt-8', text: `Coverage begins ${when(p.covered_from)} · as of ${when(p.as_of)}. Paper and simulated results are not proof of live profitability.` }),
+    );
+  }
+
+  function renderQuoteHealth(quotes) {
+    if (!changed('quote-health', quotes)) return;
+    const box = $('quote-health');
+    if (!quotes.length) {
+      box.replaceChildren(empty('No quotes observed yet. Data freshness is not verified.'));
+      return;
+    }
+    box.replaceChildren(table([
+      { label: 'Symbol', head: true, value: (q) => q.symbol || DASH },
+      { label: 'Age', num: true, value: (q) => isNum(q.age_seconds) ? `${Math.max(0, Math.round(q.age_seconds))} sec` : 'Unknown' },
+      { label: 'Feed', value: (q) => state.data.status.broker === 'sim' ? chipNode('Synthetic', null) : q.delayed ? chipNode('Delayed', 'warn') : chipNode('Real-time', null) },
+      { label: 'Freshness check', value: (q) => q.valid && !q.delayed ? chipNode('Usable', 'ok') : chipNode('Blocked', 'warn') },
+    ], quotes));
   }
 
   const MAKER_LABELS = { claude: 'Claude', grok: 'Grok', consensus: 'Consensus', rules: 'Rules' };
@@ -737,7 +794,14 @@
     setChip('chip-bot', s.running ? 'Bot running' : 'Bot stopped', s.running ? 'ok' : null);
     setChip('chip-broker', `${broker} ${s.connected ? 'connected' : 'disconnected'}`, s.connected ? 'ok' : 'bad');
     setChip('chip-market', s.stock_market_open ? 'Market open' : 'Market closed', s.stock_market_open ? 'ok' : null);
-    setChip('chip-data', s.data_delayed ? 'Delayed data' : 'Real-time data', s.data_delayed ? 'warn' : 'ok');
+    const quotes = asList(s.quote_health || state.data.quote_health);
+    const delayed = Boolean(s.data_delayed || quotes.some((q) => q.delayed));
+    const blockedQuotes = quotes.some((q) => !q.valid);
+    setChip('chip-data', s.broker === 'sim' ? 'Synthetic data' : delayed ? 'Delayed data' : blockedQuotes ? 'Quotes need review' : quotes.length ? 'Real-time feed' : 'Data not verified',
+      delayed || blockedQuotes ? 'warn' : s.broker === 'sim' || !quotes.length ? null : 'ok');
+    $('market-data-banner').hidden = !delayed;
+    setText($('market-data-text'), delayed
+      ? 'Delayed market data: stock entries and paid stock entry analysis are paused. Existing exits remain managed.' : '');
     setChip('chip-autopilot', s.autopilot ? 'Autopilot on' : 'Approval required', s.autopilot ? 'ok' : 'warn');
     setChip('chip-ai', AI_CHIP[s.decision_maker] || `AI: ${makerLabel(s.decision_maker)}`,
       s.decision_warning ? 'warn' : s.decision_maker === 'consensus' ? 'ok' : null);
@@ -1006,6 +1070,8 @@
     const save = $('settings-save');
     if (!isBusy(save)) save.disabled = !state.settingsDirty;
     $('settings-discard').disabled = !state.settingsDirty || isBusy(save);
+    const replay = $('research-run');
+    if (!isBusy(replay)) replay.disabled = state.researchRunning || state.researchFrames === 0;
   }
 
   // ------------------------------------------------------------------ activity
@@ -1260,7 +1326,10 @@
         el('span', { class: 'entry-meta', text: isNum(d.conviction) ? `conviction ${Math.round(d.conviction * 100)}%` : '' }),
       ]),
       levels.length ? el('p', { class: 'tabular', text: levels.join(' · ') }) : null,
-      d.rationale ? el('p', { text: d.rationale }) : null,
+      d.rationale ? el('details', { class: 'more' }, [
+        el('summary', { text: 'Decision rationale' }),
+        el('p', { text: d.rationale }),
+      ]) : null,
     ]);
   }
 
@@ -1280,7 +1349,6 @@
       el('summary', { text: 'How each model voted' }),
       ...names.map((name) => voteList(name, asList(votes[name]))),
     ]);
-    box.open = true;
     return box;
   }
 
@@ -1319,7 +1387,7 @@
   }
 
   function renderDecisions(data) {
-    const batches = asList(data);
+    const batches = [...asList(data)].sort((a, b) => (parseTs(b.ts)?.getTime() || 0) - (parseTs(a.ts)?.getTime() || 0));
     $('decisions-list').replaceChildren(batches.length
       ? el('ul', { class: 'entries' }, batches.map(decisionEntry))
       : empty('No decision cycles yet.'));
@@ -1367,7 +1435,108 @@
 
   // ------------------------------------------------------------------ signals
   function loadSignals() {
-    return Promise.all([loadStats(), loadSignalList()]);
+    return Promise.all([loadStats(), loadSignalList(), loadFilledSetups(), loadResearch()]);
+  }
+
+  function loadSignalPeriod() {
+    return Promise.all([loadStats(), loadFilledSetups(), loadResearch()]);
+  }
+
+  function loadFilledSetups() {
+    const days = encodeURIComponent($('stats-days').value || '30');
+    return loadInto($('filled-setups-list'), `/api/performance?days=${days}`, (p) => {
+      const rows = asList(p.setup_stats);
+      $('filled-setups-list').replaceChildren(rows.length ? table([
+        { label: 'Setup', head: true, value: (s) => setupLabel(s.setup) },
+        { label: 'Closed trades', num: true, value: (s) => String(s.trades ?? 0) },
+        { label: 'Trading P&L', num: true, value: (s) => pnlSpan(s.net_pnl) },
+        { label: 'Per trade', num: true, value: (s) => pnlSpan(s.net_expectancy) },
+        { label: 'Observed days', num: true, value: (s) => String(s.days_observed ?? 0) },
+        { label: 'Exploratory range / trade', num: true, value: (s) => isNum(s.confidence_low) && isNum(s.confidence_high)
+          ? `${signedMoney(s.confidence_low)} to ${signedMoney(s.confidence_high)}` : 'More history needed' },
+      ], rows) : empty('No closed trades in this period. Profitability has not been established.'));
+    });
+  }
+
+  async function loadResearch() {
+    clearTimeout(state.researchTimer);
+    if (document.hidden || state.expired || state.redirecting) return;
+    const request = ++state.researchRequest;
+    const days = $('stats-days').value || '30';
+    const box = $('research-list');
+    box.setAttribute('aria-busy', 'true');
+    try {
+      const data = await api('GET', `/api/research?days=${encodeURIComponent(days)}`, undefined, { background: state.researchRunning });
+      if (request === state.researchRequest) renderResearch(data);
+    } catch (err) {
+      if (!err.fatal && request === state.researchRequest) box.replaceChildren(errorLine(`Comparison unavailable: ${err.message}`));
+    } finally {
+      if (request === state.researchRequest) box.removeAttribute('aria-busy');
+    }
+  }
+
+  async function runResearch() {
+    await busy($('research-run'), async () => {
+      const request = ++state.researchRequest;
+      try {
+        const data = await api('POST', '/api/research/run', { days: Number($('stats-days').value || '30') });
+        if (request === state.researchRequest) renderResearch(data);
+      } catch (err) {
+        report(err, 'Could not start comparison: ');
+      }
+    });
+  }
+
+  function renderResearch(data) {
+    state.researchRunning = data.status === 'running';
+    state.researchFrames = isNum(data.frame_count) ? data.frame_count : null;
+    syncButtons();
+    const box = $('research-list');
+    const report = data.report;
+    if (!report) {
+      const message = data.status === 'running' ? 'Comparing captured decisions…'
+        : data.status === 'failed' ? `Comparison failed: ${data.error || 'Try again.'}`
+          : `No comparison has been run for this period. ${data.frame_count ?? 0} captured data frames are available. New cycles will add data for replay.`;
+      box.replaceChildren(empty(message));
+    } else {
+      const arms = Object.entries(report.arms || {}).map(([name, arm]) => ({ name, ...arm }));
+      const warnings = [...asList(report.warnings)];
+      if (!warnings.some((text) => /original portfolio|alternative portfolio/i.test(text))) {
+        warnings.unshift('Captured-vote selection replay: model opinions were recorded against the original portfolio. This is not an independent, portfolio-specific AI test.');
+      }
+      if (!warnings.some((text) => /sparse|between observations|intra-cycle/i.test(text))) {
+        warnings.push('Sparse captured cycles can miss price moves between observations. These replay results do not demonstrate executable live profitability.');
+      }
+      box.replaceChildren(
+        data.status === 'running' ? el('p', { class: 'inline-warn', text: 'A new comparison is running. Previous results are shown below.' }) : '',
+        data.status === 'failed' ? errorLine(`Last run failed: ${data.error || 'Try again.'} Previous results follow.`) : '',
+        el('p', { class: 'small muted mt-12', text: `${report.frame_count ?? 0} captured frames · ${report.decision_cycles ?? 0} decision cycles · starting virtual equity ${money(report.starting_equity)}` }),
+        el('p', { class: 'small muted mt-8', text: `Captured ${when(report.started_at)} to ${when(report.ended_at)} · sources: ${asList(report.source_types).join(', ') || 'unknown'}${data.generated_at ? ` · generated ${when(data.generated_at)}` : ''}` }),
+        arms.length ? table([
+          { label: 'Decision method', head: true, value: (a) => makerLabel(a.name) },
+          { label: 'Trading P&L', num: true, value: (a) => pnlSpan(a.trading_pnl_usd) },
+          { label: 'Model cost', num: true, value: (a) => isNum(a.model_cost_usd) ? fineMoney(a.model_cost_usd) : 'Unknown split' },
+          { label: 'After model cost', num: true, value: (a) => isNum(a.all_in_pnl_usd) ? pnlSpan(a.all_in_pnl_usd) : 'Incomplete costs' },
+          { label: 'Drawdown', num: true, value: (a) => [
+            el('span', { text: pct(a.max_drawdown_pct) }),
+            el('span', { class: 'cell-sub', text: a.drawdown_basis === 'trading_only' ? 'Before model costs' : 'After model costs' }),
+          ] },
+          { label: 'Closed trades', num: true, value: (a) => String(asList(a.trades).length) },
+          { label: 'Votes observed / missing', num: true, value: (a) => a.name === 'rules' ? 'Not applicable' : `${a.observed_vote_cycles ?? 0} / ${a.missing_vote_cycles ?? 0}` },
+        ], arms) : empty('No replay accounts available.'),
+        el('p', { class: 'small muted mt-8', text: 'Trading P&L includes virtual open positions and commissions. After model cost excludes hosting and market-data expenses. Missing model votes are not filled with invented decisions.' }),
+        el('ul', { class: 'performance-warnings mt-12' }, warnings.map((text) => el('li', { text }))),
+        el('details', { class: 'more' }, [
+          el('summary', { text: 'Replay assumptions and account warnings' }),
+          el('ul', {}, [
+            ...asList(report.assumptions).map((text) => el('li', { text })),
+            ...arms.flatMap((a) => asList(a.warnings).map((text) => el('li', { text: `${makerLabel(a.name)}: ${text}` }))),
+          ]),
+        ]),
+      );
+    }
+    clearTimeout(state.researchTimer);
+    if (state.researchRunning && state.view === 'signals' && !state.expired) state.researchTimer = setTimeout(loadResearch, 5000);
   }
 
   function loadStats() {
@@ -1407,11 +1576,11 @@
         value: (s) => [
           el('span', { class: 'cell-title', text: `${setupLabel(s.setup)} ` }),
           el('span', s.enough_data
-            ? { class: 'badge badge-enough', text: 'N ≥ 30' }
+            ? { class: 'badge badge-few', text: 'N ≥ 30: initial review' }
             : {
               class: 'badge badge-few',
-              text: 'N < 30: too few to judge',
-              title: `${s.evaluated ?? 0} evaluated signals; at least 30 are needed`,
+              text: 'Limited sample',
+              title: `${s.evaluated ?? 0} evaluated signals; price diagnostics are not proof of profitability`,
             }),
         ],
       },
@@ -1476,6 +1645,16 @@
       keys: ['llm_enabled', 'decision_mode', 'llm_model', 'llm_effort', 'llm_min_candidate_score'],
     },
     {
+      title: 'Setup selection',
+      note: 'Only enabled setups can create new entries. Existing positions continue to follow their exit rules.',
+      keys: ['enabled_setups'],
+    },
+    {
+      title: 'Operating costs',
+      object: 'operating_costs',
+      note: 'Monthly USD estimates are prorated over the selected reporting period. Leave unknown costs blank; enter 0 for a free service.',
+    },
+    {
       title: 'Risk limits',
       object: 'risk',
       note: 'Loosening any of these needs a 2FA code. Sizing never depends on the daily target.',
@@ -1514,7 +1693,7 @@
     llm_enabled: { label: 'Use AI for decisions', help: 'Off: rules-only decisions, whatever the mode.' },
     decision_mode: {
       label: 'Decision mode', options: ['consensus', 'claude', 'grok', 'rules'],
-      help: 'consensus = Claude and Grok must both BUY (fewer trades; Grok adds about $0.02-0.03 per call: ~1.5x the AI cost with Opus, ~2x with Sonnet, ~20x with Haiku); claude / grok = one model alone; rules = no AI.',
+      help: 'Consensus requires Claude and Grok to both BUY and pays for both models. Single-model modes use one model; rules uses no AI. Compare results after model costs before choosing a mode.',
     },
     llm_model: { label: 'Claude model', options: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'] },
     llm_effort: { label: 'Claude effort', options: ['low', 'medium', 'high', 'xhigh', 'max'] },
@@ -1524,7 +1703,7 @@
     },
     'risk.daily_profit_target_pct': {
       label: 'Daily profit target', unit: '% of start equity', min: 0, optional: true,
-      help: 'New entries stop for the day (when that option is on) once the gain reaches this percent of start-of-day equity. Default 1.5%. Leave empty to use the fixed dollar amount instead. It never increases size.',
+      help: 'New entries stop for the day (when that option is on) once the gain reaches this percent of start-of-day equity. Default 0 (off). Leave empty to use the fixed dollar amount instead. It never increases size.',
     },
     'risk.daily_profit_target_usd': {
       label: 'Daily profit target (fixed dollars)', unit: '$', min: 0, optional: true,
@@ -1569,6 +1748,8 @@
     'exits.time_stop_min_r': { label: 'Time stop minimum', unit: 'R', min: 0 },
     'exits.breakeven_at_r': { label: 'Move stop to entry at', unit: 'R', min: 0 },
     'exits.trail_atr_mult': { label: 'Trailing stop distance', unit: '× ATR', min: 0 },
+    'operating_costs.hosting_monthly_usd': { label: 'Monthly hosting cost', unit: '$ / month', min: 0, nullable: true },
+    'operating_costs.data_monthly_usd': { label: 'Monthly market-data cost', unit: '$ / month', min: 0, nullable: true },
   };
 
   const fieldId = (path) => `set-${path.replace(/[^A-Za-z0-9_-]/g, '-')}`;
@@ -1588,6 +1769,22 @@
     const error = el('p', { id: errorId, class: 'field-error' });
     const described = [help ? helpId : null, errorId];
 
+    if (path === 'enabled_setups') {
+      const enabled = new Set(asList(value));
+      return el('div', { class: 'field' }, [
+        el('fieldset', { id, class: 'setup-choices', 'data-path': path, 'data-kind': 'setups', 'aria-describedby': errorId }, [
+          el('legend', { text: 'Trade these setups' }),
+          ...Object.keys(SETUP_LABELS).map((setup) => {
+            const input = el('input', { type: 'checkbox', value: setup, 'data-setup': setup });
+            input.checked = enabled.has(setup);
+            return el('label', { class: 'setup-choice' }, [input, el('span', { text: setupLabel(setup) })]);
+          }),
+        ]),
+        el('p', { class: 'help', text: 'All unchecked pauses new entries from these setups. Setup-level results are available in Signals.' }),
+        error,
+      ]);
+    }
+
     if (typeof value === 'boolean') {
       const input = el('input', {
         id, type: 'checkbox', class: 'switch', role: 'switch',
@@ -1604,7 +1801,9 @@
 
     let control;
     const extra = [];
-    const optionalNumber = (value === null || value === undefined) && meta.optional;
+    // Optional (Cursor) and nullable (Codex) number fields both accept an empty value.
+    const emptyOk = Boolean(meta.optional || meta.nullable);
+    const optionalNumber = (value === null || value === undefined) && emptyOk;
     if (typeof value === 'number' || optionalNumber) {
       const cap = path.startsWith('risk.') ? caps[path.slice(5)] : undefined;
       const max = Math.min(isNum(meta.max) ? meta.max : Infinity, isNum(cap) ? cap : Infinity);
@@ -1613,13 +1812,14 @@
       if (meta.unit) described.unshift(unitId);
       if (isNum(cap)) described.push(capId);
       const input = el('input', {
-        id, type: 'number', required: !meta.optional,
+        id, type: 'number', required: !emptyOk,
         inputmode: meta.int ? 'numeric' : 'decimal',
         step: meta.step ?? (meta.int ? 1 : 'any'),
         min: isNum(meta.min) ? meta.min : null,
         max: Number.isFinite(max) ? max : null,
         value: optionalNumber ? '' : String(value),
         'data-path': path, 'data-kind': meta.int ? 'int' : 'number',
+        'data-nullable': meta.nullable ? 'true' : null,
         'data-positive': meta.positive ? 'true' : null,
         'data-optional': meta.optional ? 'true' : null,
         'data-cap': isNum(cap) ? String(cap) : null,
@@ -1755,7 +1955,7 @@
   function numberError(input, value, raw) {
     const min = input.getAttribute('min');
     const max = input.getAttribute('max');
-    if (input.dataset.optional === 'true' && raw === '') return null;
+    if ((input.dataset.optional === 'true' || input.dataset.nullable === 'true') && raw === '') return null;
     if (raw === '' || !Number.isFinite(value)) return 'Enter a number.';
     if (input.dataset.kind === 'int' && !Number.isInteger(value)) return 'Enter a whole number.';
     if (input.dataset.positive && value <= 0) return 'Must be greater than 0.';
@@ -1777,11 +1977,13 @@
       let error = null;
       if (kind === 'bool') {
         value = input.checked;
+      } else if (kind === 'setups') {
+        value = [...input.querySelectorAll('input[data-setup]:checked')].map((checkbox) => checkbox.dataset.setup);
       } else if (kind === 'list') {
         value = input.value.split(/[\s,;]+/).map((s) => s.trim().toUpperCase()).filter(Boolean);
       } else if (kind === 'int' || kind === 'number') {
         const raw = input.value.trim();
-        if (input.dataset.optional === 'true' && raw === '') {
+        if ((input.dataset.optional === 'true' || input.dataset.nullable === 'true') && raw === '') {
           value = null;
         } else {
           value = Number(raw);
@@ -1933,8 +2135,10 @@
       $(`view-${view}`).hidden = !active;
     }
     if (!switched) return;
+    if (name !== 'signals') clearTimeout(state.researchTimer);
     window.scrollTo(0, 0);
-    if (name === 'activity') loadActivity();
+    if (name === 'dashboard') loadPerformance();
+    else if (name === 'activity') loadActivity();
     else if (name === 'signals') loadSignals();
     else if (name === 'settings') loadSettingsView();
   }
@@ -1985,8 +2189,10 @@
 
     $('activity-refresh').addEventListener('click', () => busy($('activity-refresh'), loadActivity));
     $('signals-refresh').addEventListener('click', () => busy($('signals-refresh'), loadSignals));
-    $('stats-days').addEventListener('change', loadStats);
+    $('stats-days').addEventListener('change', loadSignalPeriod);
     $('signals-setup').addEventListener('change', loadSignalList);
+    $('performance-days').addEventListener('change', loadPerformance);
+    $('research-run').addEventListener('click', runResearch);
 
     const form = $('settings-form');
     form.addEventListener('submit', saveSettings);
@@ -2002,8 +2208,10 @@
       if (document.hidden) {
         clearTimeout(state.pollTimer);
         state.pollTimer = null;
+        clearTimeout(state.researchTimer);
       } else {
         refreshStatus();
+        if (state.view === 'signals' && state.researchRunning) loadResearch();
       }
     });
     window.addEventListener('beforeunload', (event) => {

@@ -6,11 +6,13 @@ with `model_dump(mode="json")`; errors are `{"detail": ...}`.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import re
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
-from datetime import time, timedelta
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -36,6 +38,7 @@ from trader.models import (
     RiskLimits,
     utcnow,
 )
+from trader.performance import performance_report
 from trader.security import crypto
 from trader.security.auth import (
     Authenticator,
@@ -98,6 +101,10 @@ def _apply_headers(headers: MutableHeaders, path: str, base: dict[str, str]) -> 
         headers["Cache-Control"] = "no-store"
     if path == "/static/sw.js":
         headers["Service-Worker-Allowed"] = "/"  # the shell's service worker controls "/"
+    if path.startswith("/static/") and path.endswith((".js", ".css")):
+        # Revalidate executable/layout assets across deployments. Versioned page
+        # references also bypass a still-controlling older service worker's cache.
+        headers["Cache-Control"] = "no-cache"
 
 
 class SecurityHeadersMiddleware:
@@ -207,6 +214,10 @@ class SettingsBody(BaseModel):
     totp: str | None = Field(default=None, max_length=16)
 
 
+class ResearchBody(BaseModel):
+    days: int = Field(default=30, ge=1, le=90)
+
+
 # ---------------------------------------------------------------------- helpers
 def _dump(value: Any) -> Any:
     if isinstance(value, BaseModel):
@@ -271,6 +282,8 @@ def loosened_fields(old: BotSettings, new: BotSettings, live: bool) -> list[str]
         loosened.append("flatten_stocks_before_close")
     if _effective_mode(old) == "consensus" and _effective_mode(new) != "consensus":
         loosened.append("decision_mode" if new.decision_mode != "consensus" else "llm_enabled")
+    if set(new.enabled_setups) - set(old.enabled_setups):
+        loosened.append("enabled_setups")
     return loosened
 
 
@@ -315,6 +328,7 @@ def validate_settings(settings: BotSettings) -> BotSettings:
         update={
             "stock_universe": _normalize_universe("stock_universe", settings.stock_universe),
             "crypto_universe": _normalize_universe("crypto_universe", settings.crypto_universe),
+            "enabled_setups": list(dict.fromkeys(settings.enabled_setups)),
         }
     )
 
@@ -333,11 +347,70 @@ async def _manual_cycle(engine: Engine) -> None:
         log.exception("manual decision cycle failed")
 
 
+def _research_window(db: Database, days: int) -> dict[str, Any] | None:
+    since = utcnow() - timedelta(days=days)
+    epoch = db.get_kv("journal_account_since")
+    if epoch:
+        since = max(since, datetime.fromisoformat(epoch))
+    account = db.get_kv("broker_account")
+    return db.research_window(since, account)
+
+
+async def _run_research(st: Any, window: dict[str, Any], days: int) -> None:
+    try:
+
+        def run() -> dict[str, Any]:
+            from trader.research import ReplayFrame, replay_experiment
+
+            frames = st.db.research_frames_in_window(window["first_id"], window["last_id"])
+            if not frames:
+                raise ValueError("captured observations expired before replay")
+            settings = BotSettings.model_validate(frames[0].get("settings", {}))
+            report = asyncio.run(
+                replay_experiment(
+                    [ReplayFrame.model_validate(f) for f in frames],
+                    settings,
+                    starting_equity=frames[0].get("starting_equity") or 600.0,
+                    commission_plan=frames[0].get("commission_plan") or "tiered",
+                )
+            )
+            return report.model_dump(mode="json")
+
+        report = await run_in_threadpool(run)
+        st.db.set_kv(
+            "research_report",
+            json.dumps(
+                {
+                    "status": "ready",
+                    "cohort": window["cohort"],
+                    "days": days,
+                    "generated_at": utcnow().isoformat(),
+                    "report": report,
+                },
+                allow_nan=False,
+            ),
+        )
+    except Exception:
+        log.exception("offline research replay failed")
+        st.db.set_kv(
+            "research_report",
+            json.dumps(
+                {
+                    "status": "failed",
+                    "error": "Comparison failed; inspect server logs and retry.",
+                }
+            ),
+        )
+    finally:
+        st.research_running = False
+
+
 def _bind(app: FastAPI, config: AppConfig, db: Database, engine: Engine) -> None:
     app.state.config = config
     app.state.db = db
     app.state.engine = engine
     app.state.auth = Authenticator(config, db)
+    app.state.research_running = False
 
 
 def _startup_checks(auth: Authenticator) -> None:
@@ -640,6 +713,62 @@ def create_app(
         return _dump(state(request).db.setup_stats(since=since))
 
     # ------------------------------------------------------------ settings
+    @app.get("/api/performance")
+    async def performance(
+        request: Request,
+        days: int = Query(30, ge=1, le=90),
+        session: Session = Depends(require_session),
+    ) -> Any:
+        st = state(request)
+        return performance_report(st.db, st.db.get_settings(), st.engine.status(), utcnow(), days)
+
+    @app.get("/api/research")
+    async def research_status(
+        request: Request,
+        days: int = Query(30, ge=1, le=90),
+        session: Session = Depends(require_session),
+    ) -> Any:
+        st = state(request)
+        window = _research_window(st.db, days)
+        raw = st.db.get_kv("research_report")
+        cached = json.loads(raw) if raw else {}
+        report = cached.get("report", cached if "arms" in cached else None)
+        stale = bool(
+            report
+            and (
+                not window or cached.get("days") != days or cached.get("cohort") != window["cohort"]
+            )
+        )
+        return {
+            "status": "running"
+            if st.research_running
+            else ("not_run" if stale else cached.get("status", "ready" if report else "not_run")),
+            "frame_count": window["frame_count"] if window else 0,
+            "report": None if stale else report,
+            "error": cached.get("error"),
+            "stale": stale,
+            "generated_at": cached.get("generated_at"),
+            "days": days,
+        }
+
+    @app.post("/api/research/run", status_code=202)
+    async def research_run(
+        body: ResearchBody,
+        request: Request,
+        background: BackgroundTasks,
+        session: Session = Depends(require_csrf),
+    ) -> Any:
+        st = state(request)
+        if st.research_running:
+            raise HTTPException(status_code=409, detail="A comparison is already running")
+        window = _research_window(st.db, body.days)
+        if not window:
+            raise HTTPException(status_code=409, detail="No captured cycles for this account yet")
+        st.research_running = True
+        background.add_task(_run_research, st, window, body.days)
+        audit(request, "research_replay", {"frames": window["frame_count"], "days": body.days})
+        return {"status": "running", "frame_count": window["frame_count"]}
+
     @app.get("/api/settings")
     async def get_settings(request: Request, session: Session = Depends(require_session)) -> Any:
         return settings_payload(request)
