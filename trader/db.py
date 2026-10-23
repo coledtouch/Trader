@@ -1,0 +1,644 @@
+"""SQLite persistence: settings, auth, sessions, audit log and the trading journal.
+
+One connection guarded by a lock. Every operation is a short statement, so it is
+fine to call these methods from the asyncio event loop directly.
+All timestamps are stored as ISO-8601 strings in UTC.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sqlite3
+import threading
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from trader.models import (
+    BotSettings,
+    DayStats,
+    DecisionBatch,
+    Fill,
+    Instrument,
+    OrderRecord,
+    OrderRequest,
+    OrderStatus,
+    TradeRecord,
+    utcnow,
+)
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS kv (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS auth (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    password_hash TEXT NOT NULL,
+    totp_secret_enc TEXT NOT NULL,
+    totp_last_step INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    csrf_token TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    ip TEXT,
+    user_agent TEXT
+);
+CREATE TABLE IF NOT EXISTS login_attempts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    ip TEXT,
+    success INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_login_attempts_ts ON login_attempts(ts);
+CREATE TABLE IF NOT EXISTS audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    actor TEXT NOT NULL,
+    action TEXT NOT NULL,
+    detail TEXT,
+    ip TEXT
+);
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    maker TEXT NOT NULL,
+    model TEXT,
+    market_view TEXT,
+    decisions TEXT NOT NULL,
+    candidates TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    refused INTEGER NOT NULL DEFAULT 0,
+    error TEXT
+);
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    request TEXT NOT NULL,
+    status TEXT NOT NULL,
+    broker_order_id TEXT,
+    filled_qty REAL NOT NULL DEFAULT 0,
+    avg_fill_price REAL,
+    commission REAL NOT NULL DEFAULT 0,
+    message TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_orders_broker ON orders(broker_order_id);
+CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
+CREATE TABLE IF NOT EXISTS fills (
+    exec_id TEXT PRIMARY KEY,
+    broker_order_id TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    side TEXT NOT NULL,
+    qty REAL NOT NULL,
+    price REAL NOT NULL,
+    commission REAL NOT NULL DEFAULT 0,
+    ts TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_fills_ts ON fills(ts);
+CREATE TABLE IF NOT EXISTS positions_meta (
+    instrument TEXT PRIMARY KEY,
+    stop_loss REAL,
+    take_profit REAL,
+    entry_price REAL,
+    initial_risk REAL,
+    opened_at TEXT,
+    decision_id INTEGER,
+    setup TEXT
+);
+CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instrument TEXT NOT NULL,
+    qty REAL NOT NULL,
+    entry_price REAL NOT NULL,
+    exit_price REAL NOT NULL,
+    entry_ts TEXT NOT NULL,
+    exit_ts TEXT NOT NULL,
+    pnl REAL NOT NULL,
+    commission REAL NOT NULL DEFAULT 0,
+    setup TEXT,
+    decision_id INTEGER,
+    r_multiple REAL,
+    exit_reason TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS daily_stats (
+    day TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS equity (
+    ts TEXT PRIMARY KEY,
+    equity REAL NOT NULL
+);
+"""
+
+
+def _iso(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.astimezone(UTC).isoformat()
+
+
+def _dt(value: str | None) -> datetime | None:
+    return datetime.fromisoformat(value) if value else None
+
+
+class Database:
+    def __init__(self, path: Path | str):
+        self.path = str(path)
+        if self.path != ":memory:":
+            parent = Path(self.path).parent
+            parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(parent, 0o700)
+            except OSError:
+                pass
+            if not Path(self.path).exists():
+                Path(self.path).touch(mode=0o600)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+        self._conn.row_factory = sqlite3.Row
+        with self._lock:
+            if self.path != ":memory:":
+                self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.executescript(SCHEMA)
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    # ------------------------------------------------------------------ helpers
+    def _exec(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
+        with self._lock:
+            return self._conn.execute(sql, tuple(params))
+
+    def _one(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
+        with self._lock:
+            return self._conn.execute(sql, tuple(params)).fetchone()
+
+    def _all(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
+        with self._lock:
+            return self._conn.execute(sql, tuple(params)).fetchall()
+
+    # ------------------------------------------------------------------ key/value
+    def get_kv(self, key: str, default: str | None = None) -> str | None:
+        row = self._one("SELECT value FROM kv WHERE key = ?", (key,))
+        return row["value"] if row else default
+
+    def set_kv(self, key: str, value: str) -> None:
+        self._exec(
+            "INSERT INTO kv(key, value) VALUES(?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
+    def get_flag(self, name: str, default: bool = False) -> bool:
+        value = self.get_kv(f"flag:{name}")
+        return default if value is None else value == "1"
+
+    def set_flag(self, name: str, value: bool) -> None:
+        self.set_kv(f"flag:{name}", "1" if value else "0")
+
+    def get_settings(self) -> BotSettings:
+        raw = self.get_kv("settings")
+        if raw is None:
+            return BotSettings()
+        return BotSettings.model_validate_json(raw)
+
+    def save_settings(self, settings: BotSettings) -> None:
+        self.set_kv("settings", settings.model_dump_json())
+
+    # ------------------------------------------------------------------ auth
+    def get_auth(self) -> dict[str, Any] | None:
+        row = self._one("SELECT * FROM auth WHERE id = 1")
+        return dict(row) if row else None
+
+    def set_auth(self, password_hash: str, totp_secret_enc: str) -> None:
+        now = _iso(utcnow())
+        self._exec(
+            "INSERT INTO auth(id, password_hash, totp_secret_enc, totp_last_step, created_at,"
+            " updated_at) VALUES(1, ?, ?, 0, ?, ?) ON CONFLICT(id) DO UPDATE SET"
+            " password_hash = excluded.password_hash, totp_secret_enc = excluded.totp_secret_enc,"
+            " totp_last_step = 0, updated_at = excluded.updated_at",
+            (password_hash, totp_secret_enc, now, now),
+        )
+
+    def update_password_hash(self, password_hash: str) -> None:
+        self._exec(
+            "UPDATE auth SET password_hash = ?, updated_at = ? WHERE id = 1",
+            (password_hash, _iso(utcnow())),
+        )
+
+    def set_totp_last_step(self, step: int) -> None:
+        self._exec("UPDATE auth SET totp_last_step = ? WHERE id = 1", (step,))
+
+    # ------------------------------------------------------------------ sessions
+    def create_session(
+        self, token_hash: str, csrf_token: str, ip: str | None, user_agent: str | None
+    ) -> None:
+        now = _iso(utcnow())
+        self._exec(
+            "INSERT INTO sessions(token_hash, csrf_token, created_at, last_seen, ip, user_agent)"
+            " VALUES(?, ?, ?, ?, ?, ?)",
+            (token_hash, csrf_token, now, now, ip, (user_agent or "")[:300]),
+        )
+
+    def get_session(self, token_hash: str) -> dict[str, Any] | None:
+        row = self._one("SELECT * FROM sessions WHERE token_hash = ?", (token_hash,))
+        if not row:
+            return None
+        data = dict(row)
+        data["created_at"] = _dt(data["created_at"])
+        data["last_seen"] = _dt(data["last_seen"])
+        return data
+
+    def touch_session(self, token_hash: str) -> None:
+        self._exec(
+            "UPDATE sessions SET last_seen = ? WHERE token_hash = ?", (_iso(utcnow()), token_hash)
+        )
+
+    def delete_session(self, token_hash: str) -> None:
+        self._exec("DELETE FROM sessions WHERE token_hash = ?", (token_hash,))
+
+    def delete_all_sessions(self) -> None:
+        self._exec("DELETE FROM sessions")
+
+    def purge_sessions(self, idle_before: datetime, created_before: datetime) -> None:
+        self._exec(
+            "DELETE FROM sessions WHERE last_seen < ? OR created_at < ?",
+            (_iso(idle_before), _iso(created_before)),
+        )
+
+    # ------------------------------------------------------------------ login attempts
+    def record_login_attempt(self, ip: str | None, success: bool) -> None:
+        self._exec(
+            "INSERT INTO login_attempts(ts, ip, success) VALUES(?, ?, ?)",
+            (_iso(utcnow()), ip, 1 if success else 0),
+        )
+
+    def count_failed_logins(self, since: datetime, ip: str | None = None) -> int:
+        if ip is None:
+            row = self._one(
+                "SELECT COUNT(*) AS n FROM login_attempts WHERE success = 0 AND ts >= ?",
+                (_iso(since),),
+            )
+        else:
+            row = self._one(
+                "SELECT COUNT(*) AS n FROM login_attempts WHERE success = 0 AND ts >= ? AND ip = ?",
+                (_iso(since), ip),
+            )
+        return int(row["n"]) if row else 0
+
+    def purge_login_attempts(self, before: datetime) -> None:
+        self._exec("DELETE FROM login_attempts WHERE ts < ?", (_iso(before),))
+
+    # ------------------------------------------------------------------ audit
+    def audit(
+        self,
+        action: str,
+        detail: dict[str, Any] | None = None,
+        ip: str | None = None,
+        actor: str = "owner",
+    ) -> None:
+        self._exec(
+            "INSERT INTO audit(ts, actor, action, detail, ip) VALUES(?, ?, ?, ?, ?)",
+            (_iso(utcnow()), actor, action, json.dumps(detail or {}, default=str), ip),
+        )
+
+    def list_audit(self, limit: int = 50) -> list[dict[str, Any]]:
+        rows = self._all("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,))
+        return [
+            {
+                "id": r["id"],
+                "ts": r["ts"],
+                "actor": r["actor"],
+                "action": r["action"],
+                "detail": json.loads(r["detail"] or "{}"),
+                "ip": r["ip"],
+            }
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------ decisions
+    def insert_decision(self, batch: DecisionBatch) -> int:
+        cur = self._exec(
+            "INSERT INTO decisions(ts, maker, model, market_view, decisions, candidates,"
+            " input_tokens, output_tokens, cost_usd, refused, error)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _iso(batch.ts),
+                batch.maker,
+                batch.model,
+                batch.market_view,
+                json.dumps([d.model_dump(mode="json") for d in batch.decisions]),
+                json.dumps([c.model_dump(mode="json") for c in batch.candidates]),
+                batch.input_tokens,
+                batch.output_tokens,
+                batch.cost_usd,
+                1 if batch.refused else 0,
+                batch.error,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def list_decisions(self, limit: int = 20) -> list[DecisionBatch]:
+        rows = self._all("SELECT * FROM decisions ORDER BY id DESC LIMIT ?", (limit,))
+        return [
+            DecisionBatch(
+                id=r["id"],
+                ts=_dt(r["ts"]),
+                maker=r["maker"],
+                model=r["model"],
+                market_view=r["market_view"] or "",
+                decisions=json.loads(r["decisions"]),
+                candidates=json.loads(r["candidates"]),
+                input_tokens=r["input_tokens"],
+                output_tokens=r["output_tokens"],
+                cost_usd=r["cost_usd"],
+                refused=bool(r["refused"]),
+                error=r["error"],
+            )
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------ orders
+    def _order_from_row(self, r: sqlite3.Row) -> OrderRecord:
+        return OrderRecord(
+            id=r["id"],
+            request=OrderRequest.model_validate_json(r["request"]),
+            status=OrderStatus(r["status"]),
+            broker_order_id=r["broker_order_id"],
+            filled_qty=r["filled_qty"],
+            avg_fill_price=r["avg_fill_price"],
+            commission=r["commission"],
+            message=r["message"],
+            created_at=_dt(r["created_at"]),
+            updated_at=_dt(r["updated_at"]),
+        )
+
+    def insert_order(self, rec: OrderRecord) -> int:
+        cur = self._exec(
+            "INSERT INTO orders(created_at, updated_at, request, status, broker_order_id,"
+            " filled_qty, avg_fill_price, commission, message) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                _iso(rec.created_at),
+                _iso(rec.updated_at),
+                rec.request.model_dump_json(),
+                rec.status.value,
+                rec.broker_order_id,
+                rec.filled_qty,
+                rec.avg_fill_price,
+                rec.commission,
+                rec.message,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    _ORDER_FIELDS = {
+        "status",
+        "broker_order_id",
+        "filled_qty",
+        "avg_fill_price",
+        "commission",
+        "message",
+        "request",
+    }
+
+    def update_order(self, order_id: int, **fields: Any) -> None:
+        unknown = set(fields) - self._ORDER_FIELDS
+        if unknown:
+            raise ValueError(f"unknown order fields: {sorted(unknown)}")
+        if not fields:
+            return
+        values: list[Any] = []
+        assignments: list[str] = []
+        for name, value in fields.items():
+            if name == "status" and isinstance(value, OrderStatus):
+                value = value.value
+            if name == "request" and isinstance(value, OrderRequest):
+                value = value.model_dump_json()
+            assignments.append(f"{name} = ?")
+            values.append(value)
+        assignments.append("updated_at = ?")
+        values.append(_iso(utcnow()))
+        values.append(order_id)
+        self._exec(f"UPDATE orders SET {', '.join(assignments)} WHERE id = ?", values)  # noqa: S608
+
+    def get_order(self, order_id: int) -> OrderRecord | None:
+        row = self._one("SELECT * FROM orders WHERE id = ?", (order_id,))
+        return self._order_from_row(row) if row else None
+
+    def get_order_by_broker_id(self, broker_order_id: str) -> OrderRecord | None:
+        row = self._one(
+            "SELECT * FROM orders WHERE broker_order_id = ? ORDER BY id DESC LIMIT 1",
+            (broker_order_id,),
+        )
+        return self._order_from_row(row) if row else None
+
+    def list_orders(
+        self, limit: int = 50, statuses: Iterable[OrderStatus] | None = None
+    ) -> list[OrderRecord]:
+        if statuses:
+            status_values = [s.value for s in statuses]
+            marks = ",".join("?" for _ in status_values)
+            rows = self._all(
+                f"SELECT * FROM orders WHERE status IN ({marks}) ORDER BY id DESC LIMIT ?",  # noqa: S608
+                [*status_values, limit],
+            )
+        else:
+            rows = self._all("SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,))
+        return [self._order_from_row(r) for r in rows]
+
+    # ------------------------------------------------------------------ fills
+    def insert_fill(self, fill: Fill) -> bool:
+        """Store a fill. Returns False if this exec_id was already recorded."""
+        cur = self._exec(
+            "INSERT OR IGNORE INTO fills(exec_id, broker_order_id, instrument, side, qty, price,"
+            " commission, ts) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                fill.exec_id,
+                fill.broker_order_id,
+                fill.instrument.key,
+                fill.side.value,
+                fill.qty,
+                fill.price,
+                fill.commission,
+                _iso(fill.ts),
+            ),
+        )
+        return cur.rowcount == 1
+
+    def update_fill_commission(self, exec_id: str, commission: float) -> None:
+        self._exec("UPDATE fills SET commission = ? WHERE exec_id = ?", (commission, exec_id))
+
+    def list_fills(self, since: datetime | None = None, limit: int = 500) -> list[Fill]:
+        if since is None:
+            rows = self._all("SELECT * FROM fills ORDER BY ts DESC LIMIT ?", (limit,))
+        else:
+            rows = self._all(
+                "SELECT * FROM fills WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+                (_iso(since), limit),
+            )
+        return [
+            Fill(
+                exec_id=r["exec_id"],
+                broker_order_id=r["broker_order_id"],
+                instrument=Instrument.from_key(r["instrument"]),
+                side=r["side"],
+                qty=r["qty"],
+                price=r["price"],
+                commission=r["commission"],
+                ts=_dt(r["ts"]),
+            )
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------ position metadata
+    def set_position_meta(
+        self,
+        instrument_key: str,
+        *,
+        stop_loss: float | None,
+        take_profit: float | None,
+        entry_price: float | None = None,
+        initial_risk: float | None = None,
+        opened_at: datetime | None = None,
+        decision_id: int | None = None,
+        setup: str | None = None,
+    ) -> None:
+        self._exec(
+            "INSERT INTO positions_meta(instrument, stop_loss, take_profit, entry_price,"
+            " initial_risk, opened_at, decision_id, setup) VALUES(?, ?, ?, ?, ?, ?, ?, ?)"
+            " ON CONFLICT(instrument) DO UPDATE SET stop_loss = excluded.stop_loss,"
+            " take_profit = excluded.take_profit, entry_price = excluded.entry_price,"
+            " initial_risk = excluded.initial_risk, opened_at = excluded.opened_at,"
+            " decision_id = excluded.decision_id, setup = excluded.setup",
+            (
+                instrument_key,
+                stop_loss,
+                take_profit,
+                entry_price,
+                initial_risk,
+                _iso(opened_at or utcnow()),
+                decision_id,
+                setup,
+            ),
+        )
+
+    def get_position_meta(self, instrument_key: str) -> dict[str, Any] | None:
+        row = self._one("SELECT * FROM positions_meta WHERE instrument = ?", (instrument_key,))
+        if not row:
+            return None
+        data = dict(row)
+        data["opened_at"] = _dt(data["opened_at"])
+        return data
+
+    def all_position_meta(self) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        for row in self._all("SELECT * FROM positions_meta"):
+            data = dict(row)
+            data["opened_at"] = _dt(data["opened_at"])
+            out[data["instrument"]] = data
+        return out
+
+    def delete_position_meta(self, instrument_key: str) -> None:
+        self._exec("DELETE FROM positions_meta WHERE instrument = ?", (instrument_key,))
+
+    # ------------------------------------------------------------------ trades
+    def insert_trade(self, tr: TradeRecord) -> int:
+        cur = self._exec(
+            "INSERT INTO trades(instrument, qty, entry_price, exit_price, entry_ts, exit_ts, pnl,"
+            " commission, setup, decision_id, r_multiple, exit_reason)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                tr.instrument.key,
+                tr.qty,
+                tr.entry_price,
+                tr.exit_price,
+                _iso(tr.entry_ts),
+                _iso(tr.exit_ts),
+                tr.pnl,
+                tr.commission,
+                tr.setup,
+                tr.decision_id,
+                tr.r_multiple,
+                tr.exit_reason,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def list_trades(self, limit: int = 50, since: datetime | None = None) -> list[TradeRecord]:
+        if since is None:
+            rows = self._all("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,))
+        else:
+            rows = self._all(
+                "SELECT * FROM trades WHERE exit_ts >= ? ORDER BY id DESC LIMIT ?",
+                (_iso(since), limit),
+            )
+        return [
+            TradeRecord(
+                id=r["id"],
+                instrument=Instrument.from_key(r["instrument"]),
+                qty=r["qty"],
+                entry_price=r["entry_price"],
+                exit_price=r["exit_price"],
+                entry_ts=_dt(r["entry_ts"]),
+                exit_ts=_dt(r["exit_ts"]),
+                pnl=r["pnl"],
+                commission=r["commission"],
+                setup=r["setup"],
+                decision_id=r["decision_id"],
+                r_multiple=r["r_multiple"],
+                exit_reason=r["exit_reason"],
+            )
+            for r in rows
+        ]
+
+    # ------------------------------------------------------------------ daily stats
+    def get_day(self, day: str) -> DayStats | None:
+        row = self._one("SELECT data FROM daily_stats WHERE day = ?", (day,))
+        return DayStats.model_validate_json(row["data"]) if row else None
+
+    def upsert_day(self, stats: DayStats) -> None:
+        self._exec(
+            "INSERT INTO daily_stats(day, data) VALUES(?, ?)"
+            " ON CONFLICT(day) DO UPDATE SET data = excluded.data",
+            (stats.day, stats.model_dump_json()),
+        )
+
+    def list_days(self, limit: int = 30) -> list[DayStats]:
+        rows = self._all("SELECT data FROM daily_stats ORDER BY day DESC LIMIT ?", (limit,))
+        return [DayStats.model_validate_json(r["data"]) for r in rows]
+
+    def latest_day_before(self, day: str) -> DayStats | None:
+        row = self._one(
+            "SELECT data FROM daily_stats WHERE day < ? ORDER BY day DESC LIMIT 1", (day,)
+        )
+        return DayStats.model_validate_json(row["data"]) if row else None
+
+    # ------------------------------------------------------------------ equity curve
+    def add_equity_point(self, equity: float, ts: datetime | None = None) -> None:
+        self._exec(
+            "INSERT OR REPLACE INTO equity(ts, equity) VALUES(?, ?)",
+            (_iso(ts or utcnow()), equity),
+        )
+
+    def list_equity(self, since: datetime | None = None, limit: int = 5000) -> list[dict[str, Any]]:
+        if since is None:
+            rows = self._all("SELECT * FROM equity ORDER BY ts DESC LIMIT ?", (limit,))
+        else:
+            rows = self._all(
+                "SELECT * FROM equity WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
+                (_iso(since), limit),
+            )
+        return [{"ts": r["ts"], "equity": r["equity"]} for r in reversed(rows)]

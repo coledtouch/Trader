@@ -1,0 +1,454 @@
+# AI Trader: Technical Specification
+
+This is the build contract for every module. If you change a contract here, update the
+code that depends on it and this file in the same change.
+
+## 1. Purpose and non-negotiables
+
+A private, self-hosted web app (one owner, no other users) that runs an AI-assisted
+trading bot against an Interactive Brokers (IBKR) account. The owner manages it from a
+laptop and an Android phone (installable PWA).
+
+Owner context that shapes the design:
+- Starting capital: **$250–$750**, IBKR Pro, **"No Borrow Margin"** account type (can't
+  borrow, can use unsettled funds; may still be subject to the old PDT day-trade count
+  until IBKR adopts FINRA's 2026 intraday-margin rule).
+- Owner's stated goal: "$100/day minimum". That is ~13–40% per day on this capital. It is
+  **not achievable reliably**; chasing it is the classic way small accounts blow up.
+  The app shows the target and progress toward it, but **no code path may increase risk
+  because the bot is behind its target** (no martingale, no "make it back" sizing).
+- Inspiration: a Reddit post where a Grok agent was given a $20K *paper* account and a
+  "$1K/day minimum" quota on thin small caps. Lessons from that thread that are
+  requirements here:
+  1. Paper fills on thin names are unrealistically kind → simulator models spread,
+     slippage and partial liquidity; risk manager filters illiquid names.
+  2. A daily quota pushes a model to size up and chase → hard risk caps in code;
+     the AI can only scale size *down*.
+  3. One good day proves nothing → full journal, equity curve, per-trade R multiples,
+     backtester with fees and slippage.
+  4. A bot that lost its broker connection almost held $50K of 0DTE SPX over a weekend →
+     **broker-side protective stops** placed with every stock entry, disconnect alerts,
+     reconcile + re-protect on reconnect, flatten stocks before the close.
+  5. LLMs "fluff" their outputs → every decision is logged with timestamp, inputs
+     (candidates), outputs, tokens and cost; the UI shows what actually happened
+     (fills from the broker), not what the model claims.
+
+Safety rules (enforced in code, covered by tests):
+- Default broker is the offline simulator. Real-money orders need **all three**:
+  `TRADER_ALLOW_LIVE=true` env, a live (non-"DU") IBKR account, and the owner "arming"
+  live trading in the UI with a fresh TOTP code. Otherwise a live account runs in
+  **shadow mode**: decisions are logged, orders are recorded as BLOCKED, nothing is sent.
+- Every entry must have a stop-loss below entry; long-only; no shorting; no options
+  writing; no leverage beyond `max_total_exposure_pct` (≤100%).
+- Hard caps in `trader.models.HARD_CAPS` clamp user settings.
+- Daily loss limit → halt (and flatten if `flatten_on_halt`). Resume requires TOTP.
+- In LIVE mode, block stock entries when market data is delayed.
+- Block stock entries when `AccountSnapshot.day_trades_remaining` is known and < 1.
+- Kill switch (UI button) → halt, cancel all orders, flatten all positions.
+- LLM spend is tracked; daily LLM budget exhausted → fall back to rules-only decisions
+  (never trade blindly), and log it.
+
+## 2. Stack
+
+Python 3.12+ (3.13 in Docker), FastAPI + Uvicorn, asyncio throughout, SQLite (stdlib),
+`ib_async` 2.1.0 for IBKR (TWS API via IB Gateway), `anthropic` 2.1.0 for Claude,
+`argon2-cffi`, `pyotp`, `cryptography` (Fernet), `httpx` (ntfy + tests), `qrcode`.
+Frontend: static HTML/CSS/vanilla JS (no build step, no CDN), PWA manifest + service
+worker. Strict CSP: no inline scripts or styles.
+
+Dependencies are pinned in `requirements.txt` / `requirements-dev.txt`. Do not add new
+runtime dependencies without a strong reason.
+
+## 3. Layout and module ownership
+
+```
+trader/
+  __init__.py
+  __main__.py          # `python -m trader [serve|setup|reset-password|backtest|...]` -> cli.main
+  cli.py               # argparse CLI (setup wizard, password/TOTP reset, backtest, status)
+  config.py            # AppConfig (env, secrets)                       [DONE - shared]
+  models.py            # shared pydantic types                         [DONE - shared]
+  db.py                # SQLite Database class                          [DONE - shared]
+  timeutil.py          # market calendar/hours helpers (NY time, holidays)
+  indicators.py        # pure-python indicators
+  risk.py              # RiskManager (sizing + checks + halts)
+  engine.py            # Engine: loops, orchestration, journal, reconciliation; build_engine()
+  notify.py            # Notifier (ntfy) - optional
+  backtest.py          # backtester for the rule-based strategy (CLI entry)
+  broker/
+    base.py            # Broker ABC                                     [DONE - shared]
+    sim.py             # SimBroker (synthetic market, realistic fills)
+    ibkr.py            # IBKRBroker (ib_async)
+  strategy/
+    signals.py         # Scanner: setups -> Candidate list
+    decide.py          # DecisionMaker protocol + RuleBasedDecisionMaker
+    claude.py          # ClaudeDecisionMaker (Anthropic API, structured output)
+    prompts.py         # system prompt + context rendering for Claude
+  security/
+    auth.py            # passwords, TOTP, sessions, CSRF, rate limiting, step-up
+    crypto.py          # Fernet helpers for secrets at rest
+  web/
+    app.py             # create_app(): FastAPI app, middleware, routes
+    static/            # index.html, login.html, app.js, login.js, styles.css,
+                       # manifest.webmanifest, sw.js, icon.svg, icon-192.png?, icon-512.png?
+tests/                 # pytest; no network; sim broker + fake LLM
+docs/                  # SPEC.md (this), SETUP_IBKR.md, DEPLOY.md, SECURITY.md, STRATEGY.md
+Dockerfile, docker-compose.yml, .env.example, README.md, .github/workflows/ci.yml
+```
+
+## 4. Shared contracts (already implemented)
+
+- `trader/models.py`: all domain types. Key ones: `Instrument` (`.key` = "STK:AAPL"),
+  `Bar`, `Quote` (`.price`), `Position`, `AccountSnapshot`, `OrderRequest`, `OrderRecord`,
+  `Fill`, `Candidate`, `AIDecision`, `DecisionBatch`, `RiskLimits`, `HARD_CAPS`,
+  `LOWER_IS_LOOSER`, `BotSettings`, `RiskVerdict`, `DayStats`, `TradeRecord`,
+  `EngineStatus`, `DecisionContext`.
+- `trader/config.py`: `AppConfig` (env prefix `TRADER_`), `get_config()`.
+- `trader/db.py`: `Database` - kv/flags, settings, auth row, sessions, login attempts,
+  audit, decisions, orders, fills, positions_meta, trades, daily_stats, equity.
+- `trader/broker/base.py`: `Broker` ABC + `BrokerError`; default `round_qty`,
+  `close_position`, `flatten_all`.
+
+Read these files before writing code that uses them. Do not change their public
+signatures; if you truly need a new field or method, add it (backward compatible) and
+mention it in your final report.
+
+## 5. Module specifications
+
+### 5.1 `trader/timeutil.py`
+- `NY = ZoneInfo(config.market_timezone)` default "America/New_York".
+- `trading_day(now: datetime) -> str` - NY calendar date "YYYY-MM-DD" (crypto P&L day
+  also rolls at NY midnight; one day boundary for everything).
+- `is_us_market_holiday(d: date) -> bool` - NYSE full-day holidays for 2025–2028
+  (hard-coded list; note half-days: 13:00 close on day after Thanksgiving, Christmas Eve,
+  July 3 when applicable).
+- `stock_market_open(now) -> bool` (regular session 09:30–16:00 NY, weekdays, not holiday,
+  respects half-day early closes).
+- `market_close_time(day) -> datetime` (16:00 or 13:00 NY, tz-aware).
+- `in_entry_window(now, start="09:45", cutoff="15:30") -> bool` (also false on holidays
+  and after an early close minus 20 min).
+- `minutes_to_close(now) -> float | None`.
+
+### 5.2 `trader/indicators.py` (pure functions on `list[float]` / `list[Bar]`)
+`sma, ema, rsi (Wilder), atr (Wilder), bollinger(period, k) -> (mid, upper, lower),
+session_vwap(bars, tz) (resets each NY session), highest, lowest, pct_change,
+avg_volume`. Return lists aligned with the input (None for warm-up) or a latest scalar
+helper `last(values)`. Unit-tested against hand-computed values.
+
+### 5.3 `trader/strategy/signals.py`
+`Scanner(settings: BotSettings)` with `scan(instrument, bars, quote, now) -> list[Candidate]`
+and `snapshot(instrument, bars, quote) -> dict[str, float]` (price, ema9, ema21, rsi14,
+atr14, atr_pct, vwap, dist_vwap_pct, rel_volume, day_change_pct, high_of_day,
+low_of_day, ...). Setups (long-only), each with score 0..1, ATR-based stop and target
+with reward:risk >= 2 by default:
+- `orb_breakout` - price breaks the opening-range (first 15 min) high on rel volume > 1.5,
+  above VWAP, EMA9 > EMA21. (Stocks only.)
+- `vwap_reclaim` - crosses back above VWAP after trading below, rising EMA9.
+- `trend_pullback` - EMA9 > EMA21 rising, pullback to EMA21 with bullish close.
+- `rsi_reversion` - RSI14 < 30 turning up, price at/below lower Bollinger band, not in a
+  steep downtrend (price within 2 ATR of EMA21). Smaller score.
+Filters: price >= `risk.min_price`, avg volume >= `min_avg_volume` (stocks), enough bars.
+Crypto uses the same setups minus ORB, with a rolling 24h "session" for VWAP.
+
+### 5.4 `trader/strategy/decide.py`
+```python
+class DecisionMaker(Protocol):
+    name: str
+    async def decide(self, ctx: DecisionContext) -> DecisionBatch: ...
+
+class RuleBasedDecisionMaker:   # name = "rules"
+    # Highest-score candidate above settings.llm_min_candidate_score -> BUY with the
+    # candidate's stop/target, LIMIT at candidate price; CLOSE positions whose setup has
+    # invalidated (e.g. close below VWAP for vwap/orb setups) - conservative, deterministic.
+```
+`DecisionBatch.candidates` must be set to `ctx.candidates`.
+
+### 5.5 `trader/strategy/claude.py` + `prompts.py`
+`ClaudeDecisionMaker(api_key, model, effort, fallback: DecisionMaker)`; `name = "claude"`.
+- Uses `anthropic.AsyncAnthropic`. Default model `claude-opus-5-5`, effort from settings
+  (`output_config={"effort": ...}`); never send temperature/top_p/top_k or a thinking
+  budget (400 on this model). Thinking stays default (adaptive).
+- Structured output: `client.beta.messages.parse(..., output_format=<pydantic model>,
+  betas=["server-side-fallback-2026-07-01"], fallbacks="default")` - verified present in
+  anthropic 2.1.0. Validate the parsed result again and convert to `AIDecision`s.
+- Handle `stop_reason == "refusal"` (→ `refused=True`, no decisions), `max_tokens`
+  (→ error, no decisions), API errors with the typed exception chain (→ error, no
+  decisions). On any failure the batch has **no BUY decisions** (fail safe), but the
+  engine still manages exits via stops.
+- Prompt caching: stable system prompt with `cache_control`; volatile context in the
+  user message. Never put timestamps in the system prompt.
+- Cost: compute from `usage` (input, output, cache read, cache write) with a per-model
+  price table (USD per 1M tokens): opus-5-5 4/20 (cache read 0.20, write 5.0),
+  sonnet-5-5 2/10 (0.20, 2.5), haiku-5-5 0.10/0.50 (0.01, 0.125); unknown model →
+  opus prices. `max_tokens` 16000 (non-streaming parse).
+- The system prompt makes Claude a disciplined intraday risk manager: may only BUY
+  symbols present in candidates (or CLOSE/HOLD existing positions), must provide
+  stop below entry, prefers HOLD when edge is unclear, never sizes up to catch a
+  daily target, explains rationale in <= 2 sentences, respects delayed-data warnings.
+  The engine re-validates all of this anyway.
+
+### 5.6 `trader/risk.py`
+```python
+class RiskManager:
+    def __init__(self, limits: RiskLimits): ...   # clamps to HARD_CAPS
+    def effective_limits(self) -> RiskLimits
+    def size_entry(self, *, decision: AIDecision, entry: float, stop: float,
+                   account: AccountSnapshot, positions: list[Position], day: DayStats,
+                   broker: Broker, allow_fractional: bool) -> tuple[float, list[str]]
+    def check(self, req: OrderRequest, *, quote: Quote, account: AccountSnapshot,
+              positions: list[Position], open_orders: list[OrderRecord], day: DayStats,
+              mode: Mode, data_delayed: bool, broker: Broker,
+              now: datetime, settings: BotSettings) -> RiskVerdict
+    def halt_reason(self, *, account: AccountSnapshot, day: DayStats) -> str | None
+```
+Sizing: `risk_usd = start_equity * max_risk_per_trade_pct/100 * size_fraction * streak`
+(streak = 0.5 when `day.loss_streak >= loss_streak_halve_after`), qty = min(risk_usd /
+(entry - stop), max_position_pct·equity/entry, max_order_notional/entry, available cash
+/ entry (settled_cash for cash-like accounts; buying_power capped at equity), remaining
+exposure room / entry), rounded DOWN with `broker.round_qty`. Size never depends on the
+daily target or on being behind.
+Entry checks (any failure blocks): halted day; trades_today >= max; open positions >=
+max; already holding the instrument; stop missing or >= entry; target (if given) <=
+entry; reward:risk < min; price < min_price; limit price outside collar vs quote; order
+notional > max; exposure after fill > max_total_exposure; fees (2 × estimate_commission)
+> max_fee_to_reward_pct of expected reward; stock entry outside entry window or market
+closed; LIVE + delayed data for stocks; day_trades_remaining known and < 1 for stocks;
+quote missing/stale (> 2 × monitor interval for live data); qty rounds to 0.
+Exits (`is_exit`) are always allowed if they reduce an existing long and never exceed
+the held qty (no accidental shorts).
+Halt reasons: equity <= start_equity × (1 − max_daily_loss_pct/100) → "daily loss limit";
+pnl >= target and stop_trading_at_target → "daily target reached" (a *soft* halt: no new
+entries, existing positions keep their stops; resets next day).
+
+### 5.7 `trader/engine.py`
+```python
+class Engine:
+    def __init__(self, config: AppConfig, db: Database, broker: Broker,
+                 decider: DecisionMaker, notifier: Notifier | None = None,
+                 clock: Callable[[], datetime] = utcnow): ...
+    async def start(self) -> None        # connect + start loops (idempotent); sets running
+    async def stop(self) -> None         # stop loops; keep positions & broker stops
+    async def shutdown(self) -> None     # stop + disconnect (app shutdown)
+    async def kill(self, actor: str = "owner") -> None    # halt + cancel_all + flatten_all
+    async def resume(self, actor: str = "owner") -> None  # clear halt for today
+    async def run_cycle(self, manual: bool = False) -> DecisionBatch | None
+    async def monitor_tick(self) -> None
+    async def approve_order(self, order_id: int, actor: str = "owner") -> OrderRecord
+    async def reject_order(self, order_id: int, actor: str = "owner") -> OrderRecord
+    async def arm_live(self, actor: str = "owner") -> None    # caller already verified TOTP
+    async def disarm_live(self, actor: str = "owner") -> None
+    def reload_settings(self) -> None   # re-read BotSettings from db
+    def status(self) -> EngineStatus
+    def snapshot(self) -> dict          # cached {"account", "positions", "open_orders"}
+                                         # refreshed by monitor_tick (no broker calls here)
+
+def build_engine(config: AppConfig, db: Database) -> Engine
+    # broker: SimBroker if config.broker == "sim" else IBKRBroker
+    # decider: ClaudeDecisionMaker(fallback=RuleBasedDecisionMaker) when an API key is
+    #          configured and settings.llm_enabled, else RuleBasedDecisionMaker
+```
+Loops (asyncio tasks, each wrapped so one exception logs + sets `last_error` and the
+loop continues; exponential backoff on broker errors; never crash the app):
+- **monitor loop** every `monitor_seconds`: ensure connected (reconnect with backoff;
+  notify once if down > 60 s, and again on recovery), refresh account/positions/open
+  orders cache, sync order statuses + fills into the journal (dedupe by exec_id), build
+  `TradeRecord`s when a position closes (FIFO from fills; pnl after commissions; R
+  multiple from positions_meta.initial_risk), update DayStats (start_equity at first
+  snapshot of the day; wins/losses/loss_streak/fees/realized), record equity point at
+  most every 5 min, evaluate `halt_reason` (halt + flatten per settings + notify),
+  engine-side stop/target check for positions without native stops (and as a backup
+  for stocks: only if price breaches stop by > 0.5% and no protective order is working),
+  re-place missing protective stops for stock positions after reconnect, and flatten
+  stocks at close − 10 min when `flatten_stocks_before_close`.
+- **decision loop** every `cycle_seconds`: skip when halted, disconnected, or nothing is
+  tradable now (stocks closed and crypto disabled). Build universe (settings + optional
+  scanner movers), fetch bars + quote per instrument (concurrency-limited, per-symbol
+  errors tolerated), run Scanner, build `DecisionContext`. Call the LLM only if there is
+  a candidate scoring >= `llm_min_candidate_score` or an open position to manage and
+  today's LLM cost < budget; otherwise use the rule-based maker (and log why). Journal
+  the batch (`insert_decision`), update `DayStats.llm_cost`. For each decision: BUY →
+  build `OrderRequest` (LIMIT at decision limit or quote ask/last; stop/target from the
+  decision or candidate) → size → risk check → BLOCKED (journal with reasons) or, if
+  approved: shadow mode → BLOCKED("shadow mode"); autopilot off → PENDING_APPROVAL
+  (+ notify); else place via broker, journal, store positions_meta (stop, target,
+  entry, initial_risk = (entry − stop) × qty, setup, decision_id), count the trade.
+  CLOSE → `broker.close_position`. HOLD → nothing.
+- `approve_order` re-runs the full risk check with fresh data before sending; pending
+  approvals expire after 10 minutes (→ CANCELLED, "approval expired").
+- All owner actions (start/stop/kill/resume/arm/disarm/approve/reject/settings) are
+  written to the audit log by the web layer; engine-originated events (halts, flatten,
+  reconnects) are audited with actor "engine".
+- Live gating: `shadow = (broker.mode == LIVE) and not (config.allow_live and
+  db.get_flag("live_armed"))`. `arm_live` raises `PermissionError` if `config.allow_live`
+  is False or the broker is not LIVE.
+
+### 5.8 `trader/notify.py`
+`Notifier(config)` with `async send(title, message, priority="default", tags=None)`; no-op
+when `ntfy_url` is unset; never raises (log failures); 5 s timeout; rate limit duplicate
+messages (same title within 60 s).
+
+### 5.9 `trader/broker/sim.py`
+`SimBroker(seed, starting_cash, clock=utcnow, commission_model="ibkr_pro_fixed")`,
+`mode = SIM`, always "connected" after `connect()`. Synthetic market: per-symbol
+geometric random walk with intraday volatility regimes and volume, deterministic per
+seed, with sensible base prices (SPY ~ 600, QQQ ~ 520, AAPL ~ 230, AMD ~ 160, F ~ 11,
+SOFI ~ 15, PLTR ~ 40, INTC ~ 22, BTC ~ 65000, ETH ~ 3000; unknown symbols get a stable
+hash-based price). `bars()` returns history consistent with `quote()`; time advances
+with the injected clock (tests use a fake clock). Fills: market orders fill at ask/bid
+plus slippage (bps scaled by inverse liquidity); limit orders fill when price crosses;
+bracket stops/targets are simulated natively (`supports_native_stops` True for stocks,
+False for crypto so the engine path is exercised). Commission models: IBKR Pro Fixed
+stocks $0.005/share, min $1.00, max 1% of trade value; crypto 0.18% of value, min
+$1.75, max 1% of value. No shorting (sells beyond held qty are rejected). Cash account
+semantics (no borrowing). Expose `advance(seconds)` for tests.
+
+### 5.10 `trader/broker/ibkr.py`
+`IBKRBroker(config)` using `ib_async.IB` (asyncio; never call blocking variants; never
+`util.startLoop`/`nest_asyncio` inside the server). Connect with `connectAsync(host,
+port, clientId, timeout)`, `reqMarketDataType(config.ib_market_data_type)`. Mode from
+account id ("DU…" → PAPER, else LIVE). Account values from `accountValues()` /
+`accountSummaryAsync()` tags: NetLiquidation, TotalCashValue, SettledCash, BuyingPower,
+AvailableFunds, RealizedPnL, UnrealizedPnL, DayTradesRemaining (−1 → None). Contracts:
+stocks `Stock(symbol, "SMART", "USD")`, crypto `Crypto(symbol, "PAXOS", "USD")`; qualify
+and cache. Bars via `reqHistoricalDataAsync` (useRTH False for crypto, True for
+stocks... choose sensibly), converted to UTC `Bar`s. Quotes via snapshot/streaming
+tickers with timeout; mark `delayed` when market data type is 3/4. Stock entries:
+bracket order (parent LMT/MKT, child STP at stop_loss, child LMT at take_profit,
+OCA, transmit flags correct; child TIF GTC so protection survives disconnects and the
+day boundary) via `bracketOrder` helpers when available. Crypto: IBKR crypto order
+rules differ (research them: cashQty for market buys, allowed TIFs, whether STP is
+supported) - implement what is supported, return REJECTED with a clear message
+otherwise, and report `supports_native_stops(crypto)` truthfully. Fills via
+`reqExecutionsAsync` + commission reports; order status from `trades()`/`openTrades()`.
+Event handlers: `disconnectedEvent`, `errorEvent` (log codes; 1100/1102 connectivity),
+`orderStatusEvent`. Estimate commissions with IBKR Pro Fixed (same as sim). Optional
+`async scan_movers(limit=10) -> list[str]` using `reqScannerDataAsync` (TOP_PERC_GAIN,
+US major, price 2–50, volume > 1M) that returns [] on any error. All IB calls wrapped
+with timeouts; raise `BrokerError` on connectivity failures.
+
+### 5.11 `trader/security/*` and `trader/web/app.py`
+Auth model: single owner. `python -m trader setup` creates the password (min 12 chars,
+argon2id) and a TOTP secret (shows otpauth URI + terminal QR), writes `TRADER_SECRET_KEY`
+to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
+- Sessions: 32-byte random token in cookie `__Host-trader` (HttpOnly, Secure,
+  SameSite=Strict, Path=/); store only SHA-256(token). If `cookie_secure` is False
+  (local http dev), cookie name `trader_session`, Secure off. Idle timeout and absolute
+  lifetime from config; purge expired on access. Logout deletes the row.
+- Login: `POST /api/auth/login {password, totp}` - both required, constant-time,
+  same generic error for any failure, per-IP limit (`login_max_attempts_per_ip` per
+  15 min → 429) and global lockout (`login_lockout_failures` in 15 min → 429 for
+  everyone), TOTP valid_window=1 with replay protection (`totp_last_step`), audit
+  every attempt. On success rotate session (new token), return `{"ok": true, "csrf":
+  "<token>"}`.
+- CSRF: every POST/PUT/PATCH/DELETE under `/api` except login requires header
+  `X-CSRF-Token` matching the session's csrf_token (constant-time) AND an `Origin`
+  (or `Referer`) that equals the request's own origin or one of `public_origins`.
+- Step-up: `/api/live/arm`, `/api/bot/resume`, and settings changes that loosen any
+  risk limit (vs current; see `LOWER_IS_LOOSER`) or enable autopilot while live require
+  a fresh `totp` field in the body (replay-protected).
+- Middleware: TrustedHostMiddleware (`allowed_hosts`), security headers on every
+  response: `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src
+  'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src
+  'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`,
+  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy:
+  no-referrer`, `Permissions-Policy: camera=(), microphone=(), geolocation=()`,
+  `Cross-Origin-Opener-Policy: same-origin`, HSTS when `cookie_secure`, and
+  `Cache-Control: no-store` on `/api/*` and HTML. No OpenAPI docs routes
+  (`docs_url=None, redoc_url=None, openapi_url=None`). Request body size limit 64 KB.
+  Client IP = socket peer unless `trust_proxy_headers`.
+- `create_app(config: AppConfig | None = None, db: Database | None = None,
+  engine: Engine | None = None, start_engine: bool = True) -> FastAPI` - lifespan creates
+  the db/engine if not given; engine is started only if the persisted flag
+  `engine_running` is True (so a restart resumes the previous on/off state). Tests pass
+  `start_engine=False` and their own engine/db.
+
+### 5.12 HTTP API contract (JSON; all `/api/*` except `/api/auth/login` and
+`/api/session` require a valid session → 401 `{"detail": "..."}` otherwise)
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| GET | `/healthz` | - | `{"ok": true}` (no auth, no details) |
+| GET | `/` | - | index.html if authed, else 302 → `/login` |
+| GET | `/login` | - | login.html |
+| GET | `/static/*` | - | static assets |
+| POST | `/api/auth/login` | `{"password", "totp"}` | `{"ok": true, "csrf"}` + cookie; 401; 429 |
+| POST | `/api/auth/logout` | - | `{"ok": true}` |
+| GET | `/api/session` | - | `{"authenticated": bool, "csrf"?: str}` |
+| GET | `/api/status` | - | `{"status": EngineStatus, "account": AccountSnapshot\|null, "positions": [Position], "open_orders": [OrderRecord], "pending": [OrderRecord], "today": DayStats\|null}` |
+| GET | `/api/decisions?limit=20` | - | `[DecisionBatch]` (limit ≤ 200) |
+| GET | `/api/orders?limit=50` | - | `[OrderRecord]` |
+| GET | `/api/trades?limit=50` | - | `[TradeRecord]` |
+| GET | `/api/equity?days=30` | - | `[{"ts", "equity"}]` |
+| GET | `/api/days?limit=30` | - | `[DayStats]` |
+| GET | `/api/audit?limit=50` | - | `[{"id","ts","actor","action","detail","ip"}]` |
+| GET | `/api/settings` | - | `{"settings": BotSettings, "hard_caps": {...}, "llm_available": bool, "live_allowed": bool}` |
+| PUT | `/api/settings` | `{"settings": BotSettings, "totp"?: str}` | same as GET; 403 `{"detail":"step_up_required"}` when TOTP needed/invalid; 422 invalid |
+| POST | `/api/bot/start` | - | `EngineStatus` |
+| POST | `/api/bot/stop` | - | `EngineStatus` |
+| POST | `/api/bot/kill` | - | `EngineStatus` |
+| POST | `/api/bot/resume` | `{"totp"}` | `EngineStatus`; 403 step_up_required |
+| POST | `/api/bot/cycle` | - | `{"ok": true}` (runs one decision cycle in background) |
+| POST | `/api/live/arm` | `{"totp"}` | `EngineStatus`; 403 if not allowed / bad TOTP |
+| POST | `/api/live/disarm` | - | `EngineStatus` |
+| POST | `/api/orders/{id}/approve` | - | `OrderRecord`; 409 if not pending |
+| POST | `/api/orders/{id}/reject` | - | `OrderRecord`; 409 if not pending |
+
+Datetimes serialize as ISO-8601 strings (pydantic `model_dump(mode="json")`).
+
+### 5.13 Frontend (`trader/web/static/`)
+Mobile-first, dark/light via `prefers-color-scheme`, works at 360 px width and on a
+laptop. No external requests. Files: `login.html` + `login.js`, `index.html` + `app.js`,
+`styles.css`, `manifest.webmanifest` (name "AI Trader", display standalone, icons),
+`sw.js` (cache the static shell only; never cache `/api/*`; network-first for HTML),
+`icon.svg` (+ PNG icons generated if feasible).
+Views (bottom tab bar on phones, top tabs on desktop):
+- **Dashboard**: mode badge (SIM / PAPER / LIVE-SHADOW / LIVE-ARMED, color coded),
+  connection + market-open + delayed-data indicators, equity, today's P&L vs target
+  (progress bar that also shows the loss limit), trades today / max, LLM cost today /
+  budget, open positions (qty, avg, last, unrealized P&L, stop, target), pending
+  approvals with Approve / Reject buttons, halt banner with reason, big buttons:
+  Start/Stop bot, Run cycle now, **KILL** (confirm dialog: "Cancel all orders and close
+  every position?"), Resume (asks for a 2FA code).
+- **Activity**: AI decision log (time, maker/model, market view, each decision with
+  action/symbol/conviction/rationale, cost, refused/errors), orders (status chips,
+  block reasons), closed trades (P&L, R), equity chart (inline SVG line chart drawn in
+  JS, last 30 days), daily stats table.
+- **Settings**: form for BotSettings incl. nested risk limits, showing hard caps;
+  universe editors (comma-separated); save → if the server answers 403
+  step_up_required, prompt for a 2FA code and retry; Live trading card: shows whether
+  live is allowed by the server, Arm (2FA) / Disarm; audit log list; Logout.
+Behavior: poll `/api/status` every 5 s while the page is visible (pause when hidden);
+show a stale-data warning if polling fails; all mutating fetches send `X-CSRF-Token`
+(from `/api/session`) and handle 401 by redirecting to `/login`. Escape all text
+(build DOM with `textContent`, never `innerHTML` with data). Accessible: labels,
+focus states, 44 px tap targets, `aria-live` for P&L/halt changes.
+
+### 5.14 Deployment
+- `Dockerfile`: python:3.13-slim, non-root user, `pip install --no-cache-dir -r
+  requirements.txt`, copy `trader/`, `HEALTHCHECK` hitting `/healthz`, `CMD ["python",
+  "-m", "trader", "serve"]`, data volume `/data` (`TRADER_DATA_DIR=/data`).
+- `docker-compose.yml`: services `ib-gateway` (ghcr.io/gnzsnz/ib-gateway image with
+  IBC; env from `.env`: TWS_USERID, TWS_PASSWORD, TRADING_MODE=paper|live,
+  READ_ONLY_API=no, TWOFA_TIMEOUT_ACTION=restart, auto-restart time; **no host ports
+  published** except optionally VNC on 127.0.0.1) and `trader` (builds the Dockerfile,
+  `ports: ["127.0.0.1:8000:8000"]`, `TRADER_HOST=0.0.0.0` inside the container,
+  `TRADER_IB_HOST=ib-gateway`, port per the image's docs for container-to-container
+  access, volume `./data:/data`, `restart: unless-stopped`).
+- Private access via **Tailscale** on the host: `tailscale serve --bg 8000` gives
+  `https://<machine>.<tailnet>.ts.net` reachable only from the owner's devices; set
+  `TRADER_ALLOWED_HOSTS`/`TRADER_PUBLIC_ORIGINS` accordingly. Never port-forward or
+  expose IB Gateway.
+- `.env.example` documents every variable with safe defaults.
+
+## 6. Testing requirements
+`pytest` must pass offline (no IBKR, no Anthropic). Cover at least: indicators; scanner
+setups on crafted bars; risk manager (every block reason, sizing math, hard caps,
+no-martingale property: sizing identical whether behind or ahead of target); engine
+end-to-end on SimBroker with a fake decision maker (entry → stop hit → trade journaled
+→ day stats; daily loss halt + flatten; kill switch; shadow mode blocks; approval flow
+and expiry; LLM budget fallback); Claude maker with a mocked client (parse success,
+refusal, API error → no BUYs, cost math); IBKR broker with a mocked `IB` object (account
+parsing incl. DayTradesRemaining, bracket construction, mode detection); auth (hashing,
+TOTP + replay, lockout, session expiry, CSRF + Origin checks, step-up); web API (login
+flow, 401s, headers present, settings step-up, approve/reject).
+`ruff check .` and `ruff format --check .` must pass.

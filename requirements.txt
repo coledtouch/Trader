@@ -1,0 +1,13 @@
+# Runtime dependencies (pinned). Update deliberately, then run the test suite.
+fastapi==0.161.1
+uvicorn[standard]==0.54.0
+pydantic==2.14.1
+pydantic-settings==2.16.1
+argon2-cffi==25.1.0
+pyotp==2.10.0
+cryptography==50.0.2
+httpx==0.28.1
+ib_async==2.1.0
+anthropic==2.1.0
+qrcode==8.2
+tzdata==2025.3
