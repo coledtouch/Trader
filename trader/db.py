@@ -32,6 +32,10 @@ from trader.models import (
     utcnow,
 )
 
+# kv: equity points before this time belong to an earlier broker account (or an earlier
+# simulator run) and are left out of the equity curve.
+EQUITY_SINCE_KEY = "equity_since"
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS kv (
     key TEXT PRIMARY KEY,
@@ -715,7 +719,14 @@ class Database:
             (_iso(ts or utcnow()), equity),
         )
 
+    def start_equity_history(self, ts: datetime) -> None:
+        """Hide earlier equity points (they belong to another broker account) from now on."""
+        self.set_kv(EQUITY_SINCE_KEY, _iso(ts))
+
     def list_equity(self, since: datetime | None = None, limit: int = 5000) -> list[dict[str, Any]]:
+        floor = _dt(self.get_kv(EQUITY_SINCE_KEY))
+        if floor is not None and (since is None or since < floor):
+            since = floor
         if since is None:
             rows = self._all("SELECT * FROM equity ORDER BY ts DESC LIMIT ?", (limit,))
         else:

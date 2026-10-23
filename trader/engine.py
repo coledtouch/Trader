@@ -37,7 +37,7 @@ from typing import Any, Protocol
 
 from trader.broker.base import Broker, BrokerError
 from trader.config import AppConfig
-from trader.db import Database
+from trader.db import EQUITY_SINCE_KEY, Database
 from trader.models import (
     LEVERAGED_ETFS,
     OPEN_ORDER_STATUSES,
@@ -412,6 +412,16 @@ class Engine:
         self._epoch_reason = "simulator restarted"
         self._rebase_pending = self._epoch is not None
         self._enforce_live_gate()
+        self._backfill_equity_floor()
+
+    def _backfill_equity_floor(self) -> None:
+        """Journals from before equity-curve restarts existed: start the curve at the last
+        recorded broker account change so it does not jump between accounts."""
+        if self.db.get_kv(EQUITY_SINCE_KEY) is not None:
+            return
+        changes = [a for a in self.db.list_audit(limit=1000) if a["action"] == "account_changed"]
+        if changes:
+            self.db.set_kv(EQUITY_SINCE_KEY, changes[0]["ts"])  # newest first
 
     def _enforce_live_gate(self) -> None:
         """Arming lasts only while the server gate (TRADER_ALLOW_LIVE) stays open. The gate
@@ -1020,6 +1030,9 @@ class Engine:
                         self.db.set_kv(BASELINE_PREFIX + day.day, "")
                         if is_soft_halt(day.halt_reason):  # the target was the old account's
                             day.halted, day.halt_reason = False, None
+                        # The equity curve restarts too, with a first point right now.
+                        self.db.start_equity_history(now)
+                        self._last_equity_at = None
                 if day.start_equity is None:
                     day.start_equity, changed = account.equity, True
                 if day.end_equity != account.equity:

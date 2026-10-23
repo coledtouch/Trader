@@ -5,7 +5,7 @@ change guard and market-data warnings."""
 from __future__ import annotations
 
 import dataclasses
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
@@ -392,6 +392,11 @@ async def test_account_change_starts_a_new_journal_epoch(db: Database, config: A
     assert audit["detail"]["live_disarmed"] is True
     assert "Broker account changed" in h.notes.titles()
     assert h.day().start_equity == pytest.approx(h.engine.snapshot()["account"].equity)
+    # The equity curve restarts with the new account (no jump from the old balance).
+    curve = db.list_equity()
+    assert curve and all(p["equity"] == pytest.approx(curve[0]["equity"]) for p in curve)
+    assert curve[0]["equity"] == pytest.approx(h.engine.snapshot()["account"].equity)
+    assert db._one("SELECT COUNT(*) AS n FROM equity")["n"] > len(curve)  # old points kept
     # The old position is left alone: no time stop, no engine stop, even when breached.
     h.broker.set_price("F", 9.0)
     for _ in range(3):
@@ -437,3 +442,16 @@ async def test_broker_data_warning_reaches_status_and_last_error(
     await h.engine.monitor_tick()
     status = h.engine.status()
     assert status.data_warning is None and status.last_error is None
+
+
+async def test_equity_curve_backfills_from_an_earlier_account_change(
+    db: Database, config: AppConfig
+) -> None:
+    """Journals written before the curve restart existed: the curve starts at the last
+    recorded account change, so it does not jump from the simulator's balance."""
+    real_now = datetime.now(UTC)  # the audit log is stamped with the real clock
+    db.add_equity_point(600.0, ts=real_now - timedelta(hours=2))
+    db.audit("account_changed", {"from": "SIM-7", "to": "DU...456"}, actor="engine")
+    db.add_equity_point(1_000_000.0, ts=real_now + timedelta(minutes=5))
+    await harness(db, config)
+    assert [p["equity"] for p in db.list_equity()] == [1_000_000.0]
