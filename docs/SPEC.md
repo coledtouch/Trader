@@ -309,7 +309,8 @@ port, clientId, timeout)`, `reqMarketDataType(config.ib_market_data_type)`. Mode
 account id ("DU…" → PAPER, else LIVE). Account values from `accountValues()` /
 `accountSummaryAsync()` tags: NetLiquidation, TotalCashValue, SettledCash, BuyingPower,
 AvailableFunds, RealizedPnL, UnrealizedPnL, DayTradesRemaining (−1 → None). Contracts:
-stocks `Stock(symbol, "SMART", "USD")`, crypto `Crypto(symbol, "PAXOS", "USD")`; qualify
+stocks `Stock(symbol, "SMART", "USD")`, crypto `Crypto(symbol, config.ib_crypto_exchange, "USD")`
+(default "ZEROHASH"; the owner's account routes BTC via ZEROHASH, conid 541686651); qualify
 and cache. Bars via `reqHistoricalDataAsync` (useRTH False for crypto, True for
 stocks... choose sensibly), converted to UTC `Bar`s. Quotes via snapshot/streaming
 tickers with timeout; mark `delayed` when market data type is 3/4. Stock entries:
@@ -392,6 +393,8 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
 | POST | `/api/live/disarm` | - | `EngineStatus` |
 | POST | `/api/orders/{id}/approve` | - | `OrderRecord`; 409 if not pending |
 | POST | `/api/orders/{id}/reject` | - | `OrderRecord`; 409 if not pending |
+| GET | `/api/signals?limit=100&setup=` | - | `[SignalRecord]` (limit ≤ 500) |
+| GET | `/api/signals/stats?days=30` | - | `[SetupStats]` |
 
 Datetimes serialize as ISO-8601 strings (pydantic `model_dump(mode="json")`).
 
@@ -452,3 +455,100 @@ parsing incl. DayTradesRemaining, bracket construction, mode detection); auth (h
 TOTP + replay, lockout, session expiry, CSRF + Origin checks, step-up); web API (login
 flow, 401s, headers present, settings step-up, approve/reject).
 `ruff check .` and `ruff format --check .` must pass.
+
+## 7. Round 2 additions (owner facts, Reddit lessons, deployment)
+
+Owner facts (from the live account, Oct 2026): IBKR **Pro, Tiered** pricing (Lite has no
+API access, so Pro is required), "No Borrow Margin" account, $510 equity, all trading
+permissions enabled (the app must still only ever build plain stock/ETF and crypto
+contracts). IBKR crypto routes via **ZEROHASH**. SPY trades ~$764 and BTC ~$81.7k, so many
+stocks are unaffordable as whole shares with a ~$255 position cap. Access will be via
+**Cloudflare Tunnel + Cloudflare Access at `desk.kaxo.dev`** on a DigitalOcean droplet
+(Ubuntu 24.04, Docker, user `trader`, ufw with only SSH open).
+
+Lessons from a second r/ai_trading post (a builder whose bots were "trash" on paper for
+7 months; two lucky manual halt trades made the money): write the rule down and **log every
+qualifying signal**, including the ones you skip, then score them for a month; halts can
+reopen −30–40%, never chase a halt; mark P&L at the **bid**; refuse spreads > 0.3%; wait
+for the open to settle; time stops; size small.
+
+### 7.1 Shared contract changes (implemented)
+- `trader/fees.py`: `estimate_commission(instrument, qty, price, side, plan)` - IBKR Pro
+  Tiered (default) / Fixed for stocks incl. sell-side regulatory fees; crypto 0.18% min
+  $1.75 capped at 1% of value. Brokers' `estimate_commission` must delegate to it with
+  `config.commission_plan`.
+- `AppConfig`: `ib_crypto_exchange` (ZEROHASH), `commission_plan` (tiered|fixed),
+  `cf_access_team_domain`, `cf_access_aud`, `cf_access_enabled`; `trust_proxy_headers`
+  now means: client IP = `CF-Connecting-IP` if present, else first `X-Forwarded-For`.
+- `Quote`: `bid_size`, `ask_size`, `halted`, `spread_pct`, `exit_price` (bid, else price).
+- `RiskLimits`: `max_spread_pct` (0.3), `halt_cooldown_minutes` (15),
+  `allow_leveraged_etfs` (False). `HARD_CAPS["max_spread_pct"] = 2.0`. `LEVERAGED_ETFS`
+  blocklist. Loosening rules: `LOWER_IS_LOOSER`, `BOOL_TRUE_IS_LOOSER`,
+  `BOOL_FALSE_IS_LOOSER` (web step-up uses these; every other numeric risk field: higher
+  is looser).
+- `ExitRules` (in `BotSettings.exits`): `time_stop_minutes` (45), `time_stop_min_r` (0.5),
+  `breakeven_at_r` (1.0), `trail_atr_mult` (0 = off).
+- `BotSettings.stock_universe` default: liquid lower-priced names.
+- `SignalRecord`, `SetupStats` models; `Database.insert_signal/update_signal/get_signal/
+  list_signals/unevaluated_signals/setup_stats`.
+- `Broker.modify_stop(instrument, new_stop) -> bool` (default False) and
+  `Broker.scan_movers(limit) -> list[str]` (default []).
+
+### 7.2 Behavior required from the remaining modules
+- **Risk manager** adds entry blocks: symbol in `LEVERAGED_ETFS` (unless allowed); quote
+  `halted`; within `halt_cooldown_minutes` after a halt was last seen for the symbol (engine
+  passes `last_halt_at`); `quote.spread_pct` missing (for stocks) or > `max_spread_pct`;
+  fee check uses `broker.estimate_commission` for BOTH legs (buy at entry, sell at target).
+- **Engine**:
+  - Prefilter the universe before scanning/LLM: skip symbols whose 1 unit (stocks: 1
+    share unless fractional) costs more than the max position size or available cash;
+    skip leveraged ETFs unless allowed. Log skipped symbols once per day, not every cycle.
+  - Track `last_halt_at` per symbol from quotes (`halted=True`).
+  - Mark positions at `quote.exit_price` (bid) for unrealized P&L, stops, targets, R.
+  - **Signal ledger**: every scanner candidate that passes the scanner's own filters is
+    written with `insert_signal` (taken False). When it becomes an order, set `taken=True`,
+    `order_id`, `decision_id`; otherwise `skip_reason` (e.g. "AI: HOLD", "risk: spread
+    0.8% > 0.3%", "LLM budget", "not top candidate"). Evaluate in the monitor loop (or a
+    slower ledger loop every ~5 min): for signals at least 60 min old (stocks: or after
+    the close), fetch bars since the signal and fill `r_15m/r_30m/r_60m/r_close/mfe_r/
+    mae_r/first_hit` (stop checked first when both are hit in one bar), then
+    `evaluated=True`. Bound the work per tick; tolerate data errors.
+  - **Exits** (`ExitRules`): time stop → `close_position` with reason "time stop"; at
+    `breakeven_at_r` move stop to entry (`broker.modify_stop`; if False, update
+    positions_meta and manage it engine-side); trailing per `trail_atr_mult`. Never move
+    a stop down.
+  - Never add to an existing position; never enter a symbol that halted within the
+    cooldown.
+- **Brokers**: IBKR crypto exchange from config; `estimate_commission` via `trader.fees`
+  with `config.commission_plan`; `modify_stop` for stocks modifies the working GTC STP
+  child (same orderId, new auxPrice) and returns True on acceptance; quotes fill
+  `bid_size/ask_size/halted` (ib_async Ticker `halted` > 0 means halted). SimBroker: same
+  fee module, base prices refreshed (SPY ~764, QQQ ~690, AAPL ~265, BTC ~81,700, ETH
+  ~3,900 are fine approximations), `set_halted(symbol, bool)` for tests, `modify_stop`
+  for its native brackets.
+- **Web**: `/api/signals` and `/api/signals/stats` (table above). Cloudflare Access
+  middleware when `cf_access_enabled`: require header `Cf-Access-Jwt-Assertion` on every
+  request except `/healthz`; verify RS256 signature against the team's JWKS
+  (`https://<team_domain>/cdn-cgi/access/certs`, fetched with httpx, cached 1 h, refetched
+  once on unknown `kid`), `aud` contains `cf_access_aud`, `iss == https://<team_domain>`,
+  `exp`/`nbf` with 60 s leeway; reject with 403 otherwise. Implement with `cryptography`
+  (no new dependencies). Tests use a locally generated RSA key and a stubbed JWKS fetch.
+- **Frontend**: a **Signals** view (tab) showing `/api/signals/stats` per setup (signals,
+  taken, evaluated, target-first %, avg R at close, MFE/MAE) with a clear "N < 30: too
+  few to judge" badge, plus the latest signals list (time, symbol, setup, score, taken /
+  skip reason, outcome). Dashboard P&L copy: "valued at the bid".
+- **Deploy/docs**: Cloudflare Tunnel is the primary access path: a `cloudflared` service
+  in docker-compose (`cloudflare/cloudflared` image pinned to a version tag, `tunnel
+  --no-autoupdate run`, `TUNNEL_TOKEN` from `.env`), public hostname `desk.kaxo.dev` →
+  `http://trader:8000` (plain http inside the docker network; the owner already created
+  the tunnel `desk`, the Access app and policy). `.env.example`:
+  `TRADER_ALLOWED_HOSTS=desk.kaxo.dev,localhost,127.0.0.1`,
+  `TRADER_PUBLIC_ORIGINS=https://desk.kaxo.dev`, `TRADER_TRUST_PROXY_HEADERS=true`,
+  `TRADER_CF_ACCESS_TEAM_DOMAIN=`, `TRADER_CF_ACCESS_AUD=` (owner fills in; never commit
+  real values), `TRADER_IB_HOST=ib-gateway`, `TRADER_IB_PORT=4004` (paper; 4003 live) per
+  the gnzsnz image's socat relay. Tailscale stays documented as an alternative.
+  DigitalOcean hardening notes: SSH drop-in must be named `00-hardening.conf` because
+  DigitalOcean's `50-cloud-init.conf` sets `PasswordAuthentication yes` and sshd uses the
+  first value; verify with `sudo sshd -T`. Docker publishes ports past ufw, so never
+  publish anything except `127.0.0.1:8000`.
+

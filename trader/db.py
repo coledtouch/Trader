@@ -25,6 +25,8 @@ from trader.models import (
     OrderRecord,
     OrderRequest,
     OrderStatus,
+    SetupStats,
+    SignalRecord,
     TradeRecord,
     utcnow,
 )
@@ -137,6 +139,16 @@ CREATE TABLE IF NOT EXISTS equity (
     ts TEXT PRIMARY KEY,
     equity REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    setup TEXT NOT NULL,
+    evaluated INTEGER NOT NULL DEFAULT 0,
+    data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);
+CREATE INDEX IF NOT EXISTS idx_signals_eval ON signals(evaluated, ts);
 """
 
 
@@ -642,3 +654,92 @@ class Database:
                 (_iso(since), limit),
             )
         return [{"ts": r["ts"], "equity": r["equity"]} for r in reversed(rows)]
+
+    # ------------------------------------------------------------------ signal ledger
+    def insert_signal(self, sig: SignalRecord) -> int:
+        cur = self._exec(
+            "INSERT INTO signals(ts, instrument, setup, evaluated, data) VALUES(?, ?, ?, ?, ?)",
+            (
+                _iso(sig.ts),
+                sig.instrument.key,
+                sig.setup,
+                1 if sig.evaluated else 0,
+                sig.model_dump_json(exclude={"id"}),
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def update_signal(self, sig: SignalRecord) -> None:
+        if sig.id is None:
+            raise ValueError("signal has no id")
+        self._exec(
+            "UPDATE signals SET evaluated = ?, data = ? WHERE id = ?",
+            (1 if sig.evaluated else 0, sig.model_dump_json(exclude={"id"}), sig.id),
+        )
+
+    def _signal_from_row(self, r: sqlite3.Row) -> SignalRecord:
+        sig = SignalRecord.model_validate_json(r["data"])
+        sig.id = r["id"]
+        return sig
+
+    def get_signal(self, signal_id: int) -> SignalRecord | None:
+        row = self._one("SELECT * FROM signals WHERE id = ?", (signal_id,))
+        return self._signal_from_row(row) if row else None
+
+    def list_signals(
+        self, limit: int = 100, setup: str | None = None, since: datetime | None = None
+    ) -> list[SignalRecord]:
+        clauses, params = [], []
+        if setup:
+            clauses.append("setup = ?")
+            params.append(setup)
+        if since is not None:
+            clauses.append("ts >= ?")
+            params.append(_iso(since))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._all(
+            f"SELECT * FROM signals {where} ORDER BY ts DESC LIMIT ?",  # noqa: S608
+            [*params, limit],
+        )
+        return [self._signal_from_row(r) for r in rows]
+
+    def unevaluated_signals(self, before: datetime, limit: int = 200) -> list[SignalRecord]:
+        """Signals that fired before `before` and still need their outcome scored."""
+        rows = self._all(
+            "SELECT * FROM signals WHERE evaluated = 0 AND ts < ? ORDER BY ts LIMIT ?",
+            (_iso(before), limit),
+        )
+        return [self._signal_from_row(r) for r in rows]
+
+    def setup_stats(self, since: datetime | None = None, min_samples: int = 30) -> list[SetupStats]:
+        """Per-setup forward-test statistics from the signal ledger."""
+        sigs = self.list_signals(limit=100_000, since=since)
+        by_setup: dict[str, list[SignalRecord]] = {}
+        for sig in sigs:
+            by_setup.setdefault(sig.setup, []).append(sig)
+
+        def avg(values: list[float]) -> float | None:
+            return round(sum(values) / len(values), 3) if values else None
+
+        stats: list[SetupStats] = []
+        for setup, items in sorted(by_setup.items()):
+            done = [x for x in items if x.evaluated]
+            hits = [x for x in done if x.first_hit is not None]
+            stats.append(
+                SetupStats(
+                    setup=setup,
+                    signals=len(items),
+                    taken=sum(1 for x in items if x.taken),
+                    evaluated=len(done),
+                    target_first_pct=(
+                        round(100 * sum(1 for x in hits if x.first_hit == "target") / len(hits), 1)
+                        if hits
+                        else None
+                    ),
+                    avg_r_close=avg([x.r_close for x in done if x.r_close is not None]),
+                    avg_mfe_r=avg([x.mfe_r for x in done if x.mfe_r is not None]),
+                    avg_mae_r=avg([x.mae_r for x in done if x.mae_r is not None]),
+                    enough_data=len(done) >= min_samples,
+                )
+            )
+        return stats

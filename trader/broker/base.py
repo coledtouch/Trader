@@ -117,6 +117,16 @@ class Broker(ABC):
         """One-way commission estimate in USD (used for fee-vs-reward risk checks)."""
         return 0.0
 
+    async def modify_stop(self, instrument: Instrument, new_stop: float) -> bool:
+        """Move the working broker-side protective stop for a long position to new_stop
+        (used for breakeven and trailing stops). Returns False when there is no native stop
+        to move; the engine then manages the stop itself."""
+        return False
+
+    async def scan_movers(self, limit: int = 10) -> list[str]:
+        """Optional dynamic universe (e.g. top % gainers). Returns [] when unsupported."""
+        return []
+
     # ------------------------------------------------------------------ convenience
     async def close_position(self, instrument: Instrument, reason: str = "") -> OrderRecord | None:
         """Cancel working orders for the instrument, then market-sell the whole long position."""

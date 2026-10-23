@@ -80,8 +80,11 @@ class Quote(BaseModel):
     bid: float | None = None
     ask: float | None = None
     last: float | None = None
+    bid_size: float | None = None
+    ask_size: float | None = None
     ts: datetime = Field(default_factory=utcnow)
     delayed: bool = False  # True when the data is the free 15-minute-delayed feed
+    halted: bool = False  # trading halt (LULD or news); no entries while True
 
     @property
     def mid(self) -> float | None:
@@ -95,6 +98,22 @@ class Quote(BaseModel):
         if self.last and self.last > 0:
             return self.last
         return self.mid
+
+    @property
+    def spread_pct(self) -> float | None:
+        """Bid/ask spread as a percent of mid, or None without a two-sided quote."""
+        mid = self.mid
+        if mid is None or self.bid is None or self.ask is None:
+            return None
+        return (self.ask - self.bid) / mid * 100
+
+    @property
+    def exit_price(self) -> float | None:
+        """What a long position could actually be sold for now: the bid, else last/mid.
+        Thin names often print far above the bid, so P&L and stops use this."""
+        if self.bid and self.bid > 0:
+            return self.bid
+        return self.price
 
 
 class Position(BaseModel):
@@ -234,6 +253,9 @@ class RiskLimits(BaseModel):
     loss_streak_halve_after: int = Field(default=3, ge=1)  # halve size after N losses in a row
     llm_daily_budget_usd: float = Field(default=3.0, ge=0)
     flatten_on_halt: bool = True  # close everything when the daily loss limit trips
+    max_spread_pct: float = Field(default=0.3, gt=0)  # skip entries with wider bid/ask spreads
+    halt_cooldown_minutes: int = Field(default=15, ge=0)  # no entries this long after a halt
+    allow_leveraged_etfs: bool = False  # leveraged/inverse ETPs (TQQQ, SQQQ, UVXY, ...)
 
 
 # Absolute ceilings enforced in code no matter what the settings say. They exist so
@@ -247,10 +269,49 @@ HARD_CAPS: dict[str, float] = {
     "max_trades_per_day": 50,
     "price_collar_pct": 5.0,
     "llm_daily_budget_usd": 50.0,
+    "max_spread_pct": 2.0,
 }
 
-# Fields where a LOWER value is riskier (loosening means decreasing them).
-LOWER_IS_LOOSER = {"min_price", "min_reward_risk", "loss_streak_halve_after"}
+# Fields where a LOWER value is riskier (loosening means decreasing them). For every other
+# numeric risk field, a HIGHER value is riskier.
+LOWER_IS_LOOSER = {
+    "min_price",
+    "min_reward_risk",
+    "loss_streak_halve_after",
+    "halt_cooldown_minutes",
+}
+# Boolean risk fields where switching to True loosens, and where switching to False loosens.
+BOOL_TRUE_IS_LOOSER = {"allow_leveraged_etfs"}
+BOOL_FALSE_IS_LOOSER = {"stop_trading_at_target", "flatten_on_halt"}
+
+# Leveraged and inverse exchange-traded products. Blocked unless allow_leveraged_etfs is True.
+# Not exhaustive: the IBKR broker also refuses anything that is not a plain stock/ETF or
+# crypto contract, and this list catches the common ones by symbol.
+LEVERAGED_ETFS = frozenset(
+    {
+        "TQQQ", "SQQQ", "QLD", "QID", "SPXL", "SPXS", "SPXU", "UPRO", "SSO", "SDS", "SH",
+        "SOXL", "SOXS", "TNA", "TZA", "UDOW", "SDOW", "DDM", "DXD", "LABU", "LABD",
+        "FAS", "FAZ", "TECL", "TECS", "FNGU", "FNGD", "BULZ", "BERZ", "NUGT", "DUST",
+        "JNUG", "JDST", "GUSH", "DRIP", "ERX", "ERY", "YINN", "YANG", "TMF", "TMV", "TBT",
+        "UVXY", "SVXY", "UVIX", "SVIX", "VIXY", "VXX", "TSLL", "TSLQ", "TSLZ", "NVDL",
+        "NVDU", "NVDD", "NVDQ", "AAPU", "AAPD", "MSFU", "AMZU", "GGLL", "CONL", "MSTU",
+        "MSTX", "MSTZ", "BITX", "BITU", "SBIT", "ETHU", "SPYQ", "QQQU", "WEBL", "WEBS",
+        "DPST", "CURE", "BOIL", "KOLD", "UCO", "SCO", "AGQ", "ZSL", "USD", "SSG",
+    }
+)  # fmt: skip
+
+
+class ExitRules(BaseModel):
+    """Engine-managed exits on top of the stop-loss and target placed with every entry."""
+
+    # Time stop: close a position that has not reached time_stop_min_r after N minutes.
+    # 0 disables. Stale trades tie up the account's small capital.
+    time_stop_minutes: int = Field(default=45, ge=0, le=1440)
+    time_stop_min_r: float = Field(default=0.5, ge=0)
+    # Move the stop to the entry price once the trade is up this many R. 0 disables.
+    breakeven_at_r: float = Field(default=1.0, ge=0)
+    # After breakeven, trail the stop this many ATRs below the best price. 0 disables.
+    trail_atr_mult: float = Field(default=0.0, ge=0)
 
 
 class BotSettings(BaseModel):
@@ -261,8 +322,10 @@ class BotSettings(BaseModel):
     monitor_seconds: int = Field(default=15, ge=5, le=300)  # stop/target/loss-limit checks
     trade_stocks: bool = True
     trade_crypto: bool = True
+    # Liquid, mostly lower-priced names: with ~$500 equity and a 50% position cap a single
+    # share must cost < ~$250 (whole shares). The engine skips anything unaffordable.
     stock_universe: list[str] = Field(
-        default_factory=lambda: ["SPY", "QQQ", "AAPL", "AMD", "F", "SOFI", "PLTR", "INTC"]
+        default_factory=lambda: ["F", "SOFI", "INTC", "T", "PFE", "AAL", "SNAP", "RIVN", "NU"]
     )
     crypto_universe: list[str] = Field(default_factory=lambda: ["BTC", "ETH"])
     bar_size: Literal["1 min", "5 mins", "15 mins"] = "5 mins"
@@ -279,6 +342,7 @@ class BotSettings(BaseModel):
     llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
     llm_min_candidate_score: float = Field(default=0.5, ge=0, le=1)  # skip the LLM below this
     risk: RiskLimits = Field(default_factory=RiskLimits)
+    exits: ExitRules = Field(default_factory=ExitRules)
 
 
 class RiskVerdict(BaseModel):
@@ -360,3 +424,46 @@ class DecisionContext(BaseModel):
     market: dict[str, dict[str, float]] = Field(default_factory=dict)
     stock_market_open: bool = False
     data_delayed: bool = False
+
+
+class SignalRecord(BaseModel):
+    """One qualifying scanner signal, logged whether or not it was traded.
+
+    This is the forward-test ledger: write the rule down, log every signal that
+    qualifies (including the ones the bot skipped), and score them afterwards. A month
+    of this says far more than one great day.
+    """
+
+    id: int | None = None
+    ts: datetime = Field(default_factory=utcnow)
+    instrument: Instrument
+    setup: str
+    score: float
+    price: float  # reference entry price when the signal fired
+    stop: float
+    target: float
+    taken: bool = False
+    skip_reason: str | None = None  # why it was not traded (AI held, risk block, ...)
+    decision_id: int | None = None
+    order_id: int | None = None
+    # Outcomes in R multiples (1R = price - stop), filled in by the engine later.
+    r_15m: float | None = None
+    r_30m: float | None = None
+    r_60m: float | None = None
+    r_close: float | None = None  # at the session close (stocks) or +24h (crypto)
+    mfe_r: float | None = None  # max favorable excursion
+    mae_r: float | None = None  # max adverse excursion
+    first_hit: Literal["target", "stop", "neither"] | None = None
+    evaluated: bool = False
+
+
+class SetupStats(BaseModel):
+    setup: str
+    signals: int
+    taken: int
+    evaluated: int
+    target_first_pct: float | None = None  # of evaluated signals
+    avg_r_close: float | None = None
+    avg_mfe_r: float | None = None
+    avg_mae_r: float | None = None
+    enough_data: bool = False  # False below 30 evaluated signals: too few to judge

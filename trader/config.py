@@ -37,7 +37,13 @@ class AppConfig(BaseSettings):
     session_max_hours: int = 12
     login_max_attempts_per_ip: int = 5  # per 15 minutes
     login_lockout_failures: int = 10  # global failures in 15 minutes -> lock all logins
-    trust_proxy_headers: bool = False  # True only behind a reverse proxy you control
+    # True only behind a proxy you control (cloudflared): the client IP is then taken from
+    # CF-Connecting-IP, else the first X-Forwarded-For entry.
+    trust_proxy_headers: bool = False
+    # Cloudflare Access (optional defense in depth). When BOTH are set, every request except
+    # /healthz must carry a valid Cf-Access-Jwt-Assertion for this team and application.
+    cf_access_team_domain: str = ""  # e.g. "yourteam.cloudflareaccess.com"
+    cf_access_aud: str = ""  # the Access application's Audience (AUD) tag
 
     # --- broker ----------------------------------------------------------------
     broker: Literal["sim", "ibkr"] = "sim"
@@ -47,6 +53,10 @@ class AppConfig(BaseSettings):
     # 1 = live (needs a paid subscription and >= $500 equity), 3 = delayed (free)
     ib_market_data_type: Literal[1, 2, 3, 4] = 3
     ib_account: str = ""  # optional: pin a specific account id
+    # IBKR routes US crypto through ZEROHASH (older accounts: PAXOS).
+    ib_crypto_exchange: str = "ZEROHASH"
+    # IBKR Pro pricing plan, used for fee estimates in risk checks and the simulator.
+    commission_plan: Literal["tiered", "fixed"] = "tiered"
 
     # Hard gate for real-money orders. Even when True, the owner must also "arm" live
     # trading in the UI with a fresh 2FA code.
@@ -76,6 +86,10 @@ class AppConfig(BaseSettings):
     @property
     def public_origins_list(self) -> list[str]:
         return [o.strip().rstrip("/") for o in self.public_origins.split(",") if o.strip()]
+
+    @property
+    def cf_access_enabled(self) -> bool:
+        return bool(self.cf_access_team_domain and self.cf_access_aud)
 
     @property
     def db_path(self) -> Path:
