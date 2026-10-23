@@ -697,3 +697,19 @@ def test_block_implausible_quote() -> None:
     assert blocked_with(crossed, "quote for F looks wrong: crossed quote")
     far = run_check(q=quote(bid=9.0, ask=9.02, last=10.0), req=entry(limit=10.0))
     assert blocked_with(far, "looks wrong: bid 9")
+
+
+def test_dollar_target_applies_when_the_percent_is_zero() -> None:
+    """Review finding: with the merged 0% default, a dollar target typed into Settings was
+    silently ignored. A percent of 0 (or empty) now leaves the dollars in charge."""
+    dollars = RiskLimits(daily_profit_target_pct=0.0, daily_profit_target_usd=50.0)
+    assert not dollars.percent_target
+    assert dollars.profit_target_usd(500) == 50.0
+    reason = RiskManager(dollars).halt_reason(account=account(equity=550.0), day=day())
+    assert reason is not None and reason.startswith(HALT_TARGET)
+    assert "(target $50.00)" in reason and "% of start equity" not in reason
+    both = RiskLimits(daily_profit_target_pct=2.0, daily_profit_target_usd=50.0)
+    assert both.percent_target and both.profit_target_usd(500) == pytest.approx(10.0)
+    off = RiskLimits(daily_profit_target_pct=0.0, daily_profit_target_usd=0.0)
+    assert off.profit_target_usd(500) == 0.0
+    assert RiskManager(off).halt_reason(account=account(equity=900.0), day=day()) is None

@@ -186,7 +186,7 @@ def _today(ctx: DecisionContext) -> str:
         room = loss_limit + pnl
         limit_of = f"{_num(pct)}% of start equity"
     target = limits.profit_target_usd(basis)
-    if limits.daily_profit_target_pct is not None:
+    if limits.percent_target:
         target_text = f"{_usd(target)} ({_num(limits.daily_profit_target_pct)}% of start equity)"
     else:
         target_text = _usd(target)

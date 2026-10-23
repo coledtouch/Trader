@@ -125,6 +125,7 @@ class WatchdogSettings:
     stale_seconds: float = 45
     flatten_seconds: float = 180
     retry_seconds: float = 20
+    poll_seconds: float = 10
     orders: str = "auto"  # "auto" or "off"
     allow_live: bool = False
 
@@ -134,6 +135,7 @@ class WatchdogSettings:
             stale_seconds=config.watchdog_stale_seconds,
             flatten_seconds=config.watchdog_flatten_seconds,
             retry_seconds=config.watchdog_retry_seconds,
+            poll_seconds=config.watchdog_poll_seconds,
             orders=config.watchdog_orders,
             allow_live=config.allow_live,
         )
@@ -258,6 +260,15 @@ class CryptoWatchdog:
         self._started_at = started if started.tzinfo else started.replace(tzinfo=UTC)
         self._below_stop: dict[str, int] = {}
         self._attempt_at: dict[str, datetime] = {}
+        # When this process's broker connection last came (back) up. After a gateway
+        # outage both processes reconnect, and the app's reconnect backoff (up to
+        # MAX_BACKOFF) can lag this poll loop, so the heartbeat is stale for a while
+        # through no fault of the app. A blanket flatten therefore also waits until the
+        # flatten window has passed since the connection came back. Selling at or below a
+        # stop, and the kill switch, are not delayed.
+        self._broker_up_since: datetime | None = self._started_at
+        self._last_ok_at: datetime | None = None
+        self._reconnect_gap = timedelta(seconds=max(3 * settings.poll_seconds, 30.0))
         self._active_alerts: set[str] = set()
         self._was_unhealthy = False
         self._timeout_warning: str | None = None
@@ -282,11 +293,19 @@ class CryptoWatchdog:
             and pos.instrument.key in metas
         ]
         marks = await self._marks(managed)
+        # The broker answered: note when this connection came up (a gap of several polls
+        # without a successful tick counts as an outage too, e.g. IBKR error 1100/1102).
+        if self._broker_up_since is None or (
+            self._last_ok_at is not None and now - self._last_ok_at > self._reconnect_gap
+        ):
+            self._broker_up_since = now
+        self._last_ok_at = now
         heartbeat = read_heartbeat(self.db)
         age = self._heartbeat_age(heartbeat, now)
         stale_limit, flatten_limit = self._limits()
         unhealthy = age > stale_limit
-        flatten = unhealthy and age >= flatten_limit
+        up_for = max(0.0, (now - self._broker_up_since).total_seconds())
+        flatten = unhealthy and min(age, up_for) >= flatten_limit
         killed = kill_switch_on(self.db, now)
         if not unhealthy and not killed:
             self._below_stop.clear()
@@ -324,6 +343,11 @@ class CryptoWatchdog:
             if sent is not None:
                 result.closes.append(sent)
         return result
+
+    def note_broker_down(self) -> None:
+        """The broker connection failed: the next successful tick starts a new
+        connection, and the app gets the flatten window from then (see __init__)."""
+        self._broker_up_since = None
 
     def _heartbeat_age(self, heartbeat: datetime | None, now: datetime) -> float:
         """Seconds since the app last checked exits.
@@ -559,9 +583,11 @@ async def run_watchdog(
     while not stop.is_set():
         try:
             if not broker.connected:
+                watchdog.note_broker_down()
                 await broker.connect()
             await watchdog.tick()
         except BrokerError as exc:
+            watchdog.note_broker_down()
             log.warning("crypto watchdog: %s", exc)
         except Exception:
             log.exception("crypto watchdog tick failed")

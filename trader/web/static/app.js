@@ -1703,11 +1703,11 @@
     },
     'risk.daily_profit_target_pct': {
       label: 'Daily profit target', unit: '% of start equity', min: 0, optional: true,
-      help: 'New entries stop for the day (when that option is on) once the gain reaches this percent of start-of-day equity. Default 0 (off). Leave empty to use the fixed dollar amount instead. It never increases size.',
+      help: 'New entries stop for the day (when that option is on) once the gain reaches this percent of start-of-day equity. Default 0 (off). At 0 or empty, the fixed dollar amount below applies instead. It never increases size.',
     },
     'risk.daily_profit_target_usd': {
       label: 'Daily profit target (fixed dollars)', unit: '$', min: 0, optional: true,
-      help: 'Used only when the percent above is empty. Leave empty to use the percent.',
+      help: 'Used when the percent above is 0 or empty. Leave both at 0 or empty for no target.',
     },
     'risk.stop_trading_at_target': { label: 'Stop new entries at the target' },
     'risk.max_daily_loss_pct': {

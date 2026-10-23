@@ -1027,3 +1027,12 @@ from the stop or target when this client has no order row for that perm id.
   with `DEFAULT_DAILY_PROFIT_TARGET_PCT = 0`. A target of 0 never halts.
 - **Settings form**: number fields marked `optional` (7.7) or `nullable` (7.9) both
   accept an empty value, sent as null.
+- **Dollar target with a 0 percent** (review finding): `RiskLimits.percent_target` is true
+  only for a positive percent. Otherwise `profit_target_usd` uses the dollar amount, so a
+  dollar target with the percent at its 0 default is honoured, not silently ignored.
+- **Watchdog after a gateway outage** (review finding, from 7.8): the blanket flatten
+  also waits the flatten window after this process's broker connection comes back
+  (`note_broker_down` on a BrokerError, or no successful poll for max(3 × poll, 30s)),
+  because the app's reconnect backoff (up to `MAX_BACKOFF` 120s) can lag the watchdog's
+  10s polls and leave the heartbeat stale through no fault of the app. Selling at or
+  below the stop and the kill switch are not delayed.

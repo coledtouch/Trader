@@ -321,14 +321,22 @@ class RiskLimits(BaseModel):
             return data
         return {**data, "daily_profit_target_pct": None}
 
-    def profit_target_usd(self, start_equity: float | None) -> float:
-        """Dollar profit target for the day.
+    @property
+    def percent_target(self) -> bool:
+        """True when a positive percent sets the daily target. A percent of 0 (the
+        default, off) or an empty one leaves the dollar amount in charge, so a dollar
+        target the owner types in is never silently ignored."""
+        pct = self.daily_profit_target_pct
+        return pct is not None and pct > 0
 
-        A legacy config (percent left empty) uses its saved dollar amount. Otherwise the
-        target is daily_profit_target_pct of start-of-day equity, or 0 when that equity
-        is not known yet.
+    def profit_target_usd(self, start_equity: float | None) -> float:
+        """Dollar profit target for the day, 0 for none.
+
+        A positive percent is of start-of-day equity (0 while that equity is not known
+        yet). Otherwise the saved dollar amount applies: a legacy config, or one where the
+        owner set dollars and left the percent at 0 or empty.
         """
-        if self.daily_profit_target_pct is None:
+        if not self.percent_target:
             return float(self.daily_profit_target_usd or 0.0)
         if not start_equity or start_equity <= 0:
             return 0.0

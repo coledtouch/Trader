@@ -509,7 +509,7 @@ class RiskManager:
         pnl = equity - start
         target = lim.profit_target_usd(start)
         if lim.stop_trading_at_target and target > 0 and pnl >= target:
-            if lim.daily_profit_target_pct is not None:
+            if lim.percent_target:
                 target_text = f"${target:.2f} ({lim.daily_profit_target_pct:g}% of start equity)"
             else:
                 target_text = f"${target:.2f}"

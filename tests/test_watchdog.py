@@ -631,3 +631,55 @@ def test_flatten_timeout_must_follow_the_stale_timeout() -> None:
 def test_watchdog_client_id_must_differ_from_the_app() -> None:
     with pytest.raises(ValidationError, match="TRADER_WATCHDOG_CLIENT_ID"):
         AppConfig(_env_file=None, ib_client_id=7, watchdog_client_id=7)
+
+
+# ---------------------------------------------------------------------- gateway outages
+async def test_gateway_outage_gives_the_app_the_flatten_window_after_reconnect(
+    db: Database,
+) -> None:
+    """Review finding: after an IB Gateway outage longer than the flatten timeout, the
+    watchdog reconnected before the app (whose reconnect backoff can be 120s) and
+    market-sold healthy crypto far above its stop. A blanket flatten now also waits the
+    flatten window from when this process's connection came back."""
+    clock = Clock()
+    broker = FakeBroker()
+    hold(db, broker, bid=110.0, last=110.0, stop=95.0)
+    beat(db, clock, age=0)
+    watchdog, _notes = make(db, broker, clock)
+    await watchdog.tick()
+    watchdog.note_broker_down()  # what run_watchdog does on a BrokerError
+    clock.advance(seconds=245)  # the gateway is back; the app has not ticked yet
+    for _ in range(18):  # polls every 10s for 170s after the reconnect
+        await watchdog.tick()
+        clock.advance(seconds=10)
+    assert sells(broker) == []
+    clock.advance(seconds=10)  # 190s since the reconnect and still no heartbeat: app dead
+    await watchdog.tick()
+    assert len(sells(broker)) == 1 and "-flatten-" in (sells(broker)[0].trace_id or "")
+
+
+async def test_missed_polls_count_as_a_reconnect(db: Database) -> None:
+    clock = Clock()
+    broker = FakeBroker()
+    hold(db, broker, bid=110.0, last=110.0, stop=95.0)
+    beat(db, clock, age=0)
+    watchdog, _notes = make(db, broker, clock)
+    await watchdog.tick()
+    clock.advance(seconds=245)  # no successful poll for minutes (e.g. IBKR 1100/1102)
+    await watchdog.tick()
+    assert sells(broker) == []
+
+
+async def test_a_stop_breach_is_not_delayed_by_a_reconnect(db: Database) -> None:
+    clock = Clock()
+    broker = FakeBroker()
+    hold(db, broker, bid=90.0, last=90.0, stop=95.0)
+    beat(db, clock, age=0)
+    watchdog, _notes = make(db, broker, clock)
+    await watchdog.tick()
+    watchdog.note_broker_down()
+    clock.advance(seconds=245)
+    for _ in range(STOP_CONFIRM_TICKS):
+        await watchdog.tick()
+        clock.advance(seconds=10)
+    assert len(sells(broker)) == 1 and "-stop-" in (sells(broker)[0].trace_id or "")
