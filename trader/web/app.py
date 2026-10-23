@@ -240,8 +240,10 @@ def loosened_fields(old: BotSettings, new: BotSettings, live: bool) -> list[str]
     Risk limits: LOWER_IS_LOOSER fields loosen when decreased, BOOL_TRUE_IS_LOOSER when
     switched on, BOOL_FALSE_IS_LOOSER when switched off, and every other numeric limit when
     increased (compared after clamping to HARD_CAPS, which is what the engine enforces).
-    Autopilot off -> on loosens while the broker is a live account. Exit rules and
-    universes never count. An unclassified boolean limit counts on any change (fail safe).
+    Autopilot off -> on loosens while the broker is a live account, and switching off
+    flatten_stocks_before_close (the bot would hold stocks overnight) always loosens. Exit
+    rules and universes never count. An unclassified boolean limit counts on any change
+    (fail safe).
     """
     loosened: list[str] = []
     for name in RiskLimits.model_fields:
@@ -262,6 +264,8 @@ def loosened_fields(old: BotSettings, new: BotSettings, live: bool) -> list[str]
             loosened.append(f"risk.{name}")
     if live and new.autopilot and not old.autopilot:
         loosened.append("autopilot")
+    if old.flatten_stocks_before_close and not new.flatten_stocks_before_close:
+        loosened.append("flatten_stocks_before_close")
     return loosened
 
 
@@ -356,11 +360,17 @@ def create_app(
             _bind(app, config, database, the_engine)
         _startup_checks(app.state.auth)
         started = False
-        if start_engine and database.get_flag("engine_running"):
+        if start_engine:
+            # The bot resumes its previous on/off state. When it was off, the monitor still
+            # runs so open positions stay protected (engine-managed stops, halts, flatten
+            # before the close), exactly as after pressing Stop.
             try:
-                await the_engine.start()
+                if database.get_flag("engine_running"):
+                    await the_engine.start()
+                    log.info("trading engine resumed (it was running before the restart)")
+                else:
+                    await the_engine.start_monitor()
                 started = True
-                log.info("trading engine resumed (it was running before the restart)")
             except Exception:
                 log.exception("could not start the trading engine; start it from the UI")
         try:

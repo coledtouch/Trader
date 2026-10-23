@@ -55,6 +55,9 @@ class FakeEngine:
         self._call("start")
         self.running = True
 
+    async def start_monitor(self) -> None:
+        self._call("start_monitor")
+
     async def stop(self) -> None:
         self._call("stop")
         self.running = False
@@ -576,6 +579,10 @@ def test_loosened_fields_rules():
     assert loosened_fields(manual, base, live=False) == []
     assert loosened_fields(manual, base, live=True) == ["autopilot"]
     assert loosened_fields(base, manual, live=True) == []
+    # Holding stocks overnight loosens the day-trade rule; turning it back on does not.
+    overnight = base.model_copy(update={"flatten_stocks_before_close": False})
+    assert loosened_fields(base, overnight, live=False) == ["flatten_stocks_before_close"]
+    assert loosened_fields(overnight, base, live=False) == []
 
 
 def test_enabling_autopilot_on_live_requires_2fa():
@@ -693,8 +700,17 @@ def test_lifespan_resumes_engine_when_flag_set():
     assert ctx.engine.calls == ["start", "shutdown"]
 
 
-def test_lifespan_leaves_engine_stopped_by_default():
+def test_lifespan_leaves_bot_stopped_but_protects_positions_by_default():
     ctx = build(start_engine=True)
+    with TestClient(ctx.app):
+        assert ctx.engine.calls == ["start_monitor"]  # monitor only: no decisions
+        assert not ctx.engine.running
+    assert ctx.engine.calls == ["start_monitor", "shutdown"]
+
+
+def test_lifespan_without_start_engine_touches_nothing():
+    ctx = build(start_engine=False)
+    ctx.db.set_flag("engine_running", True)
     with TestClient(ctx.app):
         assert ctx.engine.calls == []
     assert ctx.engine.calls == []

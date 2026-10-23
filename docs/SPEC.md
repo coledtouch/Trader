@@ -147,6 +147,11 @@ with reward:risk >= 2 by default:
 - `trend_pullback` - EMA9 > EMA21 rising, pullback to EMA21 with bullish close.
 - `rsi_reversion` - RSI14 < 30 turning up, price at/below lower Bollinger band, not in a
   steep downtrend (price within 2 ATR of EMA21). Smaller score.
+- `volume_spike` - bar volume >= 3x the average of the previous 20 bars on a bullish bar
+  (close > open), close above SMA20 (and SMA50 when available) and above the session open
+  (stocks) or 24h open (crypto), positive 20-session/20-day trend when the history allows,
+  ATR% within 0.3-8% (5-minute bars, scaled for other sizes); stocks only from 09:45 NY.
+  Stop 1.5 ATR, target >= 2R.
 Filters: price >= `risk.min_price`, avg volume >= `min_avg_volume` (stocks), enough bars.
 Crypto uses the same setups minus ORB, with a rolling 24h "session" for VWAP.
 
@@ -156,7 +161,7 @@ class DecisionMaker(Protocol):
     name: str
     async def decide(self, ctx: DecisionContext) -> DecisionBatch: ...
 
-class RuleBasedDecisionMaker:   # name = "rules"
+class RuleBasedDecisionMaker:   # name = "rules"; __init__(settings: BotSettings | None = None)
     # Highest-score candidate above settings.llm_min_candidate_score -> BUY with the
     # candidate's stop/target, LIMIT at candidate price; CLOSE positions whose setup has
     # invalidated (e.g. close below VWAP for vwap/orb setups) - conservative, deterministic.
@@ -168,6 +173,10 @@ class RuleBasedDecisionMaker:   # name = "rules"
 - Uses `anthropic.AsyncAnthropic`. Default model `claude-opus-5-5`, effort from settings
   (`output_config={"effort": ...}`); never send temperature/top_p/top_k or a thinking
   budget (400 on this model). Thinking stays default (adaptive).
+- Failure policy: transient API errors (connection/timeout, 408/409/429, 5xx) return the
+  fallback maker's CLOSE decisions only, with `error` set; refusals, other 4xx errors and
+  parse failures return no decisions. `DecisionBatch.model` is the model that served the
+  response (it can be a server-side fallback model).
 - Structured output: `client.beta.messages.parse(..., output_format=<pydantic model>,
   betas=["server-side-fallback-2026-07-01"], fallbacks="default")` - verified present in
   anthropic 2.1.0. Validate the parsed result again and convert to `AIDecision`s.
@@ -191,6 +200,7 @@ class RuleBasedDecisionMaker:   # name = "rules"
 ```python
 class RiskManager:
     def __init__(self, limits: RiskLimits): ...   # clamps to HARD_CAPS
+    def set_limits(self, limits: RiskLimits) -> None   # after a settings change (clamped)
     def effective_limits(self) -> RiskLimits
     def size_entry(self, *, decision: AIDecision, entry: float, stop: float,
                    account: AccountSnapshot, positions: list[Position], day: DayStats,
@@ -198,7 +208,8 @@ class RiskManager:
     def check(self, req: OrderRequest, *, quote: Quote, account: AccountSnapshot,
               positions: list[Position], open_orders: list[OrderRecord], day: DayStats,
               mode: Mode, data_delayed: bool, broker: Broker,
-              now: datetime, settings: BotSettings) -> RiskVerdict
+              now: datetime, settings: BotSettings,
+              last_halt_at: datetime | None = None) -> RiskVerdict
     def halt_reason(self, *, account: AccountSnapshot, day: DayStats) -> str | None
 ```
 Sizing: `risk_usd = start_equity * max_risk_per_trade_pct/100 * size_fraction * streak`
@@ -210,8 +221,9 @@ daily target or on being behind.
 Entry checks (any failure blocks): halted day; trades_today >= max; open positions >=
 max; already holding the instrument; stop missing or >= entry; target (if given) <=
 entry; reward:risk < min; price < min_price; limit price outside collar vs quote; order
-notional > max; exposure after fill > max_total_exposure; fees (2 × estimate_commission)
-> max_fee_to_reward_pct of expected reward; stock entry outside entry window or market
+notional > max; exposure after fill > max_total_exposure; dollar risk at the stop >
+max_risk_per_trade_pct of start equity; fees (`estimate_commission` BUY at the entry + SELL
+at the target) > max_fee_to_reward_pct of expected reward; stock entry outside entry window or market
 closed; LIVE + delayed data for stocks; day_trades_remaining known and < 1 for stocks;
 quote missing/stale (> 2 × monitor interval for live data); qty rounds to 0.
 Exits (`is_exit`) are always allowed if they reduce an existing long and never exceed
@@ -225,27 +237,36 @@ entries, existing positions keep their stops; resets next day).
 class Engine:
     def __init__(self, config: AppConfig, db: Database, broker: Broker,
                  decider: DecisionMaker, notifier: Notifier | None = None,
-                 clock: Callable[[], datetime] = utcnow): ...
-    async def start(self) -> None        # connect + start loops (idempotent); sets running
-    async def stop(self) -> None         # stop loops; keep positions & broker stops
-    async def shutdown(self) -> None     # stop + disconnect (app shutdown)
+                 clock: Callable[[], datetime] = utcnow, *,
+                 scanner: SignalScanner | None = None, risk: RiskManager | None = None): ...
+    async def start(self) -> None        # connect + monitor & decision loops (idempotent);
+                                         # sets running and the engine_running flag
+    async def start_monitor(self) -> None  # connect + monitor loop only (protect positions)
+    async def stop(self) -> None         # stop the decision loop; the monitor keeps
+                                         # protecting positions; clears engine_running
+    async def shutdown(self) -> None     # stop both loops + disconnect (app shutdown);
+                                         # keeps engine_running so a restart resumes
     async def kill(self, actor: str = "owner") -> None    # halt + cancel_all + flatten_all
     async def resume(self, actor: str = "owner") -> None  # clear halt for today
     async def run_cycle(self, manual: bool = False) -> DecisionBatch | None
     async def monitor_tick(self) -> None
     async def approve_order(self, order_id: int, actor: str = "owner") -> OrderRecord
     async def reject_order(self, order_id: int, actor: str = "owner") -> OrderRecord
+        # both raise LookupError (unknown id) / ValueError (not pending); approve raises
+        # BrokerError when fresh data is unavailable (the order stays pending)
     async def arm_live(self, actor: str = "owner") -> None    # caller already verified TOTP
     async def disarm_live(self, actor: str = "owner") -> None
     def reload_settings(self) -> None   # re-read BotSettings from db
     def status(self) -> EngineStatus
-    def snapshot(self) -> dict          # cached {"account", "positions", "open_orders"}
-                                         # refreshed by monitor_tick (no broker calls here)
+    def snapshot(self) -> dict          # cached {"account": AccountSnapshot | None,
+                                         # "positions": [Position], "open_orders": [OrderRecord]}
+                                         # (pydantic objects) refreshed by monitor_tick
 
 def build_engine(config: AppConfig, db: Database) -> Engine
     # broker: SimBroker if config.broker == "sim" else IBKRBroker
     # decider: ClaudeDecisionMaker(fallback=RuleBasedDecisionMaker) when an API key is
-    #          configured and settings.llm_enabled, else RuleBasedDecisionMaker
+    #          configured, else RuleBasedDecisionMaker; settings.llm_enabled is checked
+    #          every cycle, so the LLM can be switched on/off without a restart
 ```
 Loops (asyncio tasks, each wrapped so one exception logs + sets `last_error` and the
 loop continues; exponential backoff on broker errors; never crash the app):
@@ -288,7 +309,8 @@ when `ntfy_url` is unset; never raises (log failures); 5 s timeout; rate limit d
 messages (same title within 60 s).
 
 ### 5.9 `trader/broker/sim.py`
-`SimBroker(seed, starting_cash, clock=utcnow, commission_model="ibkr_pro_fixed")`,
+`SimBroker(seed, starting_cash, clock=utcnow, commission_plan="tiered", *,
+max_history_days=30)` (fees from `trader.fees`, see 7.1),
 `mode = SIM`, always "connected" after `connect()`. Synthetic market: per-symbol
 geometric random walk with intraday volatility regimes and volume, deterministic per
 seed, with sensible base prices (SPY ~ 600, QQQ ~ 520, AAPL ~ 230, AMD ~ 160, F ~ 11,
@@ -297,13 +319,15 @@ hash-based price). `bars()` returns history consistent with `quote()`; time adva
 with the injected clock (tests use a fake clock). Fills: market orders fill at ask/bid
 plus slippage (bps scaled by inverse liquidity); limit orders fill when price crosses;
 bracket stops/targets are simulated natively (`supports_native_stops` True for stocks,
-False for crypto so the engine path is exercised). Commission models: IBKR Pro Fixed
-stocks $0.005/share, min $1.00, max 1% of trade value; crypto 0.18% of value, min
-$1.75, max 1% of value. No shorting (sells beyond held qty are rejected). Cash account
-semantics (no borrowing). Expose `advance(seconds)` for tests.
+False for crypto so the engine path is exercised); a SELL exit carrying `stop_loss` rests
+as a standalone stop (`supports_standalone_stops` True for stocks). No shorting (sells
+beyond held qty are rejected). Cash account semantics (no borrowing). Test hooks:
+`advance(seconds)`, `set_price(instrument, price)`, `set_halted(symbol, halted, *,
+gap_pct=None)` (entries rejected while halted; exits queue for the reopen, as at IBKR).
+State is in memory: a new process trades a fresh simulated account (see 7.3).
 
 ### 5.10 `trader/broker/ibkr.py`
-`IBKRBroker(config)` using `ib_async.IB` (asyncio; never call blocking variants; never
+`IBKRBroker(config, ib: IB | None = None)` (ib injectable for tests) using `ib_async.IB` (asyncio; never call blocking variants; never
 `util.startLoop`/`nest_asyncio` inside the server). Connect with `connectAsync(host,
 port, clientId, timeout)`, `reqMarketDataType(config.ib_market_data_type)`. Mode from
 account id ("DU…" → PAPER, else LIVE). Account values from `accountValues()` /
@@ -316,13 +340,15 @@ stocks... choose sensibly), converted to UTC `Bar`s. Quotes via snapshot/streami
 tickers with timeout; mark `delayed` when market data type is 3/4. Stock entries:
 bracket order (parent LMT/MKT, child STP at stop_loss, child LMT at take_profit,
 OCA, transmit flags correct; child TIF GTC so protection survives disconnects and the
-day boundary) via `bracketOrder` helpers when available. Crypto: IBKR crypto order
+day boundary) via `bracketOrder` helpers when available. A stock SELL exit carrying
+`stop_loss` is sent as a standalone GTC STP (re-placed protection); crypto has no stop
+orders, so such a request is rejected, never sold at market. Crypto: IBKR crypto order
 rules differ (research them: cashQty for market buys, allowed TIFs, whether STP is
 supported) - implement what is supported, return REJECTED with a clear message
 otherwise, and report `supports_native_stops(crypto)` truthfully. Fills via
 `reqExecutionsAsync` + commission reports; order status from `trades()`/`openTrades()`.
 Event handlers: `disconnectedEvent`, `errorEvent` (log codes; 1100/1102 connectivity),
-`orderStatusEvent`. Estimate commissions with IBKR Pro Fixed (same as sim). Optional
+`orderStatusEvent`. Estimate commissions via `trader.fees` with `config.commission_plan`. Optional
 `async scan_movers(limit=10) -> list[str]` using `reqScannerDataAsync` (TOP_PERC_GAIN,
 US major, price 2–50, volume > 1M) that returns [] on any error. All IB calls wrapped
 with timeouts; raise `BrokerError` on connectivity failures.
@@ -345,8 +371,9 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
   `X-CSRF-Token` matching the session's csrf_token (constant-time) AND an `Origin`
   (or `Referer`) that equals the request's own origin or one of `public_origins`.
 - Step-up: `/api/live/arm`, `/api/bot/resume`, and settings changes that loosen any
-  risk limit (vs current; see `LOWER_IS_LOOSER`) or enable autopilot while live require
-  a fresh `totp` field in the body (replay-protected).
+  risk limit (vs current; see `LOWER_IS_LOOSER`), enable autopilot while live, or switch
+  off `flatten_stocks_before_close` require a fresh `totp` field in the body
+  (replay-protected).
 - Middleware: TrustedHostMiddleware (`allowed_hosts`), security headers on every
   response: `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src
   'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src
@@ -359,9 +386,11 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
   Client IP = socket peer unless `trust_proxy_headers`.
 - `create_app(config: AppConfig | None = None, db: Database | None = None,
   engine: Engine | None = None, start_engine: bool = True) -> FastAPI` - lifespan creates
-  the db/engine if not given; engine is started only if the persisted flag
-  `engine_running` is True (so a restart resumes the previous on/off state). Tests pass
-  `start_engine=False` and their own engine/db.
+  the db/engine if not given; the engine is started only if the persisted flag
+  `engine_running` is True (so a restart resumes the previous on/off state); otherwise only
+  its monitor runs (`start_monitor()`), which is the state Stop leaves behind, so open
+  positions stay protected. The web layer sets the flag on /api/bot/start and /api/bot/stop.
+  Tests pass `start_engine=False` and their own engine/db.
 
 ### 5.12 HTTP API contract (JSON; all `/api/*` except `/api/auth/login` and
 `/api/session` require a valid session → 401 `{"detail": "..."}` otherwise)
@@ -397,6 +426,11 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
 | GET | `/api/signals/stats?days=30` | - | `[SetupStats]` |
 
 Datetimes serialize as ISO-8601 strings (pydantic `model_dump(mode="json")`).
+Errors: rate-limited login/step-up → 429 `{"detail": "too many failed attempts"}`; PUT
+/api/settings → 422 with a string detail when a risk value exceeds HARD_CAPS, the entry
+window is invalid or a universe has an invalid symbol / more than 50 symbols; engine
+failures map PermissionError → 403, ValueError/LookupError → 409, anything else → 503.
+`/static/sw.js` carries `Service-Worker-Allowed: /`.
 
 ### 5.13 Frontend (`trader/web/static/`)
 Mobile-first, dark/light via `prefers-color-scheme`, works at 360 px width and on a
@@ -552,3 +586,37 @@ for the open to settle; time stops; size small.
   first value; verify with `sudo sshd -T`. Docker publishes ports past ufw, so never
   publish anything except `127.0.0.1:8000`.
 
+### 7.3 Integration notes (round 3)
+- **Broker contract**: `estimate_commission(instrument, qty, price, side=Side.BUY)` (the risk
+  manager prices the target leg as a SELL, so regulatory fees count);
+  `supports_standalone_stops(instrument) -> bool` (default False): True means `place_order`
+  rests a stop for a SELL exit carrying `stop_loss` - the engine only re-places missing stops
+  on such brokers; `place_order` may return PARTIALLY_FILLED; the default `close_position`
+  (new keyword `restore_stop`) and `flatten_all` re-place the cancelled protective stop when
+  the broker rejects the exit, and the engine reports a refused kill/halt flatten as a
+  failure (urgent notification, `last_error` "kill switch failed: ...").
+- **Config**: `ib_market_data_type` is an int 1-4 (a `Literal` could not be set from the
+  environment).
+- **BotSettings.trade_crypto** defaults to False: at $100-250 per trade the crypto fee fails
+  the fee-vs-reward check almost always, while 24/7 candidates would still cost LLM calls.
+- **Step-up** also covers switching off `flatten_stocks_before_close` (holding stocks
+  overnight).
+- **EngineStatus.loss_limit_usd**: how far today's P&L may fall before the daily loss halt,
+  as a positive amount (after a resume halts are measured from the resume equity, so it can
+  differ from start_equity x max_daily_loss_pct). The dashboard meter uses it.
+- **Engine extras**: unfilled entry orders are cancelled after 10 minutes; the kill-switch halt
+  carries over to the next day (the daily-loss halt does not); kill also acts in shadow mode
+  (owner-confirmed); exit rules and flatten-before-close only touch positions with
+  positions_meta (kill and the daily-loss flatten close everything); AI CLOSE decisions wait
+  for approval when autopilot is off; extra per-position data lives in kv
+  `position_extra:<key>` and the resume baseline in kv `halt_baseline:<day>`.
+- **Simulator restarts**: SimBroker keeps its account in memory, so every process trades a
+  fresh simulated account. The engine starts a journal epoch at construction (SIM mode only):
+  fills from before it are never matched against the new account, positions_meta of
+  positions that no longer exist is dropped, journal orders the new simulator does not know
+  are cancelled ("simulator restarted"), and today's P&L baseline restarts from the new
+  account's equity (a stale *target* halt is cleared; loss and kill halts stay).
+- **Tests**: `tests/test_e2e.py` runs the real SimBroker, rule-based maker, Engine and web
+  app together through the HTTP API on a fake clock (entry → stop/target → trades, days,
+  signal ledger and stats; kill switch; approvals and settings step-up; shadow mode;
+  Cloudflare Access).

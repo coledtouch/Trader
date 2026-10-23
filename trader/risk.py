@@ -402,7 +402,7 @@ class RiskManager:
                         f"insufficient cash: needs ${need:.2f}, ${max(0.0, cash):.2f} available"
                     )
                 if levels_ok and target is not None:
-                    fees = fee_buy + broker.estimate_commission(inst, qty, target)
+                    fees = fee_buy + broker.estimate_commission(inst, qty, target, Side.SELL)
                     reward = (target - entry) * qty
                     if fees > lim.max_fee_to_reward_pct / 100 * reward:
                         reasons.append(

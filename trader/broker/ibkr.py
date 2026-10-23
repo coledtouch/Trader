@@ -824,6 +824,11 @@ class IBKRBroker(Broker):
         if req.instrument.asset_class == AssetClass.STOCK and req.qty != math.floor(req.qty):
             raise _Reject("fractional share quantities are not supported for IBKR stock orders")
         if req.is_exit:
+            if req.stop_loss is not None:  # a standalone protective stop, never a market sell
+                if req.instrument.asset_class != AssetClass.STOCK:
+                    raise _Reject("IBKR has no stop orders for crypto; the engine manages it")
+                if _price(req.stop_loss) is None:
+                    raise _Reject("protective stop needs a positive stop_loss")
             return
         stop = _price(req.stop_loss)
         if stop is None:
@@ -840,10 +845,15 @@ class IBKRBroker(Broker):
         return {"account": acct, "orderRef": "ai-trader"}
 
     def _stock_orders(self, req: OrderRequest, info: _ContractInfo, acct: str) -> list[Order]:
-        """Entry -> bracket [parent, stop, (take-profit)]; exit -> single DAY order."""
+        """Entry -> bracket [parent, stop, (take-profit)]; exit with stop_loss -> standalone
+        GTC protective stop; other exits -> single DAY order."""
         qty = float(req.qty)
         kwargs = self._base_kwargs(acct)
         if req.is_exit:
+            if req.stop_loss is not None:
+                tick = self._tick_size(info, req.instrument, req.stop_loss)
+                stop_price = _round_to_increment(req.stop_loss, tick, up=True)
+                return [StopOrder("SELL", qty, stop_price, tif="GTC", **kwargs)]
             if req.order_type == OrderType.MARKET:
                 return [MarketOrder("SELL", qty, tif="DAY", **kwargs)]
             assert req.limit_price is not None  # checked in _check_request
@@ -1128,6 +1138,10 @@ class IBKRBroker(Broker):
     # ------------------------------------------------------------------ capabilities
     def supports_native_stops(self, instrument: Instrument) -> bool:
         # IBKR crypto accepts only LMT/MKT orders, so crypto stops are engine-managed.
+        return instrument.asset_class == AssetClass.STOCK
+
+    def supports_standalone_stops(self, instrument: Instrument) -> bool:
+        # A SELL exit carrying stop_loss becomes a GTC STP order (stocks only).
         return instrument.asset_class == AssetClass.STOCK
 
     def round_qty(

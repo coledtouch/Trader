@@ -1,0 +1,170 @@
+# Security
+
+AI Trader can move real money, so it is built in layers: getting past one layer should
+never be enough to place a real order. This page explains who can reach what, where the
+secrets live, what gets logged, and what to do when a device is lost.
+
+## What we protect
+
+1. **The money in the IBKR account**: no one but you (and the bot within its limits) may
+   place orders.
+2. **Credentials**: the IBKR password, the Claude API key, the Cloudflare Tunnel token, the
+   app's password and 2FA secret.
+3. **Your trading data**: balances, positions and the journal.
+
+## The layers, from the internet inward
+
+```
+ Internet
+   |
+ [1] Cloudflare Access ------- only your e-mail address, one-time PIN by e-mail
+   |
+ [2] Cloudflare Tunnel ------- outbound connection from the droplet; no open ports
+   |
+ [3] Access token check ------ the app verifies Cloudflare's signed token (when configured)
+   |
+ [4] App login --------------- password (argon2id) + 6-digit 2FA code, rate limited
+   |
+ [5] Session protections ----- secure cookie, CSRF token + Origin check, idle timeout
+   |
+ [6] Step-up 2FA ------------- fresh code to arm live trading, resume after a halt,
+   |                           loosen any risk limit, or enable autopilot while live
+ [7] Live trading gate ------- TRADER_ALLOW_LIVE=true AND a live account AND "armed"
+   |
+ [8] Risk manager ------------ hard caps in code, long only, stop on every entry
+   |
+ [9] IBKR -------------------- stop-loss orders held at the broker; IB Gateway API
+                               reachable only inside the server's private Docker network
+```
+
+## Threats and controls
+
+| Threat | Controls |
+|---|---|
+| A stranger finds `desk.kaxo.dev` | Cloudflare Access shows a PIN page and only sends PINs to your address. Behind it, the app needs your password **and** a 2FA code. Failed logins: 5 per IP per 15 minutes, then all logins lock after 10 failures in 15 minutes. Every attempt is audited. |
+| Someone reaches the droplet directly, skipping Cloudflare | Nothing listens on the internet except SSH: ufw allows only SSH, the tunnel is an outbound connection, and the app's port is published on `127.0.0.1` only. With `TRADER_CF_ACCESS_TEAM_DOMAIN`/`TRADER_CF_ACCESS_AUD` set, the app also refuses any request without a valid, signed Cloudflare Access token for your application (checked against your team's public keys, audience, issuer and expiry). |
+| Your password leaks | Useless without the 2FA code. Each code works only once (replay protection). |
+| Another website tries to act with your logged-in browser | Session cookie is `HttpOnly`, `Secure`, `SameSite=Strict` with the `__Host-` prefix; every change needs a CSRF token and a matching `Origin`. Sessions end after 30 idle minutes or 12 hours. |
+| Someone picks up your unlocked phone with the app open | Arming live trading, resuming after a halt, loosening risk limits, enabling autopilot while live and turning off "flatten stocks before the close" all need a **fresh** 2FA code. Disarm, stop and KILL need no code because they only reduce risk. |
+| A bug or a misbehaving AI | Real orders need all three gates in [7]. Every order passes the risk manager; hard caps in code clamp any setting; the AI can only shrink size; every stock entry carries a stop at IBKR; daily loss limit halts trading. See [STRATEGY.md](STRATEGY.md). |
+| Abuse of the IB Gateway API (it has no password of its own) | The gateway publishes no ports. Only containers on the server's private Docker network can reach it ([gnzsnz: leaving localhost](https://github.com/gnzsnz/ib-gateway-docker#leaving-localhost)). Never add a `ports:` line to it except the temporary loopback-only VNC in DEPLOY.md. |
+| Docker bypassing the firewall | Docker-published ports skip ufw ([Docker docs](https://docs.docker.com/engine/network/packet-filtering-firewalls/)). Only `127.0.0.1:8000` is published. An optional DigitalOcean Cloud Firewall sits outside the droplet as a second wall. |
+| Attacks on SSH | Keys only, no root login, `AllowUsers trader`, fail2ban, automatic security updates (DEPLOY.md, Appendix A). |
+| Secrets leaking through Git or images | `.env` and `data/` are in `.gitignore`; the Docker build context is an allow-list (only `requirements.txt` and `trader/`); the app never logs secrets, tokens or codes. |
+| Tampered dependencies or images | Python packages pinned to exact versions; Docker images pinned to version tags; CI runs lint and the offline test suite on every push. |
+| Someone takes over your e-mail | Cloudflare Access trusts whoever reads the PIN e-mail, so **your e-mail account is the front door**: give it a strong password and 2FA. The app's own password + 2FA still stand behind it. |
+
+Also turn on 2FA for the accounts around the app: Cloudflare, DigitalOcean, GitHub,
+Anthropic (Claude Console) and your e-mail.
+
+## Where secrets live
+
+| Secret | Stored in | Protection |
+|---|---|---|
+| IBKR username/password | `~/Trader/.env` on the droplet | File mode 600 (owner only). Passed to the ib-gateway container. |
+| Cloudflare Tunnel token | `.env` | Mode 600. Passed to the cloudflared container. Anyone with it can run your tunnel, so rotate it if exposed. |
+| Claude API key | `.env` | Mode 600. Prepaid credit with auto-reload off caps the damage of a leak. |
+| `TRADER_SECRET_KEY` | `.env` | Mode 600. Encrypts the 2FA secret (Fernet: AES with an integrity check). Back it up in your password manager. |
+| App password | `data/trader.db` | Only an argon2id hash is stored. |
+| App 2FA secret | `data/trader.db` | Encrypted with `TRADER_SECRET_KEY`. |
+| Login sessions | `data/trader.db` | Only a SHA-256 hash of each session token is stored. |
+| ntfy topic | `.env` | Mode 600. Alerts contain trading events, not secrets. |
+
+Honest limits:
+
+- Root and members of the `docker` group on the droplet can read everything above. That
+  is why SSH access is locked down.
+- The trader container mounts the whole `.env` (it writes `TRADER_SECRET_KEY` there during
+  setup), so it can read the IBKR password and tunnel token. Code running inside it could
+  also place orders through the gateway. It is the best-guarded piece (behind layers 1-5),
+  runs as a non-root user with a read-only filesystem, no Linux capabilities and
+  `no-new-privileges`.
+- Cloudflare terminates HTTPS, so Cloudflare can see the traffic between your browser and
+  the app.
+- Each Claude call sends balances, positions, P&L and market data to Anthropic (no account
+  number, name or credentials).
+
+## Audit log
+
+Every owner action is recorded with time, action, details and IP address (taken from
+Cloudflare's `CF-Connecting-IP`): logins (successful, failed, rate limited), logout,
+start / stop / kill / resume, arm / disarm, order approvals and rejections, settings
+changes, failed or rate-limited 2FA step-ups. Command-line actions (`setup`,
+`reset-password`, `reset-2fa`, `logout-all`) are recorded with actor `cli`, and the
+engine's own actions (halts, flattening, reconnects) with actor `engine`.
+
+Read it in the app under **Settings > Audit log**. Look at it after anything unusual: an
+unknown IP or a login you did not make means changing the password and 2FA (below).
+
+## If you lose your phone
+
+Your phone holds the AI Trader authenticator, IB Key, IBKR Mobile, ntfy, probably your
+e-mail, and possibly a logged-in AI Trader app. Work through this list from your laptop.
+
+1. **Sign out every AI Trader session** (PowerShell: `ssh trader@DROPLET_IP`, then):
+   ```bash
+   cd ~/Trader
+   docker compose exec trader python -m trader logout-all
+   ```
+2. **If live trading was armed** and you cannot log in to disarm, turn the server gate off.
+   Set `TRADER_ALLOW_LIVE=false` in `.env` (`nano .env`), then `docker compose up -d`. The
+   bot drops to shadow mode: nothing more is sent. Positions keep their IBKR stops.
+3. **Revoke Cloudflare Access sessions**: Zero Trust > **Access** > **Applications** >
+   **desk** > **Revoke existing tokens**
+   ([Cloudflare: session management](https://developers.cloudflare.com/cloudflare-one/identity/users/session-management/)).
+   If the phone's e-mail app was signed in, sign it out from your e-mail provider's
+   security page and change the e-mail password: the Access PIN goes to that mailbox.
+4. **New AI Trader 2FA** on the replacement phone (or an authenticator restored from its
+   backup):
+   ```bash
+   docker compose exec trader python -m trader reset-2fa
+   ```
+   Scan the QR code, type the code. This also signs out all sessions. No new phone yet?
+   Skip this step: nobody can log in without a valid code, and the bot keeps running
+   inside its limits.
+5. **IBKR**: move IB Key to the new phone. In IBKR Mobile on the new phone, choose the
+   option to migrate or reactivate IB Key, log in, and enter the code IBKR texts to your
+   registered mobile number ([IBKR: reactivate or transfer IB Key](https://ibkb.interactivebrokers.com/es/node/3073),
+   [IBKR: migrate IB Key to a new smartphone](https://ibkb.interactivebrokers.com/article/3283)).
+   No access to that number, or worried someone has the phone and your IBKR password? Call
+   IBKR Client Services. **Verify on IBKR's site.** Until IB Key works again, the gateway's
+   weekly login (live username) cannot be approved and the bot loses its connection at the
+   next full login; stock stops stay active at IBKR.
+6. **If the phone held copies of secrets** (screenshots, notes, a password manager without
+   a strong lock), rotate them:
+   - **Tunnel token**: Cloudflare dashboard > **Networking** > **Tunnels** > **desk** >
+     **Rotate token** (older dashboards: **Refresh token**), copy the new `eyJ...` token
+     into `TUNNEL_TOKEN` in `.env`, then `docker compose up -d`
+     ([Cloudflare: tunnel tokens](https://developers.cloudflare.com/tunnel/reference/tunnel-tokens/)).
+   - **Claude API key**: Claude Console > **API keys**: delete the old key, create a new
+     one, put it in `ANTHROPIC_API_KEY`, `docker compose up -d`.
+   - **IBKR password**: change it in the Client Portal, update `TWS_PASSWORD`, then
+     `docker compose up -d` (the gateway logs in again).
+   - **ntfy**: make a new topic (`openssl rand -hex 16`), update `TRADER_NTFY_URL`,
+     `docker compose up -d`, subscribe on the new phone.
+7. **Check what happened**: the app's audit log, and trades and account activity in the
+   IBKR Client Portal.
+
+## If you lose your laptop
+
+1. Its SSH key can log in to the droplet. From another computer, or DigitalOcean's web
+   console (Droplet > **Access** > **Launch Droplet Console**), remove that key's line from
+   `/home/trader/.ssh/authorized_keys`, then add the new laptop's key
+   (`ssh-keygen -t ed25519` on the new laptop).
+2. Sign out sessions: `docker compose exec trader python -m trader logout-all`, and revoke
+   Cloudflare Access sessions (step 3 above).
+3. If the laptop stored secrets in plain files, rotate them (step 6 above).
+
+## If you think the server is compromised
+
+1. In the app: **KILL** (or disarm). Then in IBKR Mobile or the Client Portal, check that
+   all orders are cancelled and close what you want closed.
+2. Change the IBKR password and rotate every secret in step 6 above. Delete the GitHub
+   deploy key (repository > Settings > Deploy keys).
+3. Rebuild on a fresh droplet (DEPLOY.md, Appendix A) and restore `data/` from a backup made
+   before the incident.
+
+## Reporting a problem
+
+This is a private project. If you find a security issue in the code, fix it on a branch
+and run the tests; do not post details publicly.

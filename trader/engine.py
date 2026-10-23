@@ -12,7 +12,8 @@ journal together (docs/SPEC.md 5.7 and 7.2).
   maker (Claude or rules), then size and risk-check each BUY before it becomes an order.
 
 `stop()` ends the decision loop only: the monitor keeps protecting open positions
-(engine-managed crypto stops, halts, flatten before the close) until `shutdown()`.
+(engine-managed crypto stops, halts, flatten before the close) until `shutdown()`, and
+`start_monitor()` restores that state after an app restart.
 Exit rules only touch positions the engine opened (those with positions_meta); the kill
 switch and the daily-loss flatten close everything. In shadow mode (live account, not
 armed) nothing is sent except an owner-confirmed kill. Every broker failure is logged and
@@ -272,13 +273,13 @@ def _aware(ts: datetime) -> datetime:
     return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
 
 
-def _rests_standalone_stops(broker: Broker, instrument: Instrument) -> bool:
-    """Whether `place_order(SELL, is_exit, stop_loss=X)` rests a stop order at this broker
-    (the SimBroker convention) instead of selling at market. Brokers opt in with a
-    `supports_standalone_stops(instrument)` method; without it the engine never re-places
-    stops, because a broker that ignores stop_loss on exits would sell immediately."""
-    check = getattr(broker, "supports_standalone_stops", None)
-    return bool(callable(check) and check(instrument))
+def _refused_exits(records: Iterable[OrderRecord]) -> str:
+    """Exit orders the broker rejected, as "SYMBOL: message; ..." ("" when none)."""
+    return "; ".join(
+        f"{r.request.instrument.symbol}: {r.message or 'rejected'}"
+        for r in records
+        if r.status == OrderStatus.REJECTED
+    )
 
 
 def _short(text: str, limit: int = 200) -> str:
@@ -356,6 +357,12 @@ class Engine:
         self._ledger_retry: dict[str, datetime] = {}  # instrument -> no bar requests until
         self._fallback_logged: str | None = None
         self._last_ledger_at: datetime | None = None
+
+        # The simulator keeps its account in memory, so every process trades a fresh
+        # simulated account: journal fills from before this point are never matched against
+        # it, and today's P&L restarts from its equity at the first snapshot.
+        self._sim_epoch: datetime | None = self._now() if broker.mode == Mode.SIM else None
+        self._sim_rebased = False
 
     # ------------------------------------------------------------------ basics
     def _now(self) -> datetime:
@@ -452,6 +459,19 @@ class Engine:
             return
         self._running = True
         self.db.set_flag("engine_running", True)
+        await self._start_monitor()
+        self._decision_task = asyncio.create_task(self._decision_loop(), name="engine-decision")
+        log.info("engine started (%s, %s)", self.broker.name, self.broker.mode.value)
+
+    async def start_monitor(self) -> None:
+        """Connect and run only the monitor loop (idempotent): open positions stay protected
+        (engine-managed stops, halts, flatten before the close, journal) while no decisions
+        are made. The app calls this at startup when the bot was stopped, which is the same
+        state `stop()` leaves behind."""
+        await self._start_monitor()
+        log.info("engine monitor running; decisions stay off until the bot is started")
+
+    async def _start_monitor(self) -> None:
         self._reprotect_pending = True
         try:
             await self.broker.connect()
@@ -464,27 +484,18 @@ class Engine:
                 self._loop("monitor", self.monitor_tick, lambda: self.settings.monitor_seconds),
                 name="engine-monitor",
             )
-        self._decision_task = asyncio.create_task(self._decision_loop(), name="engine-decision")
-        log.info("engine started (%s, %s)", self.broker.name, self.broker.mode.value)
 
     async def stop(self) -> None:
         """Stop making decisions. Positions, broker stops and the monitor loop (which
         manages engine-side stops) stay in place."""
-        self._running = False
         self.db.set_flag("engine_running", False)
-        task, self._decision_task = self._decision_task, None
-        self._next_cycle_at = None
-        if task is not None:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        await self._stop_decisions()
         log.info("engine stopped (monitor keeps protecting open positions)")
 
     async def shutdown(self) -> None:
-        """Stop everything and disconnect (app shutdown). Broker-side stops remain."""
-        running = self._running
-        await self.stop()
-        self.db.set_flag("engine_running", running)  # restart resumes the previous state
+        """Stop everything and disconnect (app shutdown). Broker-side stops remain, and the
+        persisted running flag is kept so a restart resumes the previous state."""
+        await self._stop_decisions()
         task, self._monitor_task = self._monitor_task, None
         if task is not None:
             task.cancel()
@@ -494,6 +505,16 @@ class Engine:
             await self.broker.disconnect()
         except Exception as exc:
             log.warning("broker disconnect failed: %s", type(exc).__name__)
+        log.info("engine shut down (broker-side stops remain in place)")
+
+    async def _stop_decisions(self) -> None:
+        self._running = False
+        task, self._decision_task = self._decision_task, None
+        self._next_cycle_at = None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
     async def _decision_loop(self) -> None:
         await self._sleep(FIRST_CYCLE_DELAY)
@@ -544,8 +565,7 @@ class Engine:
             async with self._entry_lock:  # no entry can slip in after the flatten
                 if not self.broker.connected:
                     await self.broker.connect()
-                await self.broker.cancel_all()
-                records = await self.broker.flatten_all(KILL_REASON)
+                records = await self.broker.flatten_all(KILL_REASON)  # cancels everything
         except Exception as exc:
             log.exception("kill switch could not finish")
             self._set_error("kill", f"kill switch failed: {exc}")
@@ -556,9 +576,21 @@ class Engine:
                 tags=["rotating_light"],
             )
             return
-        self._clear_error("kill")
         for rec in records:
             self._journal_order(rec, now)
+        refused = _refused_exits(records)
+        if refused:
+            log.error("kill switch: the broker refused to close %s", refused)
+            self._set_error("kill", f"kill switch failed: the broker refused to close {refused}")
+            await self._notify(
+                "KILL switch FAILED",
+                f"Orders cancelled, but the broker refused to close {_short(refused)}. "
+                "Check the broker now.",
+                priority="urgent",
+                tags=["rotating_light"],
+            )
+            return
+        self._clear_error("kill")
         await self._notify(
             "Kill switch",
             f"Trading halted, orders cancelled, {len(records)} position(s) being closed.",
@@ -750,6 +782,11 @@ class Engine:
         day = self._day
         equity = self._account.equity if self._account is not None else None
         start = day.start_equity if day is not None else None
+        loss_limit: float | None = None
+        if day is not None and start:
+            baseline = self._halt_eval_day(day).start_equity or start
+            floor = baseline * (1 - self.risk.limits.max_daily_loss_pct / 100)
+            loss_limit = round(max(0.0, start - floor), 2)
         return EngineStatus(
             running=self._running,
             mode=self.broker.mode,
@@ -770,6 +807,7 @@ class Engine:
             equity=equity,
             pnl_today=round(equity - start, 2) if equity is not None and start else 0.0,
             pnl_target=self.risk.limits.daily_profit_target_usd,
+            loss_limit_usd=loss_limit,
             trades_today=day.trades if day else 0,
             llm_cost_today=round(day.llm_cost, 4) if day else 0.0,
             data_delayed=self.broker.data_delayed,
@@ -837,6 +875,17 @@ class Engine:
 
             if math.isfinite(account.equity) and account.equity > 0:
                 changed = False
+                if self._sim_epoch is not None and not self._sim_rebased:
+                    self._sim_rebased = True
+                    if day.start_equity is not None and day.start_equity != account.equity:
+                        log.info(
+                            "new simulated account: today's P&L restarts from $%.2f",
+                            account.equity,
+                        )
+                        day.start_equity, changed = account.equity, True
+                        self.db.set_kv(BASELINE_PREFIX + day.day, "")
+                        if is_soft_halt(day.halt_reason):  # the target was the old account's
+                            day.halted, day.halt_reason = False, None
                 if day.start_equity is None:
                     day.start_equity, changed = account.equity, True
                 if day.end_equity != account.equity:
@@ -968,11 +1017,13 @@ class Engine:
             self._closing[pos.instrument.key] = now
             self._close_reasons[pos.instrument.key] = reason
         async with self._entry_lock:  # no entry can slip in after the flatten
-            await self.broker.cancel_all()
-            records = await self.broker.flatten_all(reason)
+            records = await self.broker.flatten_all(reason)  # cancels everything first
         for rec in records:
             self._journal_order(rec, now)
         self.db.audit("flatten", {"reason": reason, "orders": len(records)}, actor="engine")
+        refused = _refused_exits(records)
+        if refused:
+            raise BrokerError(f"the broker refused to close {refused}")
         self._clear_error("flatten")
         return records
 
@@ -1233,7 +1284,7 @@ class Engine:
                 or self._closing_now(key, now)
             ):
                 continue
-            if not _rests_standalone_stops(self.broker, pos.instrument):
+            if not self.broker.supports_standalone_stops(pos.instrument):
                 await self._notify(
                     f"Unprotected {pos.instrument.symbol}",
                     f"No broker stop is working (stop {stop:g}) and this broker cannot re-place "
@@ -1293,11 +1344,15 @@ class Engine:
                 continue
             latest = await self.broker.order_status(rec.broker_order_id)
             if latest is None:
-                if now - _aware(rec.created_at) > ORDER_FORGET_AFTER:
+                created = _aware(rec.created_at)
+                restarted = self._sim_epoch is not None and created < self._sim_epoch
+                if restarted or now - created > ORDER_FORGET_AFTER:
                     self.db.update_order(
                         rec.id,
                         status=OrderStatus.CANCELLED,
-                        message="no longer known to the broker",
+                        message="simulator restarted"
+                        if restarted
+                        else "no longer known to the broker",
                     )
                 continue
             updates: dict[str, Any] = {}
@@ -1387,11 +1442,16 @@ class Engine:
     async def _reconstruct(self, key: str, now: datetime) -> None:
         """Journal every completed round trip for `key` since its last journaled exit."""
         last_exit = self._last_exit_for(key)
+        epoch = self._sim_epoch  # fills before it belong to an earlier simulated account
         since = last_exit or now - TRADE_LOOKBACK
+        if epoch is not None:
+            since = max(since, epoch)
         fills = [
             f
             for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
-            if f.instrument.key == key and (last_exit is None or _aware(f.ts) > last_exit)
+            if f.instrument.key == key
+            and (last_exit is None or _aware(f.ts) > last_exit)
+            and (epoch is None or _aware(f.ts) >= epoch)
         ]
         fills.sort(key=lambda f: (f.ts, f.exec_id))
         meta = self.db.get_position_meta(key)

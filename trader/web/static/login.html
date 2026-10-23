@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f4f6f9" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#0d1117" media="(prefers-color-scheme: dark)">
+  <meta name="robots" content="noindex, nofollow">
+  <title>Sign in · AI Trader</title>
+  <link rel="manifest" href="/static/manifest.webmanifest" crossorigin="use-credentials">
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/styles.css">
+  <script src="/static/login.js" defer></script>
+</head>
+<body>
+  <main class="login">
+    <div>
+      <div class="card login-card">
+        <div class="login-brand">
+          <img src="/static/icon.svg" alt="" width="48" height="48">
+          <h1>AI Trader</h1>
+        </div>
+        <p class="muted">Sign in with your password and the 6-digit code from your authenticator app.</p>
+        <noscript><p class="form-error">This app needs JavaScript to sign in.</p></noscript>
+        <form id="login-form" novalidate>
+          <!-- Lets password managers file the saved password under a fixed name. -->
+          <input class="visually-hidden" type="text" name="username" value="owner"
+                 autocomplete="username" tabindex="-1" aria-hidden="true">
+          <div class="field">
+            <label for="password">Password</label>
+            <input id="password" name="password" type="password" autocomplete="current-password"
+                   required autofocus>
+          </div>
+          <div class="field">
+            <label for="code">Authenticator code</label>
+            <input id="code" name="totp" class="code-input" type="text" inputmode="numeric"
+                   autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required
+                   aria-describedby="code-help">
+            <p id="code-help" class="help">6 digits. Each code works only once.</p>
+          </div>
+          <div id="login-error" class="form-error" role="alert"></div>
+          <button id="login-submit" class="btn btn-primary btn-lg btn-block" type="submit">Sign in</button>
+        </form>
+      </div>
+      <p class="login-foot muted">Private system. Every sign-in attempt is logged.</p>
+    </div>
+  </main>
+</body>
+</html>

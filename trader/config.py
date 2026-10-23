@@ -50,8 +50,9 @@ class AppConfig(BaseSettings):
     ib_host: str = "127.0.0.1"
     ib_port: int = 4002  # IB Gateway: 4002 paper, 4001 live (TWS: 7497 paper, 7496 live)
     ib_client_id: int = 17
-    # 1 = live (needs a paid subscription and >= $500 equity), 3 = delayed (free)
-    ib_market_data_type: Literal[1, 2, 3, 4] = 3
+    # 1 = live (needs a paid subscription and >= $500 equity), 2 = frozen, 3 = delayed
+    # (free), 4 = delayed frozen. A plain int so the value can come from the environment.
+    ib_market_data_type: int = Field(default=3, ge=1, le=4)
     ib_account: str = ""  # optional: pin a specific account id
     # IBKR routes US crypto through ZEROHASH (older accounts: PAXOS).
     ib_crypto_exchange: str = "ZEROHASH"

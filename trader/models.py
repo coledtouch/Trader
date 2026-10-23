@@ -321,7 +321,9 @@ class BotSettings(BaseModel):
     cycle_seconds: int = Field(default=300, ge=30, le=3600)  # AI decision cadence
     monitor_seconds: int = Field(default=15, ge=5, le=300)  # stop/target/loss-limit checks
     trade_stocks: bool = True
-    trade_crypto: bool = True
+    # Off by default: at $100-250 per trade the ~1.4% round-trip crypto fee fails the
+    # fee-vs-reward check almost every time, while 24/7 candidates would still cost LLM calls.
+    trade_crypto: bool = False
     # Liquid, mostly lower-priced names: with ~$500 equity and a 50% position cap a single
     # share must cost < ~$250 (whole shares). The engine skips anything unaffordable.
     stock_universe: list[str] = Field(
@@ -404,6 +406,10 @@ class EngineStatus(BaseModel):
     equity: float | None = None
     pnl_today: float = 0.0
     pnl_target: float = 0.0
+    # How far today's P&L (equity - start_equity) may fall before the daily loss limit halts
+    # trading, as a positive amount. Differs from start_equity x limit after a resume,
+    # because halts are then measured from the equity at the resume.
+    loss_limit_usd: float | None = None
     trades_today: int = 0
     llm_cost_today: float = 0.0
     data_delayed: bool = False

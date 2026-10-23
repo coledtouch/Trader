@@ -500,6 +500,7 @@ async def test_fills_since_filters_by_time_and_ids_are_unique():
 
 async def test_standalone_protective_stop():
     broker, _ = await make_broker()
+    assert broker.supports_standalone_stops(F) and not broker.supports_standalone_stops(BTC)
     price = (await broker.quote(F)).last
     await broker.place_order(buy(F, 20))
     take_profit = await broker.place_order(

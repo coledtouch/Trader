@@ -1015,6 +1015,11 @@ class SimBroker(Broker):
     def supports_native_stops(self, instrument: Instrument) -> bool:
         return instrument.asset_class == AssetClass.STOCK
 
+    def supports_standalone_stops(self, instrument: Instrument) -> bool:
+        # place_order rests a stop for any SELL carrying stop_loss; offered for stocks only,
+        # like the native brackets, so crypto keeps exercising the engine-managed path.
+        return self.supports_native_stops(instrument)
+
     def estimate_commission(
         self, instrument: Instrument, qty: float, price: float, side: Side = Side.BUY
     ) -> float:

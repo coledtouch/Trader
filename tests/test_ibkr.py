@@ -658,6 +658,53 @@ async def test_stock_exit_is_a_single_order() -> None:
     assert order.transmit and order.parentId == 0 and not order.ocaGroup
 
 
+async def test_exit_with_stop_loss_is_a_resting_gtc_stop_not_a_market_sell() -> None:
+    broker, fake = await connected_broker()
+    hold(fake, stock(), 5)
+    assert broker.supports_standalone_stops(AAPL) and not broker.supports_standalone_stops(BTC)
+    rec = await broker.place_order(
+        OrderRequest(
+            instrument=AAPL,
+            side=Side.SELL,
+            qty=5,
+            order_type=OrderType.MARKET,
+            stop_loss=98.123,
+            is_exit=True,
+            reason="protective stop (re-placed)",
+        )
+    )
+    assert rec.status is OrderStatus.SUBMITTED
+    [(_, order)] = fake.placed
+    assert (order.action, order.orderType, order.tif) == ("SELL", "STP", "GTC")
+    assert order.auxPrice == 98.13  # rounded UP to the tick: never risk more
+    assert order.transmit and order.parentId == 0
+    [working] = await broker.open_orders()
+    assert working.request.stop_loss == 98.123 and working.request.is_exit
+
+
+@pytest.mark.parametrize(
+    ("instrument", "stop", "fragment"),
+    [(BTC, 59000.0, "no stop orders for crypto"), (AAPL, -1.0, "positive stop_loss")],
+)
+async def test_standalone_stop_that_cannot_rest_is_rejected(
+    instrument: Instrument, stop: float, fragment: str
+) -> None:
+    broker, fake = await connected_broker()
+    hold(fake, crypto() if instrument == BTC else stock(), 1)
+    rec = await broker.place_order(
+        OrderRequest(
+            instrument=instrument,
+            side=Side.SELL,
+            qty=1,
+            order_type=OrderType.MARKET,
+            stop_loss=stop,
+            is_exit=True,
+        )
+    )
+    assert rec.status is OrderStatus.REJECTED and fragment in rec.message
+    assert fake.placed == []
+
+
 async def test_exit_larger_than_position_is_rejected() -> None:
     broker, fake = await connected_broker()
     hold(fake, stock(), 2)

@@ -42,12 +42,16 @@ class FeeBroker:
     def __init__(self, fee: float = 0.35):
         self.fee = fee
         self.fee_calls: list[tuple[str, float, float]] = []
+        self.fee_sides: list[Side] = []
 
     def round_qty(self, instrument: Instrument, qty: float, allow_fractional: bool = False):
         return Broker.round_qty(self, instrument, qty, allow_fractional)  # type: ignore[arg-type]
 
-    def estimate_commission(self, instrument: Instrument, qty: float, price: float) -> float:
+    def estimate_commission(
+        self, instrument: Instrument, qty: float, price: float, side: Side = Side.BUY
+    ) -> float:
         self.fee_calls.append((instrument.key, qty, price))
+        self.fee_sides.append(side)
         return self.fee
 
 
@@ -130,7 +134,7 @@ def run_check(
         data_delayed=delayed,
         broker=broker or FeeBroker(),  # type: ignore[arg-type]
         now=now,
-        settings=settings or BotSettings(),
+        settings=settings or BotSettings(trade_crypto=True),
         last_halt_at=last_halt_at,
     )
 
@@ -375,8 +379,10 @@ def test_cash_reserved_by_working_buys() -> None:
 def test_block_fees_vs_reward_using_both_legs() -> None:
     broker = FeeBroker(fee=1.5)  # $3 round trip vs $5 reward = 60%
     assert blocked_with(run_check(broker=broker), "round-trip fees")
-    prices = [price for _, _, price in broker.fee_calls]
-    assert 10.0 in prices and 10.5 in prices  # buy at the entry, sell at the target
+    calls = zip(broker.fee_calls, broker.fee_sides, strict=True)
+    legs = {price: side for (_, _, price), side in calls}
+    # Buy at the entry, sell at the target (the sell leg carries the regulatory fees).
+    assert legs[10.0] is Side.BUY and legs[10.5] is Side.SELL
 
 
 def test_block_outside_entry_window() -> None:
@@ -471,6 +477,10 @@ def test_block_short_entry() -> None:
 
 def test_block_disabled_asset_class() -> None:
     assert blocked_with(run_check(settings=BotSettings(trade_stocks=False)), "disabled")
+    btc = entry(BTC, qty=1, limit=100.0, stop=98.0, target=105.0)
+    q = quote(BTC, bid=99.99, ask=100.01, last=100.0)
+    # Crypto is off by default (its fees fail the fee check at this account size).
+    assert blocked_with(run_check(btc, q=q, settings=BotSettings()), "crypto trading is disabled")
 
 
 def test_all_reasons_are_reported() -> None:

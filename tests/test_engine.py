@@ -87,6 +87,7 @@ class FakeBroker(Broker):
         self.delayed = False
         self.late_commission = False
         self.standalone_stops = True
+        self.reject_exits = False  # refuse market exits (e.g. no liquidity, halted)
         self.fail: set[str] = set()
         self.quotes: dict[str, dict[str, float | bool | None]] = {}
         self.pos: dict[str, list[float]] = {}  # key -> [qty, avg]
@@ -304,6 +305,8 @@ class FakeBroker(Broker):
             held = self.pos.get(key, [0.0, 0.0])[0]
             if kind == "exit" and req.qty > held + 1e-9:
                 return OrderRecord(request=req, status=OrderStatus.REJECTED, message="no shorting")
+            if kind == "exit" and self.reject_exits:
+                return OrderRecord(request=req, status=OrderStatus.REJECTED, message="no bid")
         else:
             kind = "entry"
         self.orders[oid] = OrderRecord(
@@ -389,7 +392,9 @@ class FakeBroker(Broker):
     def supports_standalone_stops(self, instrument: Instrument) -> bool:
         return self.standalone_stops and self.supports_native_stops(instrument)
 
-    def estimate_commission(self, instrument: Instrument, qty: float, price: float) -> float:
+    def estimate_commission(
+        self, instrument: Instrument, qty: float, price: float, side: Side = Side.BUY
+    ) -> float:
         return self.fee
 
     async def modify_stop(self, instrument: Instrument, new_stop: float) -> bool:
@@ -619,6 +624,44 @@ async def test_stop_hit_journals_trade_and_day_stats(db, config) -> None:
     assert db.get_position_meta("STK:F") is None
 
 
+async def test_restarted_simulator_starts_a_fresh_journal_epoch(db, config) -> None:
+    first = await harness(db, config)
+    await enter_f(first)  # BUY F filled on the first simulated account, then the app restarts
+    await first.engine.monitor_tick()
+    stats = first.day()
+    stats.start_equity = 450.0
+    stats.halted, stats.halt_reason = True, "daily target reached: +$100.00 today"
+    db.upsert_day(stats)
+    stale_id = db.insert_order(
+        OrderRecord(
+            request=OrderRequest(
+                instrument=Instrument(symbol="T"), side=Side.BUY, qty=1, limit_price=20.0
+            ),
+            status=OrderStatus.SUBMITTED,
+            broker_order_id="old-1",
+            created_at=NOW,
+        )
+    )
+
+    second = await harness(db, config, now=NOW + timedelta(minutes=10))  # fresh $500 account
+    second.broker._ids, second.broker._execs = itertools.count(100), itertools.count(100)
+    await second.engine.monitor_tick()
+    day = second.day()
+    assert day.start_equity == 500.0  # today's P&L restarts with the new account
+    assert not day.halted  # the old account's target no longer applies (a loss halt would)
+    assert db.get_position_meta("STK:F") is None  # the old position no longer exists
+    stale = db.get_order(stale_id)
+    assert stale.status is OrderStatus.CANCELLED and stale.message == "simulator restarted"
+
+    await enter_f(second)
+    second.broker.set_price("F", 9.70)
+    second.clock.advance(minutes=1)
+    await second.engine.monitor_tick()
+    [trade] = db.list_trades()  # matched against this account's BUY, not the old lot
+    assert trade.qty == 24 and trade.entry_ts >= NOW + timedelta(minutes=10)
+    assert trade.pnl == pytest.approx(24 * (9.69 - 10.01) - 0.70)
+
+
 async def test_unaffordable_and_leveraged_symbols_skipped_before_decision(db, config) -> None:
     h = await harness(db, config, stock_universe=["F", "SPY", "TQQQ"])
     h.broker.set_price("SPY", 764.0)
@@ -700,6 +743,20 @@ async def test_resume_clears_halt_and_rebaselines(db, config) -> None:
     assert h.engine.status().halted is False
 
 
+async def test_status_reports_the_loss_limit_in_dollars(db, config) -> None:
+    h = await harness(db, config, native=False)
+    await h.engine.monitor_tick()
+    status = h.engine.status()
+    assert status.start_equity == 500.0 and status.loss_limit_usd == 30.0  # 6% of $500
+    await enter_f(h)
+    h.broker.set_price("F", 8.50)
+    await h.engine.monitor_tick()
+    await h.engine.resume()  # halts are now measured from the equity at the resume
+    status = h.engine.status()
+    floor = status.equity * 0.94
+    assert status.loss_limit_usd == pytest.approx(500.0 - floor, abs=0.01)
+
+
 async def test_target_reached_soft_halt_keeps_managing_stops(db, config) -> None:
     h = await harness(
         db, config, native=False, risk={"daily_profit_target_usd": 5}, exits={"breakeven_at_r": 0}
@@ -743,6 +800,32 @@ async def test_kill_switch_failure_is_reported_not_raised(db, config) -> None:
     assert h.day().halted
     assert "KILL switch FAILED" in h.notes.titles()
     assert "kill switch failed" in (h.engine.status().last_error or "")
+
+
+async def test_kill_switch_with_refused_exit_restores_the_stop_and_alerts(db, config) -> None:
+    h = await harness(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.broker.reject_exits = True
+    await h.engine.kill()
+    assert h.day().halted and h.broker.pos  # still held: the broker refused the sell
+    [stop] = h.broker.working("STK:F", "stop")  # protection re-placed after the cancel-all
+    assert h.broker.orders[stop].request.stop_loss == 9.8
+    assert "KILL switch FAILED" in h.notes.titles()
+    assert "refused to close F" in (h.engine.status().last_error or "")
+    rejected = [o for o in h.orders(OrderStatus.REJECTED) if o.request.side == Side.SELL]
+    assert rejected and "protective stop re-placed at 9.8" in rejected[0].message
+
+
+async def test_refused_flatten_after_loss_halt_alerts(db, config) -> None:
+    h = await harness(db, config, native=False)
+    await enter_f(h)
+    h.broker.reject_exits = True
+    h.broker.set_price("F", 8.50)
+    await h.engine.monitor_tick()
+    assert h.day().halted and h.day().halt_reason.startswith("daily loss limit")
+    assert "Flatten FAILED" in h.notes.titles()
+    assert "refused to close F" in (h.engine.status().last_error or "")
 
 
 async def test_kill_switch_carries_over_to_next_day_but_loss_halt_does_not(db, config) -> None:
@@ -1321,6 +1404,25 @@ async def test_start_stop_persist_running_flag(db, config) -> None:
     await h.engine.shutdown()
     assert db.get_flag("engine_running")  # a restart resumes the previous state
     assert h.engine._monitor_task is None and not h.broker.connected
+
+
+async def test_start_monitor_protects_without_deciding(db, config) -> None:
+    h = await harness(db, config)
+
+    async def idle_sleep(delay: float) -> None:
+        await asyncio.sleep(3600)
+
+    h.engine._sleep = idle_sleep
+    await h.broker.disconnect()
+    await h.engine.start_monitor()
+    await h.engine.start_monitor()  # idempotent
+    assert h.broker.connected and not h.engine.status().running
+    assert not db.get_flag("engine_running")
+    assert h.engine._monitor_task is not None and h.engine._decision_task is None
+    await h.engine.start()  # adds the decision loop to the running monitor
+    assert h.engine.status().running and h.engine._decision_task is not None
+    await h.engine.shutdown()
+    assert h.engine._monitor_task is None
 
 
 async def test_reload_settings_applies_new_limits(db, config) -> None:
