@@ -71,9 +71,8 @@ from trader.notify import Notifier
 from trader.risk import (
     HALT_DAILY_LOSS,
     RiskManager,
-    available_cash,
     is_soft_halt,
-    max_position_value,
+    quote_problem,
     sane_exit_price,
 )
 from trader.strategy.consensus import PREFIX as CONSENSUS_PREFIX
@@ -81,7 +80,6 @@ from trader.strategy.consensus import label as maker_label
 from trader.strategy.decide import DecisionMaker, RuleBasedDecisionMaker
 from trader.strategy.signals import Scanner
 from trader.timeutil import (
-    in_entry_window,
     market_close_time,
     minutes_to_close,
     stock_market_open,
@@ -382,6 +380,9 @@ class Engine:
         self._positions: list[Position] = []
         self._open_orders: list[OrderRecord] = []
         self._market: dict[str, dict[str, float]] = {}
+        self._latest_quotes: dict[str, Quote] = {}
+        self._cycle_quote_scope: set[str] = set()
+        self._cycle_quote_scope_at: datetime | None = None
         self._day: DayStats | None = None
         self._errors: dict[str, tuple[datetime, str]] = {}
         self._last_cycle_at: datetime | None = None
@@ -426,6 +427,8 @@ class Engine:
         # the new account, open journal orders from before it are closed out, and today's
         # P&L restarts from the new account's equity at the next snapshot.
         self._epoch: datetime | None = self._now() if broker.mode == Mode.SIM else None
+        if self._epoch is not None:
+            self.db.set_kv("journal_account_since", self._epoch.isoformat())
         self._epoch_reason = "simulator restarted"
         self._rebase_pending = self._epoch is not None
         self._busy_at = self._now()  # last time the account held a position or order
@@ -916,6 +919,11 @@ class Engine:
         self.risk.set_limits(self.settings.risk)
         self.scanner.settings = self.settings
         self.rules.settings = self.settings
+        # Dynamic results belong to the previous settings snapshot. The next universe
+        # scan can add them again; configured symbols and held positions remain visible.
+        self._cycle_quote_scope.clear()
+        self._cycle_quote_scope_at = None
+        self._prune_quote_cache(self._now())
         from trader.strategy.claude import ClaudeDecisionMaker
 
         for maker in self._all_makers():  # decision_mode itself is read every cycle
@@ -979,7 +987,7 @@ class Engine:
             if verdict is None or not verdict.approved:
                 message = "re-check at approval failed: " + "; ".join(reasons)
                 self.db.update_order(order_id, status=OrderStatus.BLOCKED, message=message)
-                self._revert_signal(order_id, f"risk at approval: {reasons[0]}")
+                self._revert_signal(order_id, "risk at approval: " + "; ".join(reasons))
                 return self._get_order(order_id)
             order = verdict.order or req
             if self.shadow and not order.is_exit:  # exits only reduce risk: still allowed
@@ -1068,6 +1076,7 @@ class Engine:
     # ------------------------------------------------------------------ status
     def status(self) -> EngineStatus:
         now = self._now()
+        self._prune_quote_cache(now)
         day = self._day
         maker, warning = self._resolve_decider()
         equity = self._account.equity if self._account is not None else None
@@ -1103,8 +1112,76 @@ class Engine:
             data_delayed=self.broker.data_delayed,
             decision_maker=maker.name if self.settings.llm_enabled else self.rules.name,
             decision_warning=warning if self.settings.llm_enabled else None,
-            data_warning=self.broker.data_warning,
+            data_warning=self._data_warning(),
+            quote_health=[
+                {
+                    "symbol": quote.instrument.symbol,
+                    "age_seconds": max(0.0, (_aware(now) - _aware(quote.ts)).total_seconds()),
+                    "delayed": quote.delayed
+                    or (
+                        self.broker.data_delayed
+                        and quote.instrument.asset_class == AssetClass.STOCK
+                    ),
+                    "valid": quote.price is not None
+                    and math.isfinite(quote.price)
+                    and quote_problem(quote) is None
+                    and not quote.halted
+                    and -1
+                    <= (_aware(now) - _aware(quote.ts)).total_seconds()
+                    <= 2 * self.settings.monitor_seconds
+                    and (
+                        quote.instrument.asset_class != AssetClass.STOCK
+                        or quote.spread_pct is not None
+                    )
+                    and (
+                        quote.spread_pct is None
+                        or quote.spread_pct <= self.risk.limits.max_spread_pct
+                    ),
+                }
+                for quote in sorted(self._latest_quotes.values(), key=lambda q: q.instrument.key)
+            ],
         )
+
+    def _prune_quote_cache(self, now: datetime) -> None:
+        """Keep health warnings scoped to configured, held and recent dynamic symbols."""
+        active = {p.instrument.key for p in self._positions if p.qty > 0}
+        if self.settings.trade_stocks:
+            active.update(
+                Instrument(symbol=s.strip().upper()).key
+                for s in self.settings.stock_universe
+                if self.risk.limits.allow_leveraged_etfs or s.upper() not in LEVERAGED_ETFS
+            )
+        if self.settings.trade_crypto:
+            active.update(
+                Instrument(symbol=s.strip().upper(), asset_class=AssetClass.CRYPTO).key
+                for s in self.settings.crypto_universe
+            )
+        ttl = timedelta(
+            seconds=max(2 * self.settings.cycle_seconds, 2 * self.settings.monitor_seconds)
+        )
+        if (
+            self.settings.trade_stocks
+            and self.settings.dynamic_universe
+            and self._cycle_quote_scope_at is not None
+            and now - self._cycle_quote_scope_at <= ttl
+        ):
+            active.update(self._cycle_quote_scope)
+        self._latest_quotes = {k: q for k, q in self._latest_quotes.items() if k in active}
+
+    def _data_warning(self) -> str | None:
+        warnings = [self.broker.data_warning] if self.broker.data_warning else []
+        delayed = sorted(
+            q.instrument.symbol
+            for q in self._latest_quotes.values()
+            if q.instrument.asset_class == AssetClass.STOCK and q.delayed
+        )
+        if self.broker.data_delayed:
+            warnings.append("Delayed stock market data: stock entries are blocked in all modes")
+        elif delayed:
+            warnings.append(
+                f"Delayed market data for {', '.join(delayed)}: stock entries are blocked"
+            )
+        return "; ".join(warnings) or None
 
     def snapshot(self) -> dict[str, Any]:
         """Cached {"account": AccountSnapshot | None, "positions": [Position],
@@ -1172,6 +1249,7 @@ class Engine:
             if any(p.qty > 0 for p in raw_positions) or open_orders:
                 self._busy_at = now
             self._account, self._positions, self._open_orders = account, positions, open_orders
+            self._prune_quote_cache(now)
 
             if math.isfinite(account.equity) and account.equity > 0:
                 changed = False
@@ -1303,6 +1381,7 @@ class Engine:
             return
         self.db.set_kv(ACCOUNT_KEY, current)
         if not known:
+            self.db.set_kv("journal_account_since", now.isoformat())
             log.info("journal belongs to broker account %s", _mask(current))
             return
         await self._on_account_changed(known, current, now)
@@ -1311,6 +1390,10 @@ class Engine:
         reason = "broker account changed"
         log.warning("%s: %s -> %s; starting a new journal epoch", reason, _mask(old), _mask(new))
         self._epoch, self._epoch_reason, self._rebase_pending = now, reason, True
+        self.db.set_kv("journal_account_since", now.isoformat())
+        self._latest_quotes.clear()
+        self._cycle_quote_scope.clear()
+        self._cycle_quote_scope_at = None
         self._cancel_pending(f"cancelled: {reason}")
         stale = self.db.list_orders(limit=500, statuses=OPEN_ORDER_STATUSES)
         for rec in stale:
@@ -1353,6 +1436,7 @@ class Engine:
         )
 
     def _track_halt(self, key: str, quote: Quote, now: datetime) -> None:
+        self._latest_quotes[key] = quote
         if quote.halted:
             if key not in self._last_halt_at or now - self._last_halt_at[key] > CLOSE_RETRY:
                 log.info("%s is halted", key)
@@ -2148,7 +2232,7 @@ class Engine:
         for sig in self.db.list_signals(limit=500):
             if sig.order_id == order_id:
                 self.db.update_signal(
-                    sig.model_copy(update={"taken": False, "skip_reason": _short(reason, 160)})
+                    sig.model_copy(update={"taken": False, "skip_reason": reason})
                 )
                 return
 
@@ -2219,11 +2303,16 @@ class Engine:
         settings = self.settings
         stocks_open = stock_market_open(now)
         symbols: list[Instrument] = []
+        dynamic_keys: set[str] = set()
         if settings.trade_stocks and stocks_open:
             names = list(settings.stock_universe)
             if settings.dynamic_universe:
                 try:
-                    names += await self.broker.scan_movers(10)
+                    movers = await self.broker.scan_movers(10)
+                    names += movers
+                    dynamic_keys = {
+                        Instrument(symbol=s.strip().upper()).key for s in movers if s.strip()
+                    }
                 except Exception as exc:
                     log.warning("scan_movers failed: %s", exc)
             symbols += [Instrument(symbol=s, asset_class=AssetClass.STOCK) for s in names]
@@ -2250,6 +2339,9 @@ class Engine:
             stock = pos.instrument.asset_class == AssetClass.STOCK
             if pos.qty > 0 and (stocks_open or not stock):
                 out.setdefault(pos.instrument.key, pos.instrument)
+        self._cycle_quote_scope = set(out) & dynamic_keys
+        self._cycle_quote_scope_at = now
+        self._prune_quote_cache(now)
         return list(out.values())
 
     def _log_skip_once(self, symbol: str, reason: str) -> None:
@@ -2257,29 +2349,11 @@ class Engine:
             self._skip_logged.add((symbol, reason))
             log.info("universe: skipping %s today: %s", symbol, reason)
 
-    def _affordable(self, inst: Instrument, quote: Quote, account: AccountSnapshot) -> bool:
-        """Whether one tradable unit fits the position cap and the cash. Crypto (and
-        fractional stocks) trade in small fractions, so only whole shares can fail."""
-        if inst.asset_class != AssetClass.STOCK or self.settings.allow_fractional_stocks:
-            return True
-        price = quote.ask or quote.price
-        if price is None:
-            return False
-        limit = min(max_position_value(self.risk.limits, account.equity), available_cash(account))
-        if price > limit:
-            self._log_skip_once(
-                inst.symbol, f"1 share costs ${price:,.2f}, more than the ${limit:,.2f} allowed"
-            )
-            return False
-        return True
-
     async def _fetch(
         self, universe: list[Instrument], now: datetime
     ) -> list[tuple[Instrument, Quote, list[Bar]]]:
-        """Quote, affordability prefilter, then bars, per instrument. Errors skip a symbol."""
+        """Fetch quotes and bars so every emitted setup reaches the signal ledger."""
         assert self._account is not None
-        account = self._account
-        held = {p.instrument.key for p in self._positions if p.qty > 0}
         lookback = BAR_LOOKBACK.get(self.settings.bar_size, "5 D")
         sem = asyncio.Semaphore(FETCH_CONCURRENCY)
 
@@ -2288,8 +2362,6 @@ class Engine:
                 try:
                     quote = await self.broker.quote(inst)
                     self._track_halt(inst.key, quote, now)
-                    if inst.key not in held and not self._affordable(inst, quote, account):
-                        return None
                     bars = await self.broker.bars(inst, self.settings.bar_size, lookback)
                 except Exception as exc:
                     log.warning("market data for %s failed: %s", inst.key, exc)
@@ -2300,19 +2372,72 @@ class Engine:
         return [r for r in results if r is not None]
 
     def _not_actionable(self, cand: Candidate, quote: Quote | None, now: datetime) -> str | None:
-        """Why a candidate cannot be traded right now (kept out of the decision maker)."""
+        """Check the largest feasible scanner proposal before spending on a decision.
+
+        The final send and approval repeat these checks on fresh broker state. This pass
+        is an eligibility filter, never authorization to send an order.
+        """
+        assert self._account is not None
         key = cand.instrument.key
-        if quote is not None and quote.halted:
-            return "halted"
-        last_halt = self._last_halt_at.get(key)
-        cooldown = timedelta(minutes=self.risk.limits.halt_cooldown_minutes)
-        if last_halt is not None and now - last_halt < cooldown:
-            return "halt cooldown"
-        if cand.instrument.asset_class == AssetClass.STOCK and not in_entry_window(
-            now, self.settings.stock_entry_start, self.settings.stock_entry_cutoff
+        account = self._with_day_trades(self._account, now)
+        day = self._today(now)
+        decision = AIDecision(
+            action=TradeAction.BUY,
+            symbol=cand.instrument.symbol,
+            asset_class=cand.instrument.asset_class,
+            conviction=cand.score,
+            setup=cand.setup,
+            rationale="scanner eligibility check",
+        )
+        entry = (quote.ask or quote.price) if quote is not None else cand.price
+        qty, notes = self.risk.size_entry(
+            decision=decision,
+            entry=entry or 0.0,
+            stop=cand.suggested_stop,
+            account=account,
+            positions=self._positions,
+            open_orders=self._open_orders,
+            day=day,
+            broker=self.broker,
+            allow_fractional=self.settings.allow_fractional_stocks,
+        )
+        req = OrderRequest(
+            instrument=cand.instrument,
+            side=Side.BUY,
+            qty=max(qty, EPS),
+            limit_price=entry,
+            stop_loss=cand.suggested_stop,
+            take_profit=cand.suggested_target,
+            setup=cand.setup,
+        )
+        verdict = self.risk.check(
+            req,
+            quote=quote,
+            account=account,
+            positions=self._positions,
+            open_orders=self._open_orders,
+            day=day,
+            mode=self.broker.mode,
+            data_delayed=self.broker.data_delayed,
+            broker=self.broker,
+            now=now,
+            settings=self.settings,
+            last_halt_at=self._last_halt_at.get(key),
+        )
+        reasons = list(verdict.reasons) if not verdict.approved else []
+        if qty <= 0:
+            reasons.insert(0, notes[-1])
+        if key in self._pending_trades:
+            reasons.append("previous trade still settling")
+        if key in self._awaiting_approval():
+            reasons.append("already waiting for approval")
+        if self._halt_pending is not None:
+            reasons.append(f"halt condition being confirmed: {self._halt_pending}")
+        if self.db.get_position_meta(key) is not None and not any(
+            p.instrument.key == key and p.qty > 0 for p in self._positions
         ):
-            return "outside the stock entry window"
-        return None
+            reasons.append(f"an entry for {cand.instrument.symbol} is in flight or still held")
+        return "risk: " + "; ".join(reasons) if reasons else None
 
     def _pick_maker(self, ctx: DecisionContext) -> tuple[DecisionMaker, str | None, bool]:
         """(maker, why it is not the configured one, whether it may open positions).
@@ -2404,6 +2529,7 @@ class Engine:
             stock_market_open=stock_market_open(now),
             data_delayed=self.broker.data_delayed,
         )
+        cycle_settings = self.settings.model_copy(deep=True)
         maker, why, entries_ok = self._pick_maker(ctx)
         try:
             batch = await maker.decide(ctx)
@@ -2419,7 +2545,25 @@ class Engine:
             batch.market_view = f"[{why}] {batch.market_view}".strip()
         if manual:
             batch.market_view = f"[manual] {batch.market_view}".strip()
+        blocked_notes = [
+            f"{item.cand.instrument.symbol}/{item.cand.setup}: {item.blocked}"
+            for item in logged
+            if item.blocked is not None
+        ]
+        if blocked_notes:
+            batch.market_view += " [Entry eligibility: " + " | ".join(blocked_notes) + "]"
         batch.id = self.db.insert_decision(batch)
+        from trader.capture import capture_cycle
+
+        if self.broker.name != "offline_research":
+            capture_cycle(
+                self.db,
+                ctx.model_copy(update={"candidates": candidates}),
+                quotes,
+                {inst.key: bars for inst, _, bars in data},
+                batch,
+                cycle_settings,
+            )
         day.llm_cost = round(day.llm_cost + batch.cost_usd, 6)
         self._save_day()
         # Orders must not be interrupted halfway (e.g. by stop()): shield the execution.
@@ -2467,7 +2611,7 @@ class Engine:
                 self._update_signal(
                     item.signal_id,
                     decision_id=batch.id,
-                    skip_reason=_short(prefix + (skip or ""), 160),
+                    skip_reason=prefix + (skip or ""),
                 )
         return batch
 
@@ -2520,8 +2664,10 @@ class Engine:
         saw (`now` is when that context was built)."""
         key = inst.key
         mine = [c for c in ctx.candidates if c.instrument.key == key]
-        cand = next((c for c in mine if c.setup == decision.setup), None) or next(
-            iter(sorted(mine, key=lambda c: c.score, reverse=True)), None
+        cand = (
+            next((c for c in mine if c.setup == decision.setup), None)
+            if decision.setup is not None
+            else next(iter(sorted(mine, key=lambda c: c.score, reverse=True)), None)
         )
         if cand is None:
             log.warning("BUY %s ignored: not a scanner candidate this cycle", key)
@@ -2557,6 +2703,7 @@ class Engine:
                 stop=stop,
                 account=account,
                 positions=positions,
+                open_orders=open_orders,
                 day=day,
                 broker=self.broker,
                 allow_fractional=self.settings.allow_fractional_stocks,
@@ -2574,7 +2721,7 @@ class Engine:
                 take_profit=target,
                 reason=_short(decision.rationale),
                 decision_id=batch.id,
-                setup=decision.setup or cand.setup,
+                setup=cand.setup,
             )
             verdict = self.risk.check(
                 req,
@@ -2603,7 +2750,7 @@ class Engine:
                     OrderRecord(request=req, status=OrderStatus.BLOCKED, message=message), send_now
                 )
                 log.info("BUY %s blocked: %s", key, message)
-                return _BuyOutcome(cand.setup, False, order_id, skip_reason=f"risk: {reasons[0]}")
+                return _BuyOutcome(cand.setup, False, order_id, skip_reason=f"risk: {message}")
             order = verdict.order or req
             sizing = "; ".join([*notes, *verdict.reasons])
             if self.shadow:

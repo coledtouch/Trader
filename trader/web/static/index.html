@@ -59,6 +59,9 @@
     <div id="stale-banner" class="banner banner-warn" role="status" hidden>
       <span id="stale-text" class="banner-text"></span>
     </div>
+    <div id="market-data-banner" class="banner banner-warn" role="status" hidden>
+      <span id="market-data-text" class="banner-text"></span>
+    </div>
     <div id="halt-region" aria-live="assertive" aria-atomic="true">
       <div id="halt-banner" class="banner banner-halt" hidden>
         <span class="banner-text"><strong>Trading halted:</strong> <span id="halt-reason"></span></span>
@@ -72,6 +75,21 @@
     <section id="view-dashboard" class="view" role="tabpanel" aria-labelledby="tab-dashboard">
       <h1 class="visually-hidden">Dashboard</h1>
       <div class="dash-grid">
+        <section class="card span-all performance-card" aria-labelledby="performance-heading">
+          <div class="card-head">
+            <h2 id="performance-heading" class="card-title">Profit after costs</h2>
+            <div class="filters">
+              <label for="performance-days">Period</label>
+              <select id="performance-days">
+                <option value="7">Last 7 days</option>
+                <option value="30" selected>Last 30 days</option>
+                <option value="90">Last 90 days</option>
+              </select>
+            </div>
+          </div>
+          <div id="performance-summary" aria-live="polite" aria-atomic="true"><p class="empty">Loading performance…</p></div>
+        </section>
+
         <section class="card span-all" aria-labelledby="equity-heading">
           <div class="hero-row">
             <div>
@@ -80,16 +98,16 @@
               <p id="equity-sub" class="small muted"></p>
             </div>
             <div class="pnl-block">
-              <h2 class="card-title">Today's P&amp;L</h2>
+              <h2 class="card-title">Today's trading P&amp;L</h2>
               <p id="pnl-value" class="pnl-value" aria-live="polite" aria-atomic="true">—</p>
-              <p class="small muted">Open positions valued at the bid</p>
+              <p class="small muted">Before operating costs · open positions valued at the bid</p>
             </div>
           </div>
           <div class="meter-wrap">
             <div id="pnl-meter" class="meter" aria-hidden="true"></div>
             <div class="meter-labels">
               <span id="pnl-loss-label"></span>
-              <span id="pnl-target-label"></span>
+              <span>Daily loss budget</span>
             </div>
             <p id="pnl-note" class="meter-note"></p>
           </div>
@@ -125,6 +143,10 @@
           <p id="decision-warning" class="inline-warn" role="status" hidden></p>
           <p id="data-warning" class="inline-warn" role="status" hidden></p>
           <p id="last-error" class="inline-warn" hidden></p>
+          <details class="more mt-12">
+            <summary>Quote freshness</summary>
+            <div id="quote-health"><p class="empty">No quotes observed yet.</p></div>
+          </details>
         </section>
 
         <section class="card span-all" aria-labelledby="today-heading">
@@ -195,22 +217,38 @@
     <section id="view-signals" class="view" role="tabpanel" aria-labelledby="tab-signals" hidden>
       <div class="view-head">
         <h1>Signals</h1>
-        <button id="signals-refresh" class="btn btn-sm" type="button">Refresh</button>
+        <div class="filters">
+          <label for="stats-days">Period</label>
+          <select id="stats-days">
+            <option value="7">Last 7 days</option>
+            <option value="30" selected>Last 30 days</option>
+            <option value="90">Last 90 days</option>
+          </select>
+          <button id="signals-refresh" class="btn btn-sm" type="button">Refresh</button>
+        </div>
       </div>
-      <p class="lede muted">Every qualifying setup is logged, traded or not, and scored afterwards in R
-        (1R = entry minus stop). Judge a setup only after at least 30 evaluated signals.</p>
+      <p class="lede muted">Signal diagnostics measure price movement before fees and operating costs.
+        They do not reproduce actual fills or the bot's managed exits. Thirty signals are an initial review point;
+        they do not establish profitability.</p>
+
+      <section class="card" aria-labelledby="filled-setups-heading">
+        <h2 id="filled-setups-heading" class="card-title">Actual closed trades by setup</h2>
+        <p class="small muted">Realized trading P&amp;L after recorded commissions. Exploratory ranges resample trading days and need more history to be useful. Operating costs are shown on the Dashboard, not allocated to individual setups.</p>
+        <div id="filled-setups-list"><p class="empty">Loading…</p></div>
+      </section>
+
+      <section class="card" aria-labelledby="research-heading">
+        <div class="card-head">
+          <h2 id="research-heading" class="card-title">Captured-decision comparison</h2>
+          <button id="research-run" class="btn btn-sm" type="button">Compare captured decisions</button>
+        </div>
+        <p class="small muted">Replays recorded model votes and rules through separate virtual accounts. Uses stored data, makes no paid AI calls, and sends no broker orders.</p>
+        <div id="research-list"><p class="empty">Loading…</p></div>
+      </section>
 
       <section class="card" aria-labelledby="stats-heading">
         <div class="card-head">
-          <h2 id="stats-heading" class="card-title">Setup scorecard</h2>
-          <div class="filters">
-            <label for="stats-days">Period</label>
-            <select id="stats-days">
-              <option value="7">Last 7 days</option>
-              <option value="30" selected>Last 30 days</option>
-              <option value="90">Last 90 days</option>
-            </select>
-          </div>
+          <h2 id="stats-heading" class="card-title">Price diagnostics before costs</h2>
         </div>
         <div id="stats-list"></div>
       </section>

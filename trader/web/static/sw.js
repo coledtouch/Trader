@@ -9,7 +9,7 @@
  */
 'use strict';
 
-const VERSION = 'v5';
+const VERSION = 'v6';
 const CACHE = `trader-shell-${VERSION}`;
 const SHELL = [
   '/static/styles.css',

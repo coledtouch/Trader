@@ -499,6 +499,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "backtest", add_help=False, help="run the backtester (python -m trader backtest --help)"
     )
+    sub.add_parser(
+        "research", add_help=False, help="replay real observations without broker access"
+    )
     return parser
 
 
@@ -508,6 +511,10 @@ def main(argv: list[str] | None = None) -> int:
         from trader.backtest import main as backtest_main
 
         return backtest_main(args_list[1:])
+    if args_list and args_list[0] == "research":
+        from trader.research import main as research_main
+
+        return research_main(args_list[1:])
     parser = build_parser()
     args = parser.parse_args(args_list)
     if not getattr(args, "func", None):

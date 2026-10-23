@@ -521,7 +521,11 @@ class _Backtest:
         if equity <= self.day_start_equity * (1 - loss_pct / 100):
             return "daily loss limit"
         gain = equity - self.day_start_equity
-        if lim.stop_trading_at_target and gain >= lim.daily_profit_target_usd:
+        if (
+            lim.stop_trading_at_target
+            and lim.daily_profit_target_usd > 0
+            and gain >= lim.daily_profit_target_usd
+        ):
             return "daily target reached"  # soft: open positions keep their exits
         return None
 

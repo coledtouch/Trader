@@ -407,10 +407,10 @@ def test_block_market_closed() -> None:
     assert blocked_with(run_check(now=saturday, q=quote(ts=saturday)), "market is closed")
 
 
-def test_block_live_with_delayed_data_for_stocks() -> None:
-    assert blocked_with(run_check(mode=Mode.LIVE, delayed=True), "delayed market data")
-    assert blocked_with(run_check(mode=Mode.LIVE, q=quote(delayed=True)), "delayed market data")
-    assert run_check(mode=Mode.PAPER, delayed=True).approved
+@pytest.mark.parametrize("mode", list(Mode))
+def test_block_all_modes_with_delayed_data_for_stocks(mode: Mode) -> None:
+    assert blocked_with(run_check(mode=mode, delayed=True), "delayed market data")
+    assert blocked_with(run_check(mode=mode, q=quote(delayed=True)), "delayed market data")
 
 
 def test_crypto_allowed_live_with_delayed_data() -> None:
@@ -438,7 +438,9 @@ def test_block_stale_quote() -> None:
 
 def test_delayed_quote_gets_extra_age() -> None:
     q = quote(ts=NOW - timedelta(minutes=10), delayed=True)
-    assert run_check(q=q).approved
+    verdict = run_check(q=q)
+    assert blocked_with(verdict, "delayed market data")
+    assert not any("stale" in reason for reason in verdict.reasons)
 
 
 def test_block_qty_rounds_to_zero() -> None:

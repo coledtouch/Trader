@@ -599,8 +599,9 @@ async def test_never_adds_to_existing_position(db, config) -> None:
     h.clock.advance(minutes=5)
     await h.engine.run_cycle()
     buys = [o for o in h.orders() if o.request.side == Side.BUY]
-    assert len(buys) == 2
-    assert buys[0].status == OrderStatus.BLOCKED and "never add" in buys[0].message
+    assert len(buys) == 1
+    assert "never add" in db.list_decisions()[0].market_view
+    assert h.decider.calls[-1].candidates == []  # owned-position exit review remains allowed
     assert len([r for r in h.broker.placed if r.side == Side.BUY]) == 1
 
 
@@ -671,7 +672,11 @@ async def test_unaffordable_and_leveraged_symbols_skipped_before_decision(db, co
     h.scanner.candidates["STK:SPY"] = [cand("SPY", 764, 760, 775)]
     h.scanner.candidates["STK:TQQQ"] = [cand("TQQQ", 50, 49, 53)]
     await h.engine.run_cycle()
-    assert "STK:SPY" not in h.scanner.scanned and "STK:TQQQ" not in h.scanner.scanned
+    assert "STK:SPY" in h.scanner.scanned and "STK:TQQQ" not in h.scanner.scanned
+    assert any(
+        s.instrument.symbol == "SPY" and "size rounds to 0" in s.skip_reason
+        for s in db.list_signals()
+    )
     assert "STK:TQQQ" not in h.broker.quote_calls  # skipped without even a quote
     ctx = h.decider.calls[-1]
     assert {c.instrument.symbol for c in ctx.candidates} == {"F"}
@@ -683,7 +688,7 @@ async def test_halted_symbol_not_entered_and_cooldown(db, config) -> None:
     batch = await h.engine.run_cycle()
     assert batch is not None and batch.candidates == [] and not h.decider.calls
     assert not [r for r in h.broker.placed if r.side == Side.BUY]
-    assert db.list_signals()[0].skip_reason == "halted"
+    assert "F is halted" in db.list_signals()[0].skip_reason
 
     h.broker.set_price("F", 10.0)  # reopened, but inside the 15 min cooldown
     h.clock.advance(minutes=5)
@@ -700,7 +705,7 @@ async def test_stock_candidates_outside_entry_window_are_held_back(db, config) -
     h = await harness(db, config, now=datetime(2026, 10, 21, 13, 35, tzinfo=UTC))  # 09:35 ET
     batch = await h.engine.run_cycle()
     assert batch is not None and batch.candidates == [] and not h.decider.calls
-    assert db.list_signals()[0].skip_reason == "outside the stock entry window"
+    assert "outside the stock entry window 09:45-15:30 ET" in db.list_signals()[0].skip_reason
 
 
 async def test_buy_for_non_candidate_is_ignored(db, config) -> None:
@@ -745,9 +750,9 @@ async def test_entry_that_fills_during_the_llm_call_is_not_doubled(db, config) -
     h.engine._decider = maker
     await h.engine.run_cycle()
     assert len([r for r in h.broker.placed if r.side == Side.BUY]) == 1
-    assert h.broker.pos["STK:F"][0] == 25
+    assert not h.broker.pos and not maker.calls
     blocked = h.orders(OrderStatus.BLOCKED)
-    assert len(blocked) == 1 and "never add to a position" in blocked[0].message
+    assert blocked == [] and "already working" in db.list_decisions()[0].market_view
 
 
 async def test_order_approved_during_the_llm_call_is_not_doubled(db, config) -> None:
@@ -768,9 +773,9 @@ async def test_order_approved_during_the_llm_call_is_not_doubled(db, config) -> 
     maker.decisions = [buy(limit_price=9.99)]
     h.engine._decider = maker
     await h.engine.run_cycle()
-    assert len([r for r in h.broker.placed if r.side == Side.BUY]) == 1
-    assert len(h.broker.working("STK:F", "entry")) == 1
-    assert any("already working" in o.message for o in h.orders(OrderStatus.BLOCKED))
+    assert len([r for r in h.broker.placed if r.side == Side.BUY]) == 0
+    assert len(h.broker.working("STK:F", "entry")) == 0 and not maker.calls
+    assert "already waiting for approval" in db.list_decisions()[0].market_view
 
 
 async def test_entry_in_flight_blocks_a_second_entry(db, config) -> None:
@@ -785,7 +790,8 @@ async def test_entry_in_flight_blocks_a_second_entry(db, config) -> None:
     h.clock.advance(seconds=30)  # within the metadata grace period
     await h.engine.run_cycle()
     assert not h.broker.placed
-    assert "in flight or still held" in h.orders(OrderStatus.BLOCKED)[0].message
+    assert "in flight or still held" in db.list_decisions()[0].market_view
+    assert len(h.decider.calls) == 1
 
 
 async def test_buy_is_checked_at_send_time_not_when_the_llm_was_asked(db, config) -> None:
@@ -856,7 +862,7 @@ async def test_recent_day_trade_counts_before_ibkr_reports_it(db, config) -> Non
     h.clock.advance(minutes=1)
     await h.engine.run_cycle()
     assert not [r for r in h.broker.placed if r.instrument.symbol == "T" and r.side == Side.BUY]
-    assert "no day trades remaining" in h.orders(OrderStatus.BLOCKED)[0].message
+    assert "no day trades remaining" in db.list_decisions()[0].market_view
     h.clock.advance(minutes=5)  # IBKR's value is fresh again (still 1: one left)
     await h.engine.run_cycle()
     assert [r for r in h.broker.placed if r.instrument.symbol == "T" and r.side == Side.BUY]

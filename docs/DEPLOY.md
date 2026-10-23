@@ -226,7 +226,11 @@ This protects you if the tunnel or a Cloudflare setting is ever misconfigured.
 ## Part B: paper trading
 
 You need the paper account from [SETUP_IBKR.md](SETUP_IBKR.md#4-request-the-paper-trading-account).
-Live market data (SETUP_IBKR steps 5-6) is optional at first.
+Without real-time market data you can check connectivity and collect diagnostic
+signals, but **PAPER stock entries are blocked on delayed data**, just as LIVE entries
+are. The current real-time request is awaiting approval. Keep
+`TRADER_IB_MARKET_DATA_TYPE=3` for diagnostics until entitlement and paper sharing are
+ready; changing a request to type `1` does not approve or purchase a subscription.
 
 1. Edit the settings:
    ```bash
@@ -262,7 +266,7 @@ Live market data (SETUP_IBKR steps 5-6) is optional at first.
    budget (it covers Claude and Grok together;
    [SETUP_IBKR.md cost advice](SETUP_IBKR.md#ai-api-cost-estimate)) and keep the dollar
    limits sized for your real account (max order $250).
-5. Once market data is subscribed and shared with the paper account, switch to live
+5. Once market data is approved, subscribed and shared with the paper account, request live
    prices: in `.env`, set the market data line to 1:
    ```
    TRADER_IB_MARKET_DATA_TYPE=1
@@ -270,9 +274,25 @@ Live market data (SETUP_IBKR steps 5-6) is optional at first.
    ```bash
    docker compose up -d
    ```
+   Verify the delivered feed in the dashboard: quotes must not be marked delayed and
+   must pass the freshness/spread checks. A recent quote age measures time since receipt,
+   not the age of a delayed exchange price. Per-symbol delayed flags still block entries
+   even when type `1` was requested. Existing positions retain their exit management.
 
-Let it run for at least 4 weeks. Read [STRATEGY.md](STRATEGY.md#judging-a-setup) for how
-to judge the results; the **Signals** tab shows the scorecard.
+In **Settings > Operating costs**, enter the current hosting dashboard estimate
+($24/month for the 4 GB / 2 CPU droplet). Leave market-data cost blank until known; enter
+zero only if confirmed free. Blank is unknown, so the dashboard does not claim complete
+all-in P&L. AI spend uses recorded price estimates; reconcile provider invoices.
+
+Use new periods with frozen rules to evaluate results after costs, realistic fills and
+the production exits. No elapsed duration or signal count certifies profitability. Read
+[STRATEGY.md](STRATEGY.md#judging-a-setup); the **Signals** tab separates gross diagnostics,
+actual closed-trade results and offline replay comparisons.
+
+The entry filter checks scanner proposals before paid model analysis, including fees,
+cash, exposure, working orders, enabled setup, session and quote quality. Blocked
+signals and exact reasons are journaled. With no eligible entries or bot-owned positions
+to review, no paid model is called. An existing position can still trigger an exit review.
 
 ---
 
@@ -407,6 +427,31 @@ diff <(grep -o '^[A-Z_]*=' .env.example | sort) <(grep -o '^[A-Z_]*=' .env | sor
 
 Lines starting with `<` are names to copy from `.env.example` into `.env`.
 
+After this upgrade, inspect **Settings > Setup selection** and **Operating costs**.
+Existing saved daily targets are retained; new defaults use $0 (off). Disabling a setup
+blocks its new entries, including pending approvals, while exits continue. Re-enabling
+requires a fresh 2FA code. The primary report uses account-scoped results after costs;
+commissions are already in trading P&L. Calendar-prorated expenses, recorded AI estimates,
+partial-day coverage and daily-observation drawdown are estimates with explicit limits,
+not reconciled invoices or a complete intraday risk history.
+
+To run an offline comparison inside the container:
+
+```bash
+docker compose exec trader python -m trader research --database /data/trader.db --save-report
+```
+
+Or use **Signals > Captured-decision comparison**. Captures are bounded to 2,500 compact
+scanner snapshots containing observed quotes, original candidates, indicator features
+and model votes/costs, without duplicated bar history. The web comparison uses at most
+1,000 frames from the latest uninterrupted account/settings cohort. It makes no broker
+or AI API calls.
+Sparse observations and opinions conditioned on the original account limit the replay;
+missing votes/costs remain unknown, and snapshots cannot rescan historical bars.
+For real historical CSV rules testing with the same
+engine, see [the replay guide](STRATEGY.md#offline-paired-replay). The legacy synthetic
+backtest is only a mechanics check.
+
 ### Backups
 
 Everything the app knows (journal, settings, login) is in `data/trader.db`. Make a
@@ -480,7 +525,7 @@ ntfy, you get an alert when the broker connection has been down for over a minut
 | Gateway log stops after `detected dialog entitled: Gateway` (right after `Authenticating...`), then only `socat ... Connection refused` | IBKR rejected the login: usually the password, often cut short at a `$` or other symbol | Run the length check from [Part B](#part-b-paper-trading); if it is shorter than your password, change the password to letters and numbers only, update `TWS_PASSWORD` and `docker compose up -d --force-recreate ib-gateway`. Also test the same username and password on the IBKR website |
 | Gateway log repeats login attempts ("login loop") | Wrong username/password; paper username with `TRADING_MODE=live`; IB Key push not approved; IBKR's nightly maintenance (around midnight ET and weekends) | Log in to the Client Portal in a browser with the same username to rule out a locked account or password problem. Check phone notifications. If it persists, look at the gateway screen (below) |
 | No IB Key notification arrives | Android blocked notifications or put IBKR Mobile to sleep | Phone settings: notifications on, battery Unrestricted. Open IBKR Mobile, then `docker compose restart ib-gateway` |
-| Dashboard shows delayed data | No subscription, not shared with paper, or `TRADER_IB_MARKET_DATA_TYPE` not 1 | See SETUP_IBKR steps 5-6 and [Part B step 5](#part-b-paper-trading). Live accounts refuse stock entries on delayed data |
+| Dashboard shows delayed data | Subscription approval pending, not shared with paper, or delivered quotes still flagged delayed | See SETUP_IBKR steps 5-6 and [Part B step 5](#part-b-paper-trading). PAPER and LIVE stock entries and paid stock entry analysis are blocked. A small quote receipt age does not make delayed prices real-time; exits remain managed |
 | Yellow warning "IBKR error 10197: no market data while another session of this login holds it" | You are logged in to the live account elsewhere (IBKR Mobile, TWS, Client Portal trading) while the paper gateway runs; shared market data goes to one session only. See [below](#no-market-data-error-10197) | Log out of the other session. Data returns within a minute and the warning clears; meanwhile the bot opens nothing in the affected symbols |
 | Yellow warning "Consensus mode needs both API keys..." | `ANTHROPIC_API_KEY` or `XAI_API_KEY` is empty or misspelled in `.env` | Fill in the missing key and `docker compose up -d`, or pick a single-model mode in Settings. Until then the one model with a key decides alone |
 | Every Grok decision shows an error ("HTTP 401", "HTTP 403", "HTTP 429") | Wrong xAI key, key not allowed for the model, or prepaid credits used up | console.x.ai: check the key, its model permissions and the credit balance. In consensus mode nothing is bought while Grok fails; exits still work |

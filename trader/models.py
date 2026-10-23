@@ -249,12 +249,16 @@ class DecisionBatch(BaseModel):
     # Consensus batches: each model's own (validated) decisions, keyed by maker name
     # ("claude", "grok"), so the journal shows how each one voted. Empty otherwise.
     votes: dict[str, list[AIDecision]] = Field(default_factory=dict)
+    # Preserve individual call accounting for paired, offline selection comparisons.
+    # Missing keys on older rows mean unknown, never a free model call.
+    vote_costs: dict[str, float] = Field(default_factory=dict)
+    vote_failures: dict[str, str] = Field(default_factory=dict)
 
 
 class RiskLimits(BaseModel):
     """User-adjustable risk settings. Values are clamped to HARD_CAPS in code."""
 
-    daily_profit_target_usd: float = Field(default=100.0, ge=0)
+    daily_profit_target_usd: float = Field(default=0.0, ge=0)
     stop_trading_at_target: bool = True  # lock in the day once the target is reached
     max_daily_loss_pct: float = Field(default=6.0, gt=0)  # of start-of-day equity
     max_risk_per_trade_pct: float = Field(default=2.0, gt=0)  # equity lost if the stop is hit
@@ -334,6 +338,25 @@ class ExitRules(BaseModel):
     trail_atr_mult: float = Field(default=0.0, ge=0)
 
 
+SetupName = Literal[
+    "orb_breakout", "vwap_reclaim", "trend_pullback", "rsi_reversion", "volume_spike"
+]
+SETUP_NAMES: tuple[SetupName, ...] = (
+    "orb_breakout",
+    "vwap_reclaim",
+    "trend_pullback",
+    "rsi_reversion",
+    "volume_spike",
+)
+
+
+class OperatingCosts(BaseModel):
+    """Owner-supplied monthly expense estimates; None means not configured, not free."""
+
+    hosting_monthly_usd: float | None = Field(default=None, ge=0, le=100_000, allow_inf_nan=False)
+    data_monthly_usd: float | None = Field(default=None, ge=0, le=100_000, allow_inf_nan=False)
+
+
 class BotSettings(BaseModel):
     """Runtime settings, editable in the UI and stored in the database."""
 
@@ -359,6 +382,8 @@ class BotSettings(BaseModel):
     min_avg_volume: float = Field(default=500_000, ge=0)  # skip illiquid names (shares/day)
     dynamic_universe: bool = False  # add IBKR scanner top movers (needs real-time data)
     allow_fractional_stocks: bool = False
+    enabled_setups: list[SetupName] = Field(default_factory=lambda: list(SETUP_NAMES), max_length=5)
+    operating_costs: OperatingCosts = Field(default_factory=OperatingCosts)
     llm_enabled: bool = True  # master switch: off means rules-only decisions
     # Who decides. "consensus" (default): a BUY goes out only when Claude AND Grok both
     # BUY the same symbol; either one can CLOSE. "claude" / "grok": that model alone.
@@ -412,6 +437,13 @@ class TradeRecord(BaseModel):
     exit_reason: str = ""
 
 
+class QuoteHealth(BaseModel):
+    symbol: str
+    age_seconds: float | None = None
+    delayed: bool = False
+    valid: bool = False
+
+
 class EngineStatus(BaseModel):
     running: bool = False
     mode: Mode = Mode.SIM
@@ -446,6 +478,7 @@ class EngineStatus(BaseModel):
     # Broker market-data problem worth the owner's attention, e.g. IBKR error 10197 (no
     # data while another session of the same login holds it). Affected symbols get no entries.
     data_warning: str | None = None
+    quote_health: list[QuoteHealth] = Field(default_factory=list)
 
 
 class DecisionContext(BaseModel):

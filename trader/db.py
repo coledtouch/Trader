@@ -99,6 +99,7 @@ CREATE TABLE IF NOT EXISTS orders (
     commission REAL NOT NULL DEFAULT 0,
     message TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts);
 CREATE INDEX IF NOT EXISTS idx_orders_broker ON orders(broker_order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE TABLE IF NOT EXISTS fills (
@@ -155,11 +156,25 @@ CREATE TABLE IF NOT EXISTS signals (
 );
 CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);
 CREATE INDEX IF NOT EXISTS idx_signals_eval ON signals(evaluated, ts);
+CREATE TABLE IF NOT EXISTS research_frames (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    cohort TEXT,
+    account_id TEXT,
+    data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_frames_ts ON research_frames(ts);
 """
 
 
 # (table, column, declaration) added after the first release; applied at startup.
-MIGRATIONS: tuple[tuple[str, str, str], ...] = (("decisions", "votes", "TEXT"),)
+MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("decisions", "votes", "TEXT"),
+    ("decisions", "vote_costs", "TEXT"),
+    ("decisions", "vote_failures", "TEXT"),
+    ("research_frames", "cohort", "TEXT"),
+    ("research_frames", "account_id", "TEXT"),
+)
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -202,6 +217,15 @@ class Database:
             names = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
             if column not in names:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        self._conn.execute(
+            "UPDATE research_frames SET cohort=COALESCE(json_extract(data, '$.cohort'), ''), "
+            "account_id=COALESCE(json_extract(data, '$.account_id'), '') "
+            "WHERE cohort IS NULL OR account_id IS NULL"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_research_account_cohort "
+            "ON research_frames(account_id, cohort, id)"
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -363,8 +387,9 @@ class Database:
     def insert_decision(self, batch: DecisionBatch) -> int:
         cur = self._exec(
             "INSERT INTO decisions(ts, maker, model, market_view, decisions, candidates,"
-            " input_tokens, output_tokens, cost_usd, refused, error, votes)"
-            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " input_tokens, output_tokens, cost_usd, refused, error, votes,"
+            " vote_costs, vote_failures)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 _iso(batch.ts),
                 batch.maker,
@@ -385,6 +410,8 @@ class Database:
                 )
                 if batch.votes
                 else None,
+                json.dumps(batch.vote_costs),
+                json.dumps(batch.vote_failures),
             ),
         )
         return int(cur.lastrowid)
@@ -406,9 +433,26 @@ class Database:
                 refused=bool(r["refused"]),
                 error=r["error"],
                 votes=json.loads(r["votes"]) if r["votes"] else {},
+                vote_costs=json.loads(r["vote_costs"]) if r["vote_costs"] else {},
+                vote_failures=json.loads(r["vote_failures"]) if r["vote_failures"] else {},
             )
             for r in rows
         ]
+
+    def decision_cost(self, since: datetime, until: datetime) -> float:
+        row = self._one(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS cost FROM decisions WHERE ts >= ? AND ts <= ?",
+            (_iso(since), _iso(until)),
+        )
+        return float(row["cost"]) if row else 0.0
+
+    def signal_counts(self, since: datetime, until: datetime) -> tuple[int, int]:
+        row = self._one(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(evaluated), 0) AS done "
+            "FROM signals WHERE ts >= ? AND ts <= ?",
+            (_iso(since), _iso(until)),
+        )
+        return (int(row["n"]), int(row["done"])) if row else (0, 0)
 
     # ------------------------------------------------------------------ orders
     def _order_from_row(self, r: sqlite3.Row) -> OrderRecord:
@@ -737,6 +781,99 @@ class Database:
         return [{"ts": r["ts"], "equity": r["equity"]} for r in reversed(rows)]
 
     # ------------------------------------------------------------------ signal ledger
+    def add_research_frame(self, payload: dict[str, Any]) -> None:
+        """Local observations only; bounded history, never a broker submission queue."""
+        ts = datetime.fromisoformat(payload["ts"])
+        self._exec(
+            "INSERT INTO research_frames(ts, cohort, account_id, data) VALUES(?, ?, ?, ?)",
+            (
+                _iso(ts),
+                payload.get("cohort") or "",
+                payload.get("account_id") or "",
+                json.dumps(payload, allow_nan=False),
+            ),
+        )
+        self._exec(
+            "DELETE FROM research_frames WHERE id <= (SELECT MAX(id) - 2500 FROM research_frames)"
+        )
+
+    def research_window(
+        self, since: datetime, account_id: str | None = None, limit: int = 1000
+    ) -> dict[str, Any] | None:
+        """Indexed metadata only: status polls must not deserialize market snapshots."""
+        params = [_iso(since), *([account_id] if account_id else [])]
+        query = (
+            "SELECT id, cohort, account_id FROM research_frames WHERE ts >= ? "
+            "AND account_id = ? ORDER BY id DESC LIMIT 1"
+            if account_id
+            else "SELECT id, cohort, account_id FROM research_frames WHERE ts >= ? "
+            "ORDER BY id DESC LIMIT 1"
+        )
+        latest = self._one(
+            query,
+            params,
+        )
+        if latest is None:
+            return None
+        boundary = self._one(
+            "SELECT COALESCE(MAX(id), 0) AS n FROM research_frames WHERE id < ? "
+            "AND (cohort != ? OR account_id != ?)",
+            (latest["id"], latest["cohort"], latest["account_id"]),
+        )
+        window = self._one(
+            "SELECT COUNT(*) AS n, MIN(id) AS first_id, MAX(id) AS last_id FROM "
+            "(SELECT id FROM research_frames WHERE ts >= ? AND id > ? AND id <= ? "
+            "AND cohort = ? AND account_id = ? ORDER BY id DESC LIMIT ?)",
+            (
+                _iso(since),
+                boundary["n"],
+                latest["id"],
+                latest["cohort"],
+                latest["account_id"],
+                max(1, min(limit, 1000)),
+            ),
+        )
+        return {
+            "frame_count": int(window["n"]),
+            "first_id": window["first_id"],
+            "last_id": window["last_id"],
+            "cohort": latest["cohort"] or None,
+        }
+
+    def research_frames_in_window(self, first_id: int, last_id: int) -> list[dict[str, Any]]:
+        rows = self._all(
+            "SELECT data FROM research_frames WHERE id >= ? AND id <= ? ORDER BY id",
+            (first_id, last_id),
+        )
+        return [json.loads(r["data"]) for r in rows]
+
+    def cash_flows(self, since: datetime, until: datetime) -> list[dict[str, Any]]:
+        rows = self._all(
+            "SELECT ts, detail FROM audit WHERE action='cash_flow' AND ts >= ? AND ts <= ? "
+            "ORDER BY ts",
+            (_iso(since), _iso(until)),
+        )
+        return [{"ts": r["ts"], **json.loads(r["detail"] or "{}")} for r in rows]
+
+    def list_research_frames(
+        self, since: datetime | None = None, limit: int = 10000
+    ) -> list[dict[str, Any]]:
+        where, params = ("WHERE ts >= ?", [_iso(since)]) if since else ("", [])
+        rows = self._all(
+            f"SELECT data FROM research_frames {where} ORDER BY id DESC LIMIT ?",  # noqa: S608
+            [*params, max(1, min(limit, 10000))],
+        )
+        return [json.loads(r["data"]) for r in reversed(rows)]
+
+    def research_frame_count(self, since: datetime | None = None) -> int:
+        if since is None:
+            row = self._one("SELECT COUNT(*) AS n FROM research_frames")
+        else:
+            row = self._one(
+                "SELECT COUNT(*) AS n FROM research_frames WHERE ts >= ?", (_iso(since),)
+            )
+        return int(row["n"]) if row else 0
+
     def insert_signal(self, sig: SignalRecord) -> int:
         cur = self._exec(
             "INSERT INTO signals(ts, instrument, setup, evaluated, data) VALUES(?, ?, ?, ?, ?)",

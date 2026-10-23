@@ -323,13 +323,20 @@ def test_background_polling_does_not_keep_an_idle_session_alive(monkeypatch):
 
 
 def test_dashboard_marks_its_status_poll_as_background():
-    """SEC-5 (client side): the automatic status refresh sends X-Background, and only it."""
+    """SEC-5 (client side): automatic dashboard/replay polls do not extend idle sessions."""
     from trader.security.auth import BACKGROUND_HEADER
 
     app_js = (Path(__file__).parent.parent / "trader/web/static/app.js").read_text("utf-8")
     assert f"headers['{BACKGROUND_HEADER}'] = '1'" in app_js
-    assert app_js.count("{ background: true }") == 1
     assert "api('GET', '/api/status', undefined, { background: true })" in app_js
+    assert "loadPerformance({ background: true })" in app_js
+    assert (
+        "`/api/performance?days=${encodeURIComponent(days)}`, undefined, { background }" in app_js
+    )
+    assert (
+        "`/api/research?days=${encodeURIComponent(days)}`, undefined, "
+        "{ background: state.researchRunning }" in app_js
+    )
 
 
 def test_login_flow(env):

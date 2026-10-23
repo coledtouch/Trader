@@ -374,8 +374,11 @@ def test_cli_setup_non_interactive(tmp_path, monkeypatch, capsys):
     text = env_file.read_text(encoding="utf-8")
     assert "TRADER_BROKER=sim" in text and text.count("TRADER_SECRET_KEY=") == 1
     assert env_file.stat().st_ino == inode  # edited in place (bind mounts keep working)
-    assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
-    assert stat.S_IMODE(secret_out.stat().st_mode) == 0o600
+    # Windows reports DOS mode bits, not Unix ownership permissions. These same
+    # functional setup checks still run there; Linux CI verifies the private modes.
+    if os.name != "nt":
+        assert stat.S_IMODE(env_file.stat().st_mode) == 0o600
+        assert stat.S_IMODE(secret_out.stat().st_mode) == 0o600
     totp_secret = secret_out.read_text(encoding="utf-8").strip()
     assert key not in capsys.readouterr().out  # the key itself is never printed
 
@@ -486,7 +489,8 @@ def test_cli_reset_2fa_writes_new_secret(tmp_path, monkeypatch):
     assert cli.main(["reset-2fa", "--env-file", str(env_file), "--totp-secret-out", str(out)]) == 0
     new_secret = out.read_text(encoding="utf-8").strip()
     assert crypto.decrypt(key, db.get_auth()["totp_secret_enc"]) == new_secret
-    assert oct(os.stat(out).st_mode & 0o777) == "0o600"
+    if os.name != "nt":
+        assert oct(os.stat(out).st_mode & 0o777) == "0o600"
     db.close()
 
 

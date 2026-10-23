@@ -860,6 +860,64 @@ main:focus {
   font-weight: 400;
 }
 
+.performance-card {
+  border-top: 3px solid var(--accent);
+}
+
+.performance-incomplete {
+  font-size: clamp(25px, 5vw, 38px);
+  color: var(--text-2);
+}
+
+.performance-card .tiles {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+@media (min-width: 700px) {
+  .performance-card .tiles {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.performance-warnings {
+  padding: 12px 16px 12px 32px;
+  border-radius: var(--radius-sm);
+  background: var(--warn-soft);
+  color: var(--warn);
+  font-size: 14px;
+}
+
+.performance-warnings li + li {
+  margin-top: 6px;
+}
+
+.setup-choices {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.setup-choices legend {
+  margin-bottom: 8px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.setup-choice {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: var(--tap);
+  cursor: pointer;
+}
+
+.setup-choice input {
+  width: 20px;
+  height: 20px;
+  margin: 0;
+  accent-color: var(--accent);
+}
+
 /* pending approvals */
 .pending {
   display: grid;

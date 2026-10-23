@@ -18,26 +18,34 @@ No strategy, human or AI, does that reliably. Top hedge funds are happy with 15-
 *year*. Small accounts that chase a daily dollar target almost always blow up: the
 pressure to "make it back" leads to bigger size, worse entries and skipped stops.
 
-So this app does something different:
+Judge the app by results after all costs, with paper money first:
 
-- It shows the $100 target and your progress, but **nothing in the code ever trades bigger
-  because you are behind**. Size depends only on your account size, the stop distance and
-  fixed caps. After 3 losses in a row it trades *smaller*.
+- New installations default the optional daily target to **$0 (off)**. Existing saved
+  targets are retained and shown as a secondary reference. **Nothing in the code ever
+  trades bigger because you are behind**. Size depends on account size, stop distance
+  and fixed caps. After 3 losses in a row it trades *smaller*.
 - It risks about 2% of the account per trade, stops for the day at a 6% loss, and stops
-  opening new trades once the daily target is hit.
+  opening new trades when a configured positive daily target is hit.
 - It refuses trades whose fees would eat more than a quarter of the expected profit. On a
   small account that blocks most trades. That is the point: at IBKR a small stock round
   trip costs about $0.80 and a $100 crypto round trip about $2 (2%), see
   [docs/STRATEGY.md](docs/STRATEGY.md#fee-math-for-a-small-account).
-- It logs every signal it sees, taken or not, and scores them later, so after a month you
-  know whether a setup has an edge instead of guessing from one good day.
+- Before paying for entry analysis, it checks whether the scanner's proposed trade can
+  pass size, cash, fees, exposure, working-order, session, setup and quote checks. Blocked
+  candidates still reach the signal ledger. Paid exit reviews remain available for bot
+  positions. Delayed stock data blocks entries in **PAPER and LIVE**, even if it was
+  received just now; existing exits remain managed.
+- The dashboard leads with account-scoped P&L after recorded AI costs and configured
+  hosting/data estimates. Signal excursions, actual filled trades and offline paired
+  replays are separate evidence. No signal count certifies profitability.
 
-Running costs matter as much as trading results. A droplet ($12/month), market data
-($4.50-14.50/month) and the AI APIs (Claude $1-90/month depending on model and settings;
-asking Grok as well adds about $0.02-0.03 per decision: roughly 1.5x the AI bill with Opus,
-2x with Sonnet and about 20x with Haiku, see the cost table)
-can add up to 5-20% of a $650 account **per month** before the first winning trade. See
-the cost table in [docs/SETUP_IBKR.md](docs/SETUP_IBKR.md#monthly-costs).
+Running costs matter as much as trading results. Enter monthly costs in **Settings >
+Operating costs**: the current hosting dashboard estimate is **$24/month**; market-data
+cost is still unknown while the real-time subscription request awaits approval. Blank
+costs mean unknown, not free; enter `0` only for an explicitly free service. AI costs are
+recorded token-price estimates and should be reconciled with provider invoices. Hosting
+and data estimates accrue across calendar time, including weekends. All-in P&L stays
+unknown until both monthly costs are configured.
 
 Realistic expectation: the first months are about learning whether any setup works at
 all, on paper, with fake money. Treat any live money as tuition you can afford to lose.
@@ -52,7 +60,7 @@ Two posts on Reddit's r/ai_trading shaped the design.
 |---|---|
 | Paper fills on thin small caps were unrealistically kind | The simulator charges the spread plus slippage and market impact that grow as liquidity shrinks; the scanner skips names under 500k shares/day; entries are refused when the bid/ask spread is wider than 0.3% |
 | The daily quota pushed the model to size up and chase | Hard risk caps in code; the AI can only scale size *down*; no code path looks at "how far behind" the day is |
-| One great day "proved" the strategy | Full journal, equity curve, per-trade R multiples, a backtester with fees and slippage, and a 30-signal minimum before judging a setup |
+| One great day "proved" the strategy | Full journal, filled-trade results after commissions, observed drawdown, and shared-engine replay with costs; 30 signals are only a first inspection |
 | A bot lost its broker connection and almost held $50K of same-day SPX options over a weekend | Every stock entry carries a stop-loss order that lives at IBKR (it works even if this server is off); disconnect alerts; on reconnect the bot re-checks and re-protects positions; stocks are closed 10 minutes before the bell |
 | LLM summaries "fluffed" the results | Every decision is stored with its inputs, output, tokens and cost; the dashboard shows fills reported by IBKR, not what the model claims |
 
@@ -107,8 +115,9 @@ Two posts on Reddit's r/ai_trading shaped the design.
   decision: ~1.5x with Opus, ~2x with Sonnet, ~20x with Haiku); switch to one model or to
   rules-only in Settings (leaving consensus needs a 2FA code). A missing API key never
   passes silently: the dashboard says which model is actually deciding.
-- Dashboard: mode badge (SIM / PAPER / LIVE-SHADOW / LIVE-ARMED), equity, today's P&L vs.
-  target and loss limit, open positions with stop and target, connection and market status,
+- Dashboard: all-in performance and cost completeness, mode badge (SIM / PAPER /
+  LIVE-SHADOW / LIVE-ARMED), equity, today's P&L and loss limit, open positions with stop
+  and target, connection and market status, per-symbol quote ages and delayed-feed flags,
   which AI is deciding, market-data warnings (such as IBKR's "competing live session"),
   AI spend today.
 - Big buttons: start / stop the bot, run one cycle now (works even while the bot is
@@ -117,9 +126,9 @@ Two posts on Reddit's r/ai_trading shaped the design.
 - Activity: every AI decision with its reasoning and cost (with consensus, how each model
   voted), orders with block reasons, closed trades with P&L and R multiple, equity chart,
   daily stats.
-- Signals: per-setup scorecard from the signal ledger, with a "too few to judge" badge
-  under 30 evaluated signals.
-- Settings: universe, risk limits, exit rules, decision mode, AI model and budget,
+- Signals: gross price-excursion diagnostics, separate filled-trade setup results with
+  exploratory intervals, and rules / Claude / Grok / consensus replay comparisons.
+- Settings: universe, per-setup switches, operating costs, risk limits, exit rules, decision mode, AI model and budget,
   autopilot or approve-every-order mode, live-trading arm/disarm, audit log.
 - Bad-tick protection: crossed quotes and bids far from the last trade are ignored for
   valuing positions, and the bot's own stops and the daily loss limit fire only when the
@@ -128,7 +137,8 @@ Two posts on Reddit's r/ai_trading shaped the design.
   starts a fresh journal and never manages positions it did not open on that account.
 - Phone alerts through [ntfy](https://ntfy.sh) (optional): buys, closed trades with P&L,
   disconnects, halts, orders waiting for approval. `python -m trader notify-test` sends a
-  test alert.
+  test alert. Failed deliveries can retry immediately; concurrent duplicate titles are
+  suppressed, and the 60-second dedupe window starts only after successful acceptance.
 - Security: Cloudflare Access + the app's own password and 2FA code, step-up 2FA for
   risky actions, audit log of every owner action. See [docs/SECURITY.md](docs/SECURITY.md).
 
@@ -143,7 +153,7 @@ Arm. Climb one step at a time:
 | Step | What runs | Money | Move on when |
 |---|---|---|---|
 | 1. **Sim** | Built-in simulator with synthetic prices | Fake | You know the dashboard, the kill switch, approvals and the logs (a few days) |
-| 2. **Paper** | IBKR paper account, real prices (with a data subscription) | Fake | 4+ weeks and 30+ evaluated signals for the setups you rely on, and the numbers still look positive after fees ([how to judge](docs/STRATEGY.md#judging-a-setup)) |
+| 2. **Paper** | IBKR paper account, verified real-time prices | Fake | Frozen rules tested on new periods, realistic fills and exits, and positive results after costs across different sessions; sample counts alone are insufficient ([how to judge](docs/STRATEGY.md#judging-a-setup)) |
 | 3. **Shadow** | Your live account, but every new entry is recorded as BLOCKED | None at risk | 1-2 weeks of sensible decisions on live data, PDT counter and balances read correctly |
 | 4. **Armed live** | Live orders, small limits, autopilot off at first (you approve each order) | Real | Only increase limits after weeks of results that match paper |
 
@@ -199,6 +209,20 @@ This takes about 10 minutes and needs no IBKR account. Commands are for PowerShe
 Other commands: `python -m trader status` (settings check, never prints secrets),
 `notify-test` (sends a test phone alert), `reset-password`, `reset-2fa`, `logout-all`, `disarm` (the last four also disarm live
 trading).
+
+For offline research using recorded observations, run:
+
+```powershell
+python -m trader research --database data/trader.db --save-report
+python -m trader research --csv F=history.csv --settings frozen.json
+```
+
+The first compares independent rules, Claude, Grok and consensus portfolios using only
+available cached votes. The second runs rules on real historical OHLCV data through the
+same trading engine; CSVs have no AI opinions. Neither command connects to a broker or
+calls an AI API. Sparse observations, original-account-conditioned opinions, assumed CSV
+spreads and missing model costs limit these comparisons; see
+[the replay guide](docs/STRATEGY.md#offline-paired-replay).
 
 ## Documentation
 

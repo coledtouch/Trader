@@ -14,20 +14,22 @@ Every **5 minutes** (`cycle_seconds`) while something is tradable:
       |             (+ IBKR's top % gainers if dynamic_universe is on; needs live data)
       |             + any position the bot holds, so it can be managed
       v
- 2. Prefilter       skip stocks where 1 share costs more than the max position or the cash;
-      |             skip leveraged/inverse ETFs (TQQQ, SQQQ, ...); logged once per day
+ 2. Universe filter skip leveraged/inverse ETFs (TQQQ, SQQQ, ...) unless enabled
       v
  3. Market data     quote + 5-minute bars per symbol (errors skip that symbol)
       v
  4. Scanner         5 setups -> candidates with a score 0-1, a stop and a target
       v
- 5. Signal ledger   EVERY candidate is written down, traded or not
+ 5. Entry eligibility + ledger
+      |             size each scanner proposal at the largest permitted quantity;
+      |             check cash, working orders, exposure, fees, session, setups and quotes;
+      |             write EVERY emitted candidate and skip reason, including unaffordable ones
       v
  6. Decision maker  consensus (Claude AND Grok must both BUY), or one model, or the rules;
-      |             AI only if a candidate scores >= 0.5 or a position is open and today's
-      |             AI spend is under budget; otherwise the plain rules
+      |             AI only if an eligible candidate scores >= 0.5 or a bot-owned position
+      |             needs review, and today's AI spend is under budget; otherwise plain rules
       v
- 7. Risk manager    sizes the trade and runs ~25 checks; any failure = no order
+ 7. Risk manager    size and check again on fresh state before sending; any failure = no order
       v
  8. Mode gate       shadow mode -> entries BLOCKED (exits still go out) | autopilot off -> waits for approval
       v
@@ -60,19 +62,38 @@ and the dashboard says so ([DEPLOY.md](DEPLOY.md#no-market-data-error-10197)).
 
 - **Stocks** (`stock_universe`): liquid, mostly lower-priced names, because with about
   $600 and a $250 order cap a share must cost well under $250 (whole shares only, unless
-  `allow_fractional_stocks`). Expensive names such as SPY (~$764) are skipped
-  automatically.
+  `allow_fractional_stocks`). An unaffordable scanner proposal is logged with its sizing
+  failure and excluded from paid entry analysis.
 - **Crypto** (`crypto_universe`, `trade_crypto`): BTC and ETH, traded in fractions, 24/7.
   Off by default; see the fee section before turning it on.
 - New stock entries only between **09:45 and 15:30 ET** (`stock_entry_start`,
   `stock_entry_cutoff`): the open is chaotic and thin names fade later in the day. On
   half days the window ends 20 minutes before the 13:00 close.
 
+**Delayed data is diagnostic only for stock entries.** A delayed global feed or a delayed
+per-symbol quote blocks stock entries in PAPER and LIVE (also SIM if a supplied quote is
+flagged delayed). It also removes that candidate from paid entry analysis. Existing
+positions keep their exit management; the bot may still pay for an exit review.
+
+The quote-age table reports elapsed time since the broker/transport timestamp. It is
+not a measurement of how far an exchange-delayed price is behind the market: a quote
+received one second ago can still be a delayed quote. Fresh age and a usable two-sided
+quote are necessary checks; the separate delayed flag must also be clear. Keep market
+data type `3` for connection and signal diagnostics while subscription approval is
+pending. Change to type `1` only after approval and paper-account sharing, then verify
+actual delivered quotes are not flagged delayed.
+
 ## 4. The scanner setups
 
 All setups are **long only**. Each candidate gets a stop below the price, based on the
 ATR (average true range: how far the price typically moves per 5-minute bar), and a
 target at **2x the risk** above the price (or `min_reward_risk` if that is higher).
+
+`enabled_setups` controls which setups may open positions. All five below are enabled
+by default. Disabling a setup keeps its emitted signals in the diagnostic ledger but
+prevents paid entry analysis and new orders for it. Re-enabling one requires fresh 2FA.
+The final send and approval checks use current settings, so disabling a setup also
+invalidates a pending entry approval; existing positions retain their exits.
 
 | Setup | When it fires | Stop | Score |
 |---|---|---|---|
@@ -122,8 +143,9 @@ record), and there is no evidence yet that two together do better. Treat consens
 risk filter, not an edge, and let the signal ledger decide: every skipped signal is
 scored, so after a month you can compare what the models bought with what they let pass.
 
-The AI is only asked when a candidate scores at least `llm_min_candidate_score` (0.5) or a
-position is open, and only while today's AI spend (both models together) is below
+The AI is only asked when an eligible candidate scores at least
+`llm_min_candidate_score` (0.5) or a position the bot opened needs review, and only while
+today's AI spend (both models together) is below
 `llm_daily_budget_usd`. Otherwise the **rules** decide: buy the highest-scoring candidate
 at or above the threshold (limit order at the candidate price, with its stop and target),
 and close a position whose setup broke (VWAP setups: price back below VWAP; trend
@@ -142,8 +164,8 @@ quantity        = the SMALLEST of:
                     risk in dollars / (entry - stop)
                     max_position_pct of equity / entry
                     max_order_notional_usd / entry
-                    available cash / entry          (no borrowing; commission included)
-                    remaining exposure room / entry
+                    uncommitted cash / entry        (working buys and commissions reserved)
+                    remaining exposure room / entry (positions and working buys included)
                   rounded DOWN to whole shares (crypto: small fractions)
 ```
 
@@ -160,7 +182,7 @@ is usually what binds, so most trades risk well under 2%.
 
 | Setting | Default | Hard cap | What it does |
 |---|---|---|---|
-| `daily_profit_target_usd` | $100 | | Shown on the dashboard. With `stop_trading_at_target` on, reaching it stops new entries for the day (positions keep their stops). It never increases risk |
+| `daily_profit_target_usd` | $0 (off) | | Optional secondary reference. Existing saved values are retained. With a positive target and `stop_trading_at_target` on, reaching it stops new entries (positions keep their stops). It never increases risk |
 | `max_daily_loss_pct` | 6% | 25% | Equity down this much from the day's start: halt (and close everything if `flatten_on_halt`). Resume needs a 2FA code |
 | `max_risk_per_trade_pct` | 2% | 10% | Loss if the stop is hit, as % of start-of-day equity |
 | `max_position_pct` | 50% | 100% | Largest single position, % of equity |
@@ -182,24 +204,26 @@ Loosening any of these in the app needs a fresh 2FA code; tightening does not.
 
 ### Every check before an entry (any failure blocks it)
 
-- **Account:** buy side only; that asset class is enabled; trading not halted today; fewer
+- **Account:** buy side only; that asset class and scanner setup are enabled; trading not halted today; fewer
   than `max_trades_per_day` entries; not already holding the symbol and no entry order
   already working (the bot **never adds to a position**); open positions plus entries below
   `max_open_positions`; not a leveraged ETF; IBKR's day-trade counter (when reported)
   above 0 for stocks. IBKR updates that counter only every few minutes, so the bot first
   subtracts its own same-day round trips that closed in the last 5 minutes.
-- **Market data:** a quote exists and is fresh (twice the monitor interval, plus 15 minutes
-  for delayed data) and plausible (not crossed, bid within 5% / 8% of the last trade); the
+- **Market data:** a quote exists, is finite, is fresh (twice the monitor interval for
+  non-delayed data), is not timestamped in the future, and is plausible (not crossed,
+  bid within 5% / 8% of the last trade); the
   symbol is not halted and was not halted in the last 15 minutes;
-  stocks need a two-sided quote with a spread of at most 0.3%; live account plus delayed
-  data blocks stock entries; stocks only while the market is open and inside the entry
+  stocks need a two-sided quote with a spread of at most 0.3%; delayed data blocks stock
+  entries in every mode regardless of receipt age; stocks only while the market is open and inside the entry
   window.
 - **Prices:** a valid entry price; a stop below it; a target above it; reward:risk at
   least `min_reward_risk`; price at least `min_price`; a limit within the collar.
 - **Size and money:** quantity above 0 after rounding; order at most
   `max_order_notional_usd`; dollar risk at the stop within `max_risk_per_trade_pct`;
   position within `max_position_pct`; total exposure including working orders within
-  `max_total_exposure_pct`; enough available cash including the commission; round-trip
+  `max_total_exposure_pct`; enough available cash including commissions for working buys
+  and the proposed purchase; unknown-priced working buys block new entries; round-trip
   fees at most `max_fee_to_reward_pct` of the expected reward.
 
 Exits are always allowed when they reduce a long position, and never sell more than is
@@ -237,7 +261,7 @@ Exit rules (`exits` settings; they only touch positions the bot opened):
 | Setup broke | rules / Claude | e.g. a VWAP setup back below VWAP: close |
 | Flatten before close | 15:50 ET (12:50 on half days) | Stock positions are closed 10 minutes before the bell (`flatten_stocks_before_close`) |
 | Daily loss limit | -6% | Halt and close everything (`flatten_on_halt`) once two consecutive checks agree; resume needs 2FA |
-| Daily target | +$100 | No new entries today; open positions keep their stops |
+| Daily target | off ($0) | If configured positive and reached, no new entries today; open positions keep their stops |
 | KILL button | | Cancel every order and close every position |
 
 Stops only ever move **up**. P&L, stops and R multiples use the bid, because that is what
@@ -266,37 +290,106 @@ every 30 minutes), with:
   - `mfe_r` / `mae_r`: the best and worst point reached;
   - `first_hit`: `target`, `stop` or `neither` (if one bar touched both, the stop counts).
 
-The outcomes are **before fees and slippage**. The **Signals** tab totals them per setup
-and shows "too few to judge" until a setup has 30 evaluated signals.
+The outcomes are **gross price excursions before fees and slippage**, not filled-trade
+returns. They do not reproduce the bot's breakeven/time/trailing exits, actual entry
+fills or the cash constraints of a portfolio. The **Signals** tab labels them as
+diagnostics; 30 evaluated signals are a first inspection threshold, not evidence of an
+edge. Full eligibility reasons are also journaled with each decision cycle, including
+cycles within the signal ledger's 30-minute deduplication window.
 
 ## Judging a setup
 
-Wait for **at least 30 evaluated signals and at least 4 weeks** of paper trading for a
-setup. One great day, or one great week, proves nothing. Then:
+Freeze rules and costs before testing, keep a separate period for evaluation, and cover
+different sessions and market conditions. Neither 30 nor 100 signals establishes an
+edge: signals from the same symbol or day can be highly correlated, and trying many
+variants makes a lucky winner easy to find.
 
-1. **Work out your fee cost in R.** Round-trip commission divided by the dollar risk of a
-   typical trade. Example: SOFI, 16 shares, $0.81 of fees and $2.40 of risk = **0.34R**. A
-   setup must beat that just to break even.
-2. **Average R at close** (`avg R at close` in the Signals tab) must be clearly above your
-   fee cost in R. Below it: no edge at this account size.
-3. **Target-first rate.** With 2R targets, a trade pays 2R when the target comes first and
-   loses 1R when the stop does. Break-even win rate = (1 + fee cost in R) / 3: 33% before
-   fees, about 45% with 0.34R of fees.
-4. **Noise.** With 30 signals, an average within about ±0.2R of zero is not evidence of
-   anything. Treat 30 as a first look and 100 as a reasonable answer.
-5. **Taken vs. skipped.** If the signals the AI chose did no better than the ones it
-   skipped, the AI is adding cost, not edge: switch to Haiku or rules-only
-   ([cost advice](SETUP_IBKR.md#ai-api-cost-estimate)). In consensus mode, also compare the
-   `consensus: ... said HOLD` signals with the taken ones: if the vetoed signals did as well
-   as the agreed ones, the second model is costing money without filtering anything.
-6. **Excursions.** Winners that first dropped close to -1R (`mae_r`) mean the stop is very
-   tight; a high `mfe_r` with few target hits means the target is too far for that setup.
+1. Inspect gross excursions to understand setup behavior and data quality. Do not use
+   average R at close or target-first rate as the return of the bot's actual exit rules.
+2. Use filled round trips for setup net expectancy and P&L after commissions. The
+   separate setup report groups trades by New York exit day and, after five observed
+   days, provides an exploratory bootstrap interval by resampling whole days. It uses
+   500 resamples; it is not a certification, a guarantee, or a correction for choosing
+   the best setup after inspecting many alternatives.
+3. Compare rules, single-model and consensus portfolios on the same observations and
+   risk settings, including the model costs each arm actually incurred. Missing votes
+   or costs keep the comparison incomplete. Vetoed signal excursions alone cannot show
+   whether consensus improves executable portfolio returns.
+4. Review all-in P&L and drawdown as well as trading P&L. Confirm paper results with
+   realistic fills, commissions, data quality and exits on new periods before considering
+   any live use. Synthetic backtests test mechanics only.
 
-What to do with the answer: keep a setup that is positive after fees across different
-weeks; ignore the rest. There is no per-setup on/off switch yet; raising
-`llm_min_candidate_score` filters out the lowest-scoring setups (`rsi_reversion` scores
-0.35-0.5). Change one thing at a time and give it another few weeks: tuning after every bad
-week fits the noise, not the market.
+Use **Settings > Setup selection** to disable a weak setup. Change one thing at a time, retain a
+record of the change, and evaluate it on subsequent observations rather than tuning
+repeatedly to the same history. Re-enabling a setup requires 2FA.
+
+## All-in performance
+
+The dashboard and `GET /api/performance?days=30` report the current journal account and
+account epoch, excluding previous simulator runs and account changes. Trading P&L uses
+recorded daily equity changes, including open P&L and broker commissions, with the
+engine's recorded cash-flow adjustments. Filled-trade expectancy also already includes
+commissions; **do not subtract them twice**.
+
+All-in P&L subtracts recorded AI token-price estimates plus hosting and market-data
+estimates. Set `operating_costs.hosting_monthly_usd` and `data_monthly_usd` in Settings.
+Both default to unknown (`null`); explicit zero means free. The current hosting
+dashboard estimate is $24/month; data pricing is unknown pending subscription approval.
+Until both values are supplied, all-in P&L remains unknown and only the result after
+known costs is shown. Reconcile AI estimates with provider invoices.
+
+Monthly estimates accrue over the recorded coverage period by elapsed calendar time
+and the days in each month, including weekends. The current monthly settings apply to
+that period; this is not a historical billing ledger. Reports warn when the first day
+is partial. Drawdown is measured from daily equity observations; unobserved intraday
+losses can be larger. Filled-trade setup statistics exclude external operating costs,
+which are reported separately. No annualized return is inferred from a short sample.
+
+## Offline paired replay
+
+Use **Signals > Captured-decision comparison** or the authenticated API:
+
+```text
+POST /api/research/run  {"days": 30}
+GET /api/research?days=30
+```
+
+POST uses the usual session, Origin and CSRF protection, returns `202` while running,
+and refuses an overlapping run. The web report uses up to the latest 1,000 captured
+frames from the latest uninterrupted account/settings cohort in the selected period.
+It does not combine regimes separated by an account or settings change.
+
+Command-line equivalents and a real-history rules test:
+
+```bash
+python -m trader research --database data/trader.db --save-report
+python -m trader research --csv F=history.csv --settings frozen.json
+```
+
+The CSV uses timezone-aware `ts,open,high,low,close,volume` rows with bar-open timestamps;
+`--bar-size` must match the data. `frozen.json` is a complete saved `BotSettings` object.
+The CSV route uses the same production `Engine`, scanner, sizing, guards and exits;
+it is rules-only because historical prices contain no recorded AI opinions. CSV quotes
+infer a spread (`--spread-bps`, default 10) and execution slippage (`--slippage-bps`,
+default 5), so results depend on those assumptions rather than actual historical quotes.
+
+Captured-data replay runs independent rules, Claude, Grok and consensus portfolios with
+the production engine and consensus logic. It uses only recorded model votes and
+recorded per-model costs: **no broker connection, AI API calls or fabricated historical
+votes**. Unknown model cost and incomplete comparisons remain `null`, never zero.
+Replay all-in results subtract model costs; hosting/data are portfolio-wide estimates
+in the primary performance report, not separate incremental charges to every arm.
+
+Capture retains up to 2,500 compact scanner snapshots with the observed quotes,
+original scanner candidates, indicator features and model votes/costs. Historical bars
+are not repeated in each snapshot; these captures cannot be historically rescanned.
+Use the CSV route when you need to recompute the scanner on historical bars.
+These are sparse decision-cycle observations, not a complete 15-second monitor trace
+or an order book. Crossings, stops, halts and losses between observations may be missed.
+Cached AI opinions saw the original account and positions, not the diverging replay
+portfolios. Reports label that conditioning, missing votes, unknown costs and open
+positions; no forced final liquidation invents unobserved exit fills. Use the comparison
+as limited research evidence, then validate changes prospectively with frozen settings.
 
 ## Why there is no "make it back" mode
 
