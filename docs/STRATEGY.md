@@ -160,14 +160,14 @@ is usually what binds, so most trades risk well under 2%.
 
 | Setting | Default | Hard cap | What it does |
 |---|---|---|---|
-| `daily_profit_target_usd` | $100 | | Shown on the dashboard. With `stop_trading_at_target` on, reaching it stops new entries for the day (positions keep their stops). It never increases risk |
+| `daily_profit_target_pct` | 1.5% of start-of-day equity | | Shown on the dashboard. With `stop_trading_at_target` on, reaching it stops new entries for the day (positions keep their stops). It never increases risk. A setup saved before this percent keeps its old `daily_profit_target_usd` instead |
 | `max_daily_loss_pct` | 6% | 25% | Equity down this much from the day's start: halt (and close everything if `flatten_on_halt`). Resume needs a 2FA code |
 | `max_risk_per_trade_pct` | 2% | 10% | Loss if the stop is hit, as % of start-of-day equity |
 | `max_position_pct` | 50% | 100% | Largest single position, % of equity |
 | `max_total_exposure_pct` | 100% | 100% | All positions plus working buy orders: never more than the equity (no leverage) |
 | `max_open_positions` | 2 | 10 | Positions plus working entry orders |
 | `max_trades_per_day` | 10 | 50 | New entries per trading day |
-| `max_order_notional_usd` | $250 | | Largest single order |
+| `max_order_notional_usd` | $250 | $5,000 | Largest single order |
 | `min_price` | $1 | | No penny stocks |
 | `price_collar_pct` | 1% | 5% | A limit price must be within this % of the last price |
 | `min_reward_risk` | 1.5 | | (target - entry) / (entry - stop); scanner targets use 2.0 |
@@ -212,9 +212,10 @@ held (no accidental short).
   quote, account, positions and working orders **at the moment it is sent** (an entry that
   filled, an order you approved, a halt or the end of the entry window in the meantime all
   count); a BUY decided on data more than **3 minutes** old is dropped. Unfilled entries
-  are cancelled **10 minutes** after they were sent. With autopilot off, the order waits
-  for your approval; approving re-runs every risk check with fresh data, and unapproved
-  orders expire after 10 minutes.
+  are cancelled **10 minutes** after they were sent. Autopilot is off by default, so the
+  order waits for your approval; approving re-runs every risk check with fresh data, and
+  unapproved orders expire after 10 minutes. Rejecting while that check is still loading
+  prices cancels the order; it is not sent.
 - **AI CLOSE:** only for positions the bot opened. A position you hold yourself (or one
   from before an account change) is never sold by an AI decision and does not trigger AI
   calls on its own.

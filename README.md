@@ -138,7 +138,14 @@ Real-money orders need **three** things at once: `TRADER_ALLOW_LIVE=true` on the
 live (not paper) IBKR account, and you pressing **Arm** in the app with a fresh 2FA code.
 Anything less and the bot cannot send a real order. Starting the app with
 `TRADER_ALLOW_LIVE=false` clears the arm, so turning the gate back on always needs a fresh
-Arm. Climb one step at a time:
+Arm.
+
+`TRADER_ALLOW_LIVE=true` also requires both `TRADER_CF_ACCESS_TEAM_DOMAIN` and
+`TRADER_CF_ACCESS_AUD`. If either is empty, the app refuses to start and says so, so a
+live account is never reachable with the in-app Cloudflare Access check turned off.
+Simulator and paper mode (`TRADER_ALLOW_LIVE=false`) keep working with those two values
+empty. Autopilot is **off** by default: every new order waits for your approval until you
+turn it on in Settings. Climb one step at a time:
 
 | Step | What runs | Money | Move on when |
 |---|---|---|---|

@@ -621,6 +621,11 @@ def test_hard_caps_and_validation(env):
     response = put_settings(env, headers, settings, totp=env.code())
     assert response.status_code == 422
     assert response.json() == {"detail": "risk.max_daily_loss_pct must be <= 25"}
+    settings.risk.max_daily_loss_pct = 6.0
+    settings.risk.max_order_notional_usd = 5001
+    too_big = put_settings(env, headers, settings, totp=env.code())
+    assert too_big.status_code == 422
+    assert too_big.json() == {"detail": "risk.max_order_notional_usd must be <= 5000"}
 
     bad_window = BotSettings(stock_entry_start="15:00", stock_entry_cutoff="10:00")
     assert put_settings(env, headers, bad_window).status_code == 422
@@ -667,11 +672,13 @@ def test_loosened_fields_rules():
     above = capped.model_copy(deep=True)
     above.risk.max_total_exposure_pct = 150.0
     assert loosened_fields(capped, above, False) == []
-    # Autopilot only counts on a live account.
+    # Autopilot only counts on a live account. The product default is off.
+    assert base.autopilot is False
     manual = base.model_copy(update={"autopilot": False})
-    assert loosened_fields(manual, base, live=False) == []
-    assert loosened_fields(manual, base, live=True) == ["autopilot"]
-    assert loosened_fields(base, manual, live=True) == []
+    auto = base.model_copy(update={"autopilot": True})
+    assert loosened_fields(manual, auto, live=False) == []
+    assert loosened_fields(manual, auto, live=True) == ["autopilot"]
+    assert loosened_fields(auto, manual, live=True) == []
     # Holding stocks overnight loosens the day-trade rule; turning it back on does not.
     overnight = base.model_copy(update={"flatten_stocks_before_close": False})
     assert loosened_fields(base, overnight, live=False) == ["flatten_stocks_before_close"]
@@ -730,13 +737,18 @@ def test_start_stop_kill_cycle(env):
     assert all(row["actor"] == "owner" for row in env.db.list_audit(10))
 
 
-def test_engine_failure_is_reported(env):
+def test_engine_failure_is_reported(env, caplog):
     headers = login(env)
     env.engine.fail = "kill"
-    response = env.client.post("/api/bot/kill", headers=headers)
+    with caplog.at_level(logging.ERROR):
+        response = env.client.post("/api/bot/kill", headers=headers)
     assert response.status_code == 503
-    assert "kill exploded" in response.json()["detail"]
-    assert env.db.list_audit(1)[0]["action"] == "bot_kill_failed"
+    assert response.json() == {"detail": "bot_kill failed"}
+    assert "exploded" not in response.text
+    assert "kill exploded" in caplog.text
+    audit = env.db.list_audit(1)[0]
+    assert audit["action"] == "bot_kill_failed"
+    assert "kill exploded" in audit["detail"]["error"]
 
 
 def test_resume_requires_2fa(env):
@@ -758,16 +770,30 @@ def test_arm_live_not_allowed(env):
     assert "arm" not in env.engine.calls
 
 
-def test_arm_live_needs_live_account_and_2fa():
-    ctx = build(mode=Mode.PAPER, allow_live=True)
-    with TestClient(ctx.app) as client:
+def test_arm_live_needs_live_account_and_2fa(monkeypatch):
+    # Live mode cannot start without Cloudflare Access, so this client presents a valid token.
+    key = new_key()
+    monkeypatch.setattr(cf_access, "fetch_jwks", FakeJwks(jwk(key, "k1")))
+    access = {"Cf-Access-Jwt-Assertion": make_token(key)}
+    ctx = build(
+        mode=Mode.PAPER,
+        allow_live=True,
+        cf_access_team_domain=TEAM,
+        cf_access_aud=AUD,
+    )
+    with TestClient(ctx.app, headers=access) as client:
         ctx.client = client
         headers = login(ctx)
         paper = client.post("/api/live/arm", headers=headers, json={"totp": ctx.code()})
         assert paper.status_code == 403 and "arm" not in ctx.engine.calls
 
-    ctx = build(mode=Mode.LIVE, allow_live=True)
-    with TestClient(ctx.app) as client:
+    ctx = build(
+        mode=Mode.LIVE,
+        allow_live=True,
+        cf_access_team_domain=TEAM,
+        cf_access_aud=AUD,
+    )
+    with TestClient(ctx.app, headers=access) as client:
         ctx.client = client
         headers = login(ctx)
         missing = client.post("/api/live/arm", headers=headers, json={})

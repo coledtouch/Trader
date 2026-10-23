@@ -297,10 +297,10 @@ def test_client_ip(db):
     assert plain.client_ip(make_request(headers)) == "10.0.0.5"
     assert proxied.client_ip(make_request(headers)) == "203.0.113.7"
     xff_only = {"X-Forwarded-For": "198.51.100.1, 10.0.0.2"}
-    assert proxied.client_ip(make_request(xff_only)) == "198.51.100.1"
-    assert proxied.client_ip(make_request({"CF-Connecting-IP": "junk", **xff_only})) == (
-        "198.51.100.1"
-    )
+    # X-Forwarded-For is spoofable, so a missing or invalid Cloudflare header falls back
+    # to the socket peer rather than the forwarded address.
+    assert proxied.client_ip(make_request(xff_only)) == "10.0.0.5"
+    assert proxied.client_ip(make_request({"CF-Connecting-IP": "junk", **xff_only})) == ("10.0.0.5")
     assert proxied.client_ip(make_request({})) == "10.0.0.5"
     assert plain.client_ip(make_request({}, client=None)) == "unknown"
 

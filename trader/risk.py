@@ -468,7 +468,11 @@ class RiskManager:
                 f"${start:.2f} (limit {lim.max_daily_loss_pct:g}%)"
             )
         pnl = equity - start
-        target = lim.daily_profit_target_usd
+        target = lim.profit_target_usd(start)
         if lim.stop_trading_at_target and target > 0 and pnl >= target:
-            return f"{HALT_TARGET}: +${pnl:.2f} today (target ${target:.2f})"
+            if lim.daily_profit_target_pct is not None:
+                target_text = f"${target:.2f} ({lim.daily_profit_target_pct:g}% of start equity)"
+            else:
+                target_text = f"${target:.2f}"
+            return f"{HALT_TARGET}: +${pnl:.2f} today (target {target_text})"
         return None

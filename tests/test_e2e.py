@@ -150,7 +150,9 @@ def open_stack(
     db = Database(config.db_path)
     # Stocks only, and no time stop or breakeven: the trade runs to its stop or target.
     settings = settings or BotSettings(
-        trade_crypto=False, exits=ExitRules(time_stop_minutes=0, breakeven_at_r=0)
+        trade_crypto=False,
+        autopilot=True,  # the product default is off; this stack sends orders on its own
+        exits=ExitRules(time_stop_minutes=0, breakeven_at_r=0),
     )
     db.save_settings(settings)
     secret = new_totp_secret()

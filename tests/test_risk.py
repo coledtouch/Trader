@@ -238,6 +238,24 @@ def test_loss_streak_halving_cannot_be_switched_off() -> None:
     assert qty == 5 and any("halved" in n for n in notes)
 
 
+def test_max_order_notional_is_hard_capped() -> None:
+    """A single order cannot be raised past $5,000, whatever the settings say."""
+    huge = RiskLimits(
+        max_order_notional_usd=50_000, max_position_pct=100, max_risk_per_trade_pct=10
+    )
+    assert RiskManager(huge).effective_limits().max_order_notional_usd == 5_000
+    assert HARD_CAPS["max_order_notional_usd"] == 5_000
+    qty, notes = size(
+        entry_px=100.0,
+        stop=99.0,
+        acct=account(equity=100_000, cash=100_000),
+        stats=day(start_equity=100_000),
+        limits=huge,
+    )
+    assert qty == 50  # $5,000 cap / $100, not the $50,000 the settings asked for
+    assert "max order" in notes[-1]
+
+
 def test_sizing_hard_cap_on_risk_per_trade() -> None:
     limits = RiskLimits(
         max_risk_per_trade_pct=50, max_order_notional_usd=10_000, max_position_pct=100
@@ -547,6 +565,27 @@ def test_soft_halt_at_target() -> None:
     reason = rm.halt_reason(account=account(equity=600), day=day())
     assert reason is not None and reason.startswith(HALT_TARGET) and is_soft_halt(reason)
     assert rm.halt_reason(account=account(equity=599), day=day()) is None
+
+
+def test_profit_target_defaults_to_a_percent_of_start_equity() -> None:
+    """1.5% of start equity, not a fixed $100 (~16% of a $600 account)."""
+    fresh = RiskLimits()
+    assert fresh.daily_profit_target_pct == 1.5
+    assert fresh.daily_profit_target_usd is None
+    assert fresh.profit_target_usd(600) == pytest.approx(9.0)
+    assert fresh.profit_target_usd(None) == 0.0
+    rm = RiskManager(fresh)
+    # 1.5% of the $500 start is $7.50.
+    reason = rm.halt_reason(account=account(equity=507.5), day=day())
+    assert reason is not None and reason.startswith(HALT_TARGET) and "1.5%" in reason
+    assert rm.halt_reason(account=account(equity=507.49), day=day()) is None
+    # A config saved with only a dollar target keeps that amount.
+    legacy = RiskLimits.model_validate({"daily_profit_target_usd": 80, "max_daily_loss_pct": 6})
+    assert legacy.daily_profit_target_pct is None
+    assert legacy.profit_target_usd(600) == 80
+    again = RiskLimits.model_validate_json(fresh.model_dump_json())
+    assert again.daily_profit_target_pct == 1.5
+    assert again.profit_target_usd(600) == pytest.approx(9.0)
 
 
 def test_no_target_halt_when_disabled() -> None:

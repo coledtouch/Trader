@@ -1522,8 +1522,13 @@
       label: 'Minimum candidate score', min: 0, max: 1, step: 0.05,
       help: 'The AI is only asked when a setup scores at least this (0 to 1).',
     },
+    'risk.daily_profit_target_pct': {
+      label: 'Daily profit target', unit: '% of start equity', min: 0,
+      help: 'New entries stop for the day (when that option is on) once the gain reaches this percent of start-of-day equity. Default 1.5%. It never increases size.',
+    },
     'risk.daily_profit_target_usd': {
-      label: 'Daily profit target', unit: '$', min: 0, help: 'Shown as progress only. It never increases risk.',
+      label: 'Daily profit target (fixed dollars)', unit: '$', min: 0,
+      help: 'Only for a setup saved before the percent target. Used when the percent above is empty.',
     },
     'risk.stop_trading_at_target': { label: 'Stop new entries at the target' },
     'risk.max_daily_loss_pct': {

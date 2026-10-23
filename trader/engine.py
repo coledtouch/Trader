@@ -65,6 +65,7 @@ from trader.models import (
     SignalRecord,
     TradeAction,
     TradeRecord,
+    order_trace_id,
     utcnow,
 )
 from trader.notify import Notifier
@@ -937,13 +938,23 @@ class Engine:
             if now - _aware(rec.created_at) >= APPROVAL_TTL:
                 self._expire(rec)
                 return self._get_order(order_id)
-            await self._ensure_connected(now)
+        # Prices are fetched without the entry lock so Reject can cancel the order while
+        # this is in flight. Reject takes the same lock; the check below runs again,
+        # still holding it, immediately before anything is sent.
+        await self._ensure_connected(now)
+        req = rec.request
+        quote = await self.broker.quote(req.instrument)
+        self._track_halt(req.instrument.key, quote, now)
+        account = await self.broker.account()
+        positions = await self.broker.positions()
+        open_orders = await self.broker.open_orders()
+        async with self._entry_lock:
+            rec = self._pending(order_id)  # rejected (or already sent) while prices loaded
+            now = self._now()
+            if now - _aware(rec.created_at) >= APPROVAL_TTL:
+                self._expire(rec)
+                return self._get_order(order_id)
             req = rec.request
-            quote = await self.broker.quote(req.instrument)
-            self._track_halt(req.instrument.key, quote, now)
-            account = await self.broker.account()
-            positions = await self.broker.positions()
-            open_orders = await self.broker.open_orders()
             day = self._today(now)
             verdict = None
             checked_account = self._with_day_trades(account, now)
@@ -981,15 +992,19 @@ class Engine:
                 self.db.update_order(order_id, status=OrderStatus.BLOCKED, message=message)
                 self._revert_signal(order_id, f"risk at approval: {reasons[0]}")
                 return self._get_order(order_id)
-            order = verdict.order or req
+            order = self._traced(verdict.order or req, order_id)
             if self.shadow and not order.is_exit:  # exits only reduce risk: still allowed
                 self.db.update_order(
                     order_id, status=OrderStatus.BLOCKED, message="shadow mode: live not armed"
                 )
                 self._revert_signal(order_id, "shadow mode")
                 return self._get_order(order_id)
+            # Again, immediately before the broker call: Reject holds this lock to cancel.
+            self._pending(order_id)
             if order.is_exit:
-                placed = await self.broker.close_position(order.instrument, order.reason)
+                placed = await self.broker.close_position(
+                    order.instrument, order.reason, trace_id=order.trace_id
+                )
                 if placed is None:
                     self.db.update_order(
                         order_id, status=OrderStatus.CANCELLED, message="no position to close"
@@ -1017,11 +1032,25 @@ class Engine:
             return self._get_order(order_id)
 
     async def reject_order(self, order_id: int, actor: str = "owner") -> OrderRecord:
-        """Cancel a pending order. Raises LookupError / ValueError like approve_order."""
-        self._pending(order_id)
-        self.db.update_order(order_id, status=OrderStatus.CANCELLED, message=f"rejected by {actor}")
-        self._revert_signal(order_id, f"rejected by {actor}")
-        return self._get_order(order_id)
+        """Cancel a pending order. Raises LookupError / ValueError like approve_order.
+
+        Uses the same lock as approve_order, so a reject that lands while approval is
+        fetching prices cancels the order before it can be sent.
+        """
+        async with self._entry_lock:
+            self._pending(order_id)
+            self.db.update_order(
+                order_id, status=OrderStatus.CANCELLED, message=f"rejected by {actor}"
+            )
+            self._revert_signal(order_id, f"rejected by {actor}")
+            return self._get_order(order_id)
+
+    def _traced(self, order: OrderRequest, order_id: int | None) -> OrderRequest:
+        """Copy of `order` carrying a unique broker tag, the journal id when we have one."""
+        trace = order_trace_id(order_id, order.trace_id)
+        if order.trace_id == trace:
+            return order
+        return order.model_copy(update={"trace_id": trace})
 
     def _pending(self, order_id: int) -> OrderRecord:
         rec = self.db.get_order(order_id)
@@ -1096,7 +1125,7 @@ class Engine:
             start_equity=start,
             equity=equity,
             pnl_today=round(equity - start, 2) if equity is not None and start else 0.0,
-            pnl_target=self.risk.limits.daily_profit_target_usd,
+            pnl_target=self.risk.limits.profit_target_usd(start),
             loss_limit_usd=loss_limit,
             trades_today=day.trades if day else 0,
             llm_cost_today=round(day.llm_cost, 4) if day else 0.0,
@@ -1861,11 +1890,42 @@ class Engine:
         await self._cleanup_meta(now, positions, open_orders)
 
     async def _sync_orders(self, now: datetime) -> None:
+        traced: dict[str, OrderRecord] | None = None
+
+        async def by_trace(trace: str | None) -> OrderRecord | None:
+            """Working broker order whose tag matches, fetched once per sync."""
+            nonlocal traced
+            if not trace:
+                return None
+            if traced is None:
+                traced = {}
+                for live in await self.broker.open_orders():
+                    if live.request.trace_id and live.broker_order_id:
+                        traced.setdefault(live.request.trace_id, live)
+            return traced.get(trace)
+
         for rec in self.db.list_orders(limit=200, statuses=OPEN_ORDER_STATUSES):
             if rec.id is None or not rec.broker_order_id:
                 continue
             latest = await self.broker.order_status(rec.broker_order_id)
             if latest is None:
+                adopted = await by_trace(rec.request.trace_id)
+                if adopted is not None:
+                    self.db.update_order(
+                        rec.id,
+                        status=adopted.status,
+                        broker_order_id=adopted.broker_order_id,
+                        filled_qty=adopted.filled_qty,
+                        avg_fill_price=adopted.avg_fill_price,
+                        commission=adopted.commission,
+                    )
+                    log.info(
+                        "reconciled order %s via %s -> broker %s",
+                        rec.id,
+                        rec.request.trace_id,
+                        adopted.broker_order_id,
+                    )
+                    continue
                 created = _aware(rec.created_at)
                 restarted = self._epoch is not None and created < self._epoch
                 if restarted or now - created > ORDER_FORGET_AFTER:
@@ -2656,6 +2716,7 @@ class Engine:
     async def _send_entry(self, order: OrderRequest, now: datetime) -> OrderRecord:
         """Place an entry. Position metadata is written first, so a position that appears
         is always managed even if the call fails halfway (stale metadata is cleaned up)."""
+        order = self._traced(order, None)
         assert order.limit_price is not None and order.stop_loss is not None
         key = order.instrument.key
         entry, stop = order.limit_price, order.stop_loss
@@ -2773,6 +2834,8 @@ class Engine:
         self._close_reasons[inst.key] = req.reason
         rec = await self.broker.close_position(inst, reason=req.reason)
         if rec is not None:
+            if rec.request.trace_id:
+                req = req.model_copy(update={"trace_id": rec.request.trace_id})
             self._journal_order(rec.model_copy(update={"request": req}), now)
 
 

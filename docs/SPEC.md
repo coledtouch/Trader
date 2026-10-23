@@ -551,7 +551,8 @@ for the open to settle; time stops; size small.
   `config.commission_plan`.
 - `AppConfig`: `ib_crypto_exchange` (ZEROHASH), `commission_plan` (tiered|fixed),
   `cf_access_team_domain`, `cf_access_aud`, `cf_access_enabled`; `trust_proxy_headers`
-  now means: client IP = `CF-Connecting-IP` if present, else first `X-Forwarded-For`.
+  now means: client IP = `CF-Connecting-IP` when that header is a valid address, else the
+  socket peer. `X-Forwarded-For` is not trusted.
 - `Quote`: `bid_size`, `ask_size`, `halted`, `spread_pct`, `exit_price` (bid, else price).
 - `RiskLimits`: `max_spread_pct` (0.3), `halt_cooldown_minutes` (15),
   `allow_leveraged_etfs` (False). `HARD_CAPS["max_spread_pct"] = 2.0`,
@@ -857,3 +858,24 @@ Contracts changed by the confirmed review findings (each has a regression test).
   the Fixed plan; Tiered is about $0.38 per small order).
 - **IBKR password**: letters and digits only (a `$` was cut off on the way to the
   gateway); `.env.example` and DEPLOY show a length check that prints no secret.
+
+### 7.7 Round 7: review safety fixes
+- **Approve/Reject**: `reject_order` takes `_entry_lock`. Approval reads prices without
+  that lock, then takes it again and re-checks the order is still pending immediately
+  before the send. A reject during the price fetch cancels the order; it is not sent.
+- **Autopilot** defaults to off (`BotSettings.autopilot`).
+- **`HARD_CAPS["max_order_notional_usd"] = 5000`**.
+- **Daily profit target** is `daily_profit_target_pct` (default 1.5% of start-of-day
+  equity). A saved config that has `daily_profit_target_usd` and no percent keeps that
+  dollar amount (`RiskLimits.profit_target_usd`).
+- **IBKR `orderRef`** is `OrderRequest.trace_id` (`ai-trader-<journal id>` when the id is
+  known, otherwise a unique `ai-trader-<random>`). The tag is stored on the order and
+  copied back from a working order after restart so `_sync_orders` can reattach the
+  broker id.
+- **Broker errors** returned by the web API are generic (`"<action> failed"`). The
+  exception text is logged and audited, not sent to the browser.
+- **Client IP** for rate limits is `CF-Connecting-IP` only when `trust_proxy_headers` is
+  set; otherwise the socket peer. `X-Forwarded-For` is ignored.
+- **Live start**: `TRADER_ALLOW_LIVE=true` with either `TRADER_CF_ACCESS_*` value empty
+  is a configuration error (the process refuses to start). Paper and sim
+  (`TRADER_ALLOW_LIVE=false`) may leave both empty.

@@ -67,6 +67,7 @@ from trader.models import (
     Quote,
     Side,
     exec_revision,
+    order_trace_id,
     utcnow,
 )
 
@@ -899,6 +900,7 @@ class IBKRBroker(Broker):
 
     # ------------------------------------------------------------------ orders
     async def place_order(self, req: OrderRequest) -> OrderRecord:
+        req = req.model_copy(update={"trace_id": order_trace_id(existing=req.trace_id)})
         try:
             self._check_request(req)
         except _Reject as exc:
@@ -953,14 +955,16 @@ class IBKRBroker(Broker):
         if req.take_profit is not None and req.take_profit <= stop:
             raise _Reject("entry rejected: take_profit must be above stop_loss")
 
-    def _base_kwargs(self, acct: str) -> dict[str, object]:
-        return {"account": acct, "orderRef": "ai-trader"}
+    def _base_kwargs(self, acct: str, req: OrderRequest) -> dict[str, object]:
+        # One tag per order (the journal id when the engine stamped it). The same tag on
+        # every order made them impossible to tell apart after a restart.
+        return {"account": acct, "orderRef": order_trace_id(existing=req.trace_id)}
 
     def _stock_orders(self, req: OrderRequest, info: _ContractInfo, acct: str) -> list[Order]:
         """Entry -> bracket [parent, stop, (take-profit)]; exit with stop_loss -> standalone
         GTC protective stop; other exits -> single DAY order."""
         qty = float(req.qty)
-        kwargs = self._base_kwargs(acct)
+        kwargs = self._base_kwargs(acct, req)
         if req.is_exit:
             if req.stop_loss is not None:
                 tick = self._tick_size(info, req.instrument, req.stop_loss)
@@ -1024,7 +1028,7 @@ class IBKRBroker(Broker):
         self, req: OrderRequest, info: _ContractInfo, acct: str
     ) -> list[Order]:
         """IBKR crypto: LMT (DAY) by quantity; MKT is IOC, and a MKT buy uses cashQty."""
-        kwargs = self._base_kwargs(acct)
+        kwargs = self._base_kwargs(acct, req)
         qty = float(req.qty)
         if not req.is_exit and info.min_size > 0 and qty < info.min_size:
             raise _Reject(f"crypto qty {qty:g} is below IBKR's minimum size {info.min_size:g}")
@@ -1437,6 +1441,8 @@ def _request_from_trade(trade: Trade) -> OrderRequest | None:
     side = Side(order.action)
     is_stop = order.orderType.startswith(("STP", "TRAIL"))
     is_limit = order.orderType in ("LMT", "STP LMT")
+    ref = getattr(order, "orderRef", None) or ""
+    trace_id = ref if isinstance(ref, str) and ref.startswith("ai-trader-") else None
     if side == Side.SELL:
         reason = "protective stop" if is_stop else ("take profit" if order.parentId else "exit")
     else:
@@ -1450,4 +1456,5 @@ def _request_from_trade(trade: Trade) -> OrderRequest | None:
         stop_loss=_price(order.auxPrice) if is_stop else None,
         is_exit=side == Side.SELL,  # long-only: every SELL reduces a long position
         reason=reason,
+        trace_id=trace_id,
     )

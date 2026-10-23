@@ -185,13 +185,17 @@ def _today(ctx: DecisionContext) -> str:
         loss_limit = basis * pct / 100
         room = loss_limit + pnl
         limit_of = f"{_num(pct)}% of start equity"
-    target = limits.daily_profit_target_usd
+    target = limits.profit_target_usd(basis)
+    if limits.daily_profit_target_pct is not None:
+        target_text = f"{_usd(target)} ({_num(limits.daily_profit_target_pct)}% of start equity)"
+    else:
+        target_text = _usd(target)
     progress = f"{pnl / target:.0%} of target" if target > 0 else "no target set"
     return (
         f"## Today {day.day}\n"
         f"start equity {_usd(basis)} | P&L {_signed(pnl)} (realized {_signed(day.realized_pnl)}, "
         f"unrealized {_signed(acct.unrealized_pnl)})\n"
-        f"profit target {_usd(target)} (informational, never a reason to add risk): {progress}\n"
+        f"profit target {target_text} (informational, never a reason to add risk): {progress}\n"
         f"daily loss limit -{_usd(loss_limit)} ({limit_of}, binding): "
         f"{_usd(max(room, 0.0))} left before the halt\n"
         f"entries {day.trades}/{limits.max_trades_per_day}"

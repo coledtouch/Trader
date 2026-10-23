@@ -359,14 +359,16 @@ class Authenticator:
 
     # ------------------------------------------------------------ request checks
     def client_ip(self, request: Request) -> str:
-        """Socket peer, unless trust_proxy_headers: then CF-Connecting-IP, else the first
-        X-Forwarded-For entry (only safe behind a proxy that sets them, e.g. cloudflared)."""
+        """Socket peer, unless trust_proxy_headers: then only Cloudflare's CF-Connecting-IP.
+
+        X-Forwarded-For is not used. A client can set it, so a missing Cloudflare header
+        must not let a spoofed address pick the login rate-limit bucket. With no usable
+        CF-Connecting-IP the socket peer (cloudflared, on this deployment) is the fallback.
+        """
         if self.config.trust_proxy_headers:
-            forwarded = request.headers.get("x-forwarded-for", "").split(",")[0]
-            for value in (request.headers.get("cf-connecting-ip"), forwarded):
-                ip = _valid_ip(value)
-                if ip:
-                    return ip
+            ip = _valid_ip(request.headers.get("cf-connecting-ip"))
+            if ip:
+                return ip
         return request.client.host if request.client and request.client.host else UNKNOWN_IP
 
     def origin_allowed(self, request: Request) -> bool:

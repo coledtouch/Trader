@@ -9,9 +9,10 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Literal
+from typing import Any, Literal
+from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 def utcnow() -> datetime:
@@ -158,6 +159,20 @@ class OrderRequest(BaseModel):
     reason: str = ""  # short human-readable reason (from the AI or a rule)
     decision_id: int | None = None  # journal link to the AI decision batch
     setup: str | None = None  # scanner setup name, if any
+    # Broker order tag (IBKR orderRef). "ai-trader-<journal id>" when that id is known
+    # before the send, otherwise a unique "ai-trader-<random>" stored with the order so
+    # it can be matched again after a restart. Empty until the engine or broker stamps it.
+    trace_id: str | None = None
+
+
+def order_trace_id(order_id: int | None = None, existing: str | None = None) -> str:
+    """Stable broker tag for one order. Keeps `existing` when it is set, otherwise the
+    journal id, otherwise a random id. Never the same tag for every order."""
+    if existing and existing.strip():
+        return existing.strip()
+    if order_id is not None:
+        return f"ai-trader-{order_id}"
+    return f"ai-trader-{uuid4().hex}"
 
 
 class OrderRecord(BaseModel):
@@ -251,10 +266,21 @@ class DecisionBatch(BaseModel):
     votes: dict[str, list[AIDecision]] = Field(default_factory=dict)
 
 
+# Old built-in dollar target. Saved settings that name a dollar amount and no percent
+# keep that amount; a fresh config uses the percent below (about 1.5% of the ~$600 start,
+# not ~16%).
+DEFAULT_DAILY_PROFIT_TARGET_PCT = 1.5
+
+
 class RiskLimits(BaseModel):
     """User-adjustable risk settings. Values are clamped to HARD_CAPS in code."""
 
-    daily_profit_target_usd: float = Field(default=100.0, ge=0)
+    # Percent of start-of-day equity. None only for a saved config that still uses a
+    # fixed dollar target (daily_profit_target_usd).
+    daily_profit_target_pct: float | None = Field(default=DEFAULT_DAILY_PROFIT_TARGET_PCT, ge=0)
+    # Fixed dollar target. None means "use the percent". Set (and the percent left empty)
+    # only so a config saved before the percent target still halts at the same dollar amount.
+    daily_profit_target_usd: float | None = Field(default=None, ge=0)
     stop_trading_at_target: bool = True  # lock in the day once the target is reached
     max_daily_loss_pct: float = Field(default=6.0, gt=0)  # of start-of-day equity
     max_risk_per_trade_pct: float = Field(default=2.0, gt=0)  # equity lost if the stop is hit
@@ -274,6 +300,32 @@ class RiskLimits(BaseModel):
     halt_cooldown_minutes: int = Field(default=15, ge=0)  # no entries this long after a halt
     allow_leveraged_etfs: bool = False  # leveraged/inverse ETPs (TQQQ, SQQQ, UVXY, ...)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _keep_legacy_dollar_target(cls, data: Any) -> Any:
+        """A config saved before the percent target has daily_profit_target_usd and no
+        percent. Keep that dollar amount. A new config (no dollar key, or a null one)
+        uses the percent default."""
+        if not isinstance(data, dict) or "daily_profit_target_pct" in data:
+            return data
+        usd = data.get("daily_profit_target_usd")
+        if usd is None:
+            return data
+        return {**data, "daily_profit_target_pct": None}
+
+    def profit_target_usd(self, start_equity: float | None) -> float:
+        """Dollar profit target for the day.
+
+        A legacy config (percent left empty) uses its saved dollar amount. Otherwise the
+        target is daily_profit_target_pct of start-of-day equity, or 0 when that equity
+        is not known yet.
+        """
+        if self.daily_profit_target_pct is None:
+            return float(self.daily_profit_target_usd or 0.0)
+        if not start_equity or start_equity <= 0:
+            return 0.0
+        return start_equity * self.daily_profit_target_pct / 100.0
+
 
 # Absolute ceilings enforced in code no matter what the settings say. They exist so
 # that a typo, a bug, or a misbehaving model can never blow far past sane limits.
@@ -284,6 +336,8 @@ HARD_CAPS: dict[str, float] = {
     "max_total_exposure_pct": 100.0,
     "max_open_positions": 10,
     "max_trades_per_day": 50,
+    # Largest single order, in dollars. A typo or a loosened setting cannot send more.
+    "max_order_notional_usd": 5000.0,
     "price_collar_pct": 5.0,
     "llm_daily_budget_usd": 50.0,
     "max_spread_pct": 2.0,
@@ -337,7 +391,7 @@ class ExitRules(BaseModel):
 class BotSettings(BaseModel):
     """Runtime settings, editable in the UI and stored in the database."""
 
-    autopilot: bool = True  # False: every order waits for approval in the UI
+    autopilot: bool = False  # True: orders go out on their own. Off: each one waits for approval
     cycle_seconds: int = Field(default=300, ge=30, le=3600)  # AI decision cadence
     monitor_seconds: int = Field(default=15, ge=5, le=300)  # stop/target/loss-limit checks
     trade_stocks: bool = True
