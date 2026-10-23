@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from tests.test_decide import NOW, cand, make_ctx, pos
 from trader.models import (
     AssetClass,
+    Candidate,
     DayStats,
     DecisionBatch,
     DecisionContext,
@@ -843,8 +844,29 @@ def test_candidates_show_fee_estimates_for_the_pricing_plan():
     pfe = cand("PFE", price=30.02, stop=29.90, target=30.16)
     ctx = make_ctx(candidates=[pfe], equity=600.0, day=DayStats(day="2026-10-23", start_equity=600))
     text = render_context(ctx)
-    assert "at most 8 sh (~$240.16): round-trip fees ~$0.76 = 68% of the $1.12 reward" in text
-    assert "(limit 25%)" in text
+    assert "at most 8 sh (~$240.16): round-trip fees ~$0.76 = 67.8% of the $1.12 reward" in text
+    assert "(over the 25% limit: the risk manager rejects it)" in text
+    ok = cand("F", price=12.00, stop=11.80, target=12.60)  # 20 sh: $0.84 vs a $12 reward
+    assert "= 7.0% of the $12.00 reward (limit 25%)" in render_context(
+        ctx.model_copy(update={"candidates": [ok]})
+    )
     fixed = render_context(ctx.model_copy(update={"commission_plan": "fixed"}))
     assert "round-trip fees ~$2.0" in fixed
     assert "at least $1 per order" not in SYSTEM_PROMPT
+
+
+def test_fee_share_that_rounds_to_the_limit_is_flagged_as_over_it():
+    """Review finding: 25.18% printed as "25% (limit 25%)" although the risk check rejects
+    it. The flag uses the risk check's own comparison."""
+    eth = Candidate(
+        instrument=Instrument(symbol="ETH", asset_class=AssetClass.CRYPTO),
+        setup="x",
+        score=0.7,
+        price=2500.0,
+        suggested_stop=2410.0,
+        suggested_target=2639.0,
+    )
+    ctx = make_ctx(candidates=[eth], equity=600.0, day=DayStats(day="2026-10-21", start_equity=600))
+    text = render_context(ctx)
+    assert "round-trip fees ~$3.50 = 25.2% of the $13.90 reward" in text
+    assert "(over the 25% limit: the risk manager rejects it)" in text

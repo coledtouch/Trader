@@ -302,10 +302,16 @@ def _fee_note(cand: Candidate, ctx: DecisionContext) -> str:
     )
     reward = (target - price) * qty
     size = f"{qty:g} sh" if stock else f"{qty:.6g} units"
+    limit = _num(lim.max_fee_to_reward_pct)
+    # The same comparison as the risk check, so a share that rounds to the limit is never
+    # shown as allowed when the check rejects it.
+    if fees > lim.max_fee_to_reward_pct / 100 * reward:
+        verdict = f"over the {limit}% limit: the risk manager rejects it"
+    else:
+        verdict = f"limit {limit}%"
     return (
         f" | at most {size} (~{_usd(qty * price)}): round-trip fees ~{_usd(fees)} = "
-        f"{fees / reward * 100:.0f}% of the {_usd(reward)} reward (limit "
-        f"{_num(lim.max_fee_to_reward_pct)}%)"
+        f"{fees / reward * 100:.1f}% of the {_usd(reward)} reward ({verdict})"
     )
 
 

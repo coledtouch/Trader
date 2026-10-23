@@ -851,8 +851,9 @@ Contracts changed by the confirmed review findings (each has a regression test).
   $0 for the rest of the day.
 - **Fees in the prompt**: each candidate line carries the round-trip fee estimate (same fee
   model and `DecisionContext.commission_plan` as the risk check) at the largest size the
-  notional, position and risk limits allow, as a % of the reward at target with the
-  `max_fee_to_reward_pct` limit. The system prompt no longer states a $1 minimum (that is
+  notional, position and risk limits allow, as a % (one decimal) of the reward at target
+  with the `max_fee_to_reward_pct` limit, flagged "over the limit" by the risk check's own
+  comparison. The system prompt no longer states a $1 minimum (that is
   the Fixed plan; Tiered is about $0.38 per small order).
 - **IBKR password**: letters and digits only (a `$` was cut off on the way to the
   gateway); `.env.example` and DEPLOY show a length check that prints no secret.
