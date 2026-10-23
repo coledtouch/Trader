@@ -369,10 +369,21 @@ All of these start with `cd ~/Trader`.
 `docker compose down` logs the gateway out. Stock positions keep their stop-loss orders at
 IBKR. Crypto stops are not orders at IBKR. While the gateway profile is on, the
 `crypto-watchdog` container keeps its own connection and sells crypto the bot opened if
-the app stops writing a heartbeat (default: enforce the stop after 45s, sell them all
-after 180s) or the kill switch is on. It publishes no ports and is not on the tunnel
+the app stops writing a heartbeat or the kill switch is on. At the default 15-second
+monitor interval that is: enforce the stop after 45 seconds, sell them all after 180
+seconds. A longer monitor interval in Settings raises both (three monitor intervals
+before the app looks stale, then another 60 seconds before a full sell) so a healthy
+slow loop is not flattened. It publishes no ports and is not on the tunnel
 network. It cannot sell if the gateway itself is down — there is still no broker-side
-crypto stop — and it never buys. Logs: `docker compose logs --tail 100 crypto-watchdog`.
+crypto stop — and it never buys. Paper may sell with live trading off. A live account
+with `TRADER_ALLOW_LIVE=false` gets alerts only, no watchdog sells. Leave
+`TRADER_WATCHDOG_ORDERS=off` for the first few days so it only alerts. Logs:
+`docker compose logs --tail 100 crypto-watchdog`.
+
+Stopping the **app container** (`docker compose stop trader` or a deploy that does not
+come back) for longer than the flatten timeout sells every crypto position the bot
+opened. A normal redeploy that is serving again within 45 seconds is fine: the heartbeat
+resumes before the watchdog sells. Stock stops stay at IBKR either way.
 
 **Stop bot** in the app only stops new decisions. As long as the app runs it keeps watching
 open positions (crypto stops, the daily loss limit, closing stocks before the bell), and
@@ -389,8 +400,12 @@ pending approvals, restarts today's P&L from the new account's equity, **disarms
 trading**, writes `account_changed` to the audit log and sends a phone alert.
 
 **Emergency, app unreachable:** `docker compose stop trader` stops the bot. Then manage
-positions in IBKR Mobile. If IBKR refuses the phone login because the gateway holds the
-session, also run `docker compose stop ib-gateway`.
+positions in IBKR Mobile. If the crypto watchdog is running, leaving the app container
+stopped past the flatten timeout (180 seconds unless Settings uses a longer monitor
+interval) sells all crypto the bot opened. Stop the watchdog too
+(`docker compose stop crypto-watchdog`) if you want those positions left alone. If IBKR
+refuses the phone login because the gateway holds the session, also run
+`docker compose stop ib-gateway`.
 
 ### Updating
 

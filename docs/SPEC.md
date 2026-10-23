@@ -895,12 +895,18 @@ failed broker read leaves the previous stamp in place.
 user `trader`, network `broker` only, no published ports) polls that stamp with its own
 IB client id (`TRADER_WATCHDOG_CLIENT_ID`, required to differ from `TRADER_IB_CLIENT_ID`):
 
-- Heartbeat younger than `TRADER_WATCHDOG_STALE_SECONDS` (default 45): do nothing. The app
-  is enforcing stops.
+- Heartbeat younger than the effective stale timeout: do nothing. The app is enforcing
+  stops. The effective stale timeout is `max(TRADER_WATCHDOG_STALE_SECONDS, 3 ×
+  monitor_seconds)` read from saved settings each tick (default monitor 15s keeps the
+  45s stale timeout). A longer dashboard monitor interval would otherwise look like a
+  dead app. The watchdog logs a warning when it raises the configured values.
 - Older than that, and a managed crypto position's bid is at or below its `positions_meta`
   stop on two polls: market-sell the uncovered quantity.
-- Older than `TRADER_WATCHDOG_FLATTEN_SECONDS` (default 180, must be >= the stale timeout):
-  market-sell every crypto position the bot opened, even above the stop.
+- Older than the effective flatten timeout (`max(TRADER_WATCHDOG_FLATTEN_SECONDS,
+  effective stale + 60s)`; the configured value must still be >= the configured stale
+  timeout): market-sell every crypto position the bot opened, even above the stop.
+- A stale heartbeat with nothing to sell still alerts once per outage
+  (`Crypto watchdog: app heartbeat stale`), not on every poll.
 - Kill switch persisted on today's daily stats (or the previous day, if today has no row):
   flatten those positions even when the heartbeat is fresh.
 - No heartbeat yet counts from when the watchdog process started, so a deploy does not
@@ -912,5 +918,13 @@ crypto are left alone. Orders are SELL exits whose `trace_id` (IBKR `orderRef`) 
 A working sell, or a send newer than `TRADER_WATCHDOG_RETRY_SECONDS`, suppresses a duplicate.
 `TRADER_WATCHDOG_ORDERS=off` and simulator mode alert only. Paper may sell with the live
 gate closed; live sells only when `TRADER_ALLOW_LIVE=true` (shadow mode included, because
-the app still exits then). A down gateway is logged and retried: there is no broker-side
-crypto stop to fall back on. The second client id is what survives an app crash.
+the app still exits then). A live account with `TRADER_ALLOW_LIVE=false` therefore gets
+no watchdog sells, only the alerts. A down gateway is logged and retried: there is no
+broker-side crypto stop to fall back on. The second client id is what survives an app
+crash.
+
+Those sells are not rows in this process's order journal. `IBKRBroker.fills_since` returns
+every execution on the account (another client's order id is stored as `perm:<permId>`),
+and `_sync_fills` / `replay_fills` match them to the bot's buys by instrument. The round
+trip, including P&L, is journaled when the app next syncs. The exit reason is inferred
+from the stop or target when this client has no order row for that perm id.

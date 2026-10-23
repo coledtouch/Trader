@@ -14,6 +14,7 @@ from trader.config import AppConfig
 from trader.db import Database
 from trader.models import (
     AssetClass,
+    BotSettings,
     DayStats,
     Instrument,
     Mode,
@@ -27,10 +28,12 @@ from trader.models import (
 )
 from trader.watchdog import (
     HEARTBEAT_KEY,
+    STALE_IDLE_TITLE,
     STOP_CONFIRM_TICKS,
     TAG_PREFIX,
     CryptoWatchdog,
     WatchdogSettings,
+    effective_timeouts,
     new_order_tag,
     orders_allowed,
     read_heartbeat,
@@ -203,6 +206,14 @@ def test_heartbeat_round_trip(db: Database) -> None:
     assert read_heartbeat(db) == NOW
     db.set_kv(HEARTBEAT_KEY, "not-a-timestamp")
     assert read_heartbeat(db) is None
+
+
+def test_effective_timeouts_follow_the_monitor_interval() -> None:
+    assert effective_timeouts(45, 180, 15) == (45.0, 180.0, None)
+    stale, flatten, warning = effective_timeouts(45, 180, 300)
+    assert stale == 900
+    assert flatten == 960
+    assert warning is not None and "900" in warning and "960" in warning
 
 
 def test_order_tags_are_unique_and_named() -> None:
@@ -508,6 +519,57 @@ async def test_flatten_does_not_need_a_quote(db: Database) -> None:
     watchdog, _notes = make(db, broker, clock)
     await watchdog.tick()
     assert len(sells(broker)) == 1
+
+
+async def test_a_slow_monitor_does_not_look_like_a_dead_app(db: Database, caplog) -> None:
+    """The dashboard can set the exit check to 300s. A 200s-old heartbeat is then healthy."""
+    db.save_settings(BotSettings(monitor_seconds=300))
+    clock = Clock()
+    broker = FakeBroker()
+    hold(db, broker, bid=90.0, last=90.0, stop=95.0)
+    beat(db, clock, age=200)  # past the configured 45s and 180s
+    watchdog, notes = make(db, broker, clock)
+    caplog.set_level("WARNING")
+    for _ in range(3):
+        await watchdog.tick()
+    assert sells(broker) == []
+    assert notes.sent == []
+    warnings = [r.getMessage() for r in caplog.records if "raised to match" in r.getMessage()]
+    assert warnings == [warnings[0]]
+
+
+async def test_flatten_waits_until_the_monitor_floor_plus_a_margin(db: Database) -> None:
+    db.save_settings(BotSettings(monitor_seconds=100))  # stale floor 300s, flatten floor 360s
+    clock = Clock()
+    broker = FakeBroker()
+    hold(db, broker, bid=100.0, last=100.0, stop=95.0)
+    beat(db, clock, age=320)
+    watchdog, _notes = make(db, broker, clock)
+    await watchdog.tick()
+    assert sells(broker) == []
+    beat(db, clock, age=400)
+    await watchdog.tick()
+    assert len(sells(broker)) == 1
+    assert "-flatten-" in (sells(broker)[0].trace_id or "")
+
+
+async def test_stale_heartbeat_with_nothing_to_sell_alerts_once(db: Database) -> None:
+    clock = Clock()
+    broker = FakeBroker()
+    beat(db, clock, age=60)
+    watchdog, notes = make(db, broker, clock)
+    await watchdog.tick()  # first look: noted, not yet repeated
+    assert notes.sent == []
+    await watchdog.tick()
+    await watchdog.tick()
+    assert notes.sent == [STALE_IDLE_TITLE]
+    beat(db, clock, age=1)
+    await watchdog.tick()
+    assert notes.sent.count("Crypto watchdog: app heartbeat restored") == 1
+    beat(db, clock, age=60)
+    await watchdog.tick()
+    await watchdog.tick()
+    assert notes.sent.count(STALE_IDLE_TITLE) == 2
 
 
 async def test_heartbeat_restored_is_reported_once(db: Database) -> None:

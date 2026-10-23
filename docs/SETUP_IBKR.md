@@ -312,9 +312,12 @@ and on every decision in Activity; recheck this table after a week of paper trad
 - **Crypto at IBKR** routes through ZEROHASH and accepts only limit and market orders, so
   crypto stop-losses are watched by the bot, not held at IBKR. Stock stops are real orders
   at IBKR and keep working. The `crypto-watchdog` container (its own gateway client id)
-  sells crypto the bot opened if the app stops heartbeating or the kill switch is on. If
-  the gateway or IBKR is down, that watchdog cannot sell either: there is no crypto stop
-  resting at the broker.
+  sells crypto the bot opened if the app stops heartbeating or the kill switch is on.
+  Stopping the app container for longer than the flatten timeout does that sell; a
+  redeploy that is back within 45 seconds does not. A live account with
+  `TRADER_ALLOW_LIVE=false` gets no watchdog sells (alerts only). Start with
+  `TRADER_WATCHDOG_ORDERS=off` for a few days. If the gateway or IBKR is down, that
+  watchdog cannot sell either: there is no crypto stop resting at the broker.
 - **One trading session per username.** IBKR checks for an existing session whenever you
   log in to trade. The gateway is set to keep its session (`primary`), so logging in to
   IBKR Mobile or the Client Portal with the same username while the bot runs may be

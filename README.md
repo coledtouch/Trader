@@ -162,8 +162,12 @@ Paper fills are kinder than real fills, so expect live results to be worse than 
 With the IB Gateway profile on, the crypto watchdog container is a second process on the
 broker network. It sells only crypto the bot opened, and only when the app has stopped
 heartbeating, the kill switch is on, or a stop is hit while the app is unhealthy. Paper
-mode is allowed to sell; live sells only while `TRADER_ALLOW_LIVE=true`. Set
-`TRADER_WATCHDOG_ORDERS=off` to alert without sending. See `.env.example`.
+mode is allowed to sell. A live account sells only while `TRADER_ALLOW_LIVE=true`; with
+that switch off, the watchdog alerts and does not sell, so a live account in that
+configuration has no watchdog backup. Start with `TRADER_WATCHDOG_ORDERS=off` for a few
+days (alerts only) before letting it send. Stopping the app container for longer than
+the flatten timeout (180 seconds at the default monitor interval) sells all crypto the
+bot opened. A normal redeploy that is back within 45 seconds does not. See `.env.example`.
 
 You can disarm, stop or kill at any time from the app. Know the difference: **Stop** ends new
 decisions while the bot keeps protecting open positions; **Disarm** blocks new real-money

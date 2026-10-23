@@ -58,6 +58,11 @@ TAG_PREFIX = "ai-trader-wd-"
 # One bad bid must not sell. The app uses the same idea (two monitor ticks).
 STOP_CONFIRM_TICKS = 2
 QTY_EPS = 1e-8
+# The app writes the heartbeat once per monitor interval. Three intervals cover a slow
+# tick and one miss before a healthy app looks dead. Flatten stays a step past that.
+STALE_MONITOR_MULTIPLE = 3
+FLATTEN_MARGIN_SECONDS = 60.0
+STALE_IDLE_TITLE = "Crypto watchdog: app heartbeat stale"
 
 
 def write_heartbeat(db: Database, now: datetime) -> None:
@@ -149,6 +154,30 @@ class TickResult:
     skipped: list[str] = field(default_factory=list)
 
 
+def effective_timeouts(
+    stale_seconds: float, flatten_seconds: float, monitor_seconds: float
+) -> tuple[float, float, str | None]:
+    """Stale and flatten limits that cannot fire during a healthy monitor interval.
+
+    The dashboard can set the monitor loop from 5s to 300s. A heartbeat older than the
+    configured 45s/180s is then normal, so the effective stale limit is at least three
+    monitor intervals and flatten is at least that plus a margin. Returns a warning when
+    the configured values were raised, or None when they already clear the floor.
+    """
+    stale = max(float(stale_seconds), STALE_MONITOR_MULTIPLE * float(monitor_seconds))
+    flatten = max(float(flatten_seconds), stale + FLATTEN_MARGIN_SECONDS)
+    if stale == float(stale_seconds) and flatten == float(flatten_seconds):
+        return stale, flatten, None
+    warning = (
+        "watchdog timeouts raised to match the monitor interval: "
+        f"stale {stale_seconds:g}s -> {stale:g}s, "
+        f"flatten {flatten_seconds:g}s -> {flatten:g}s "
+        f"(the app checks exits every {monitor_seconds:g}s, so a healthy heartbeat "
+        "can be that old)"
+    )
+    return stale, flatten, warning
+
+
 def orders_allowed(mode: Mode, settings: WatchdogSettings) -> tuple[bool, str]:
     """Whether this process may send a reduce. It never opens a position either way.
 
@@ -231,6 +260,9 @@ class CryptoWatchdog:
         self._attempt_at: dict[str, datetime] = {}
         self._active_alerts: set[str] = set()
         self._was_unhealthy = False
+        self._timeout_warning: str | None = None
+        self._stale_limit = settings.stale_seconds
+        self._flatten_limit = settings.flatten_seconds
 
     def _now(self) -> datetime:
         now = self._clock()
@@ -252,8 +284,9 @@ class CryptoWatchdog:
         marks = await self._marks(managed)
         heartbeat = read_heartbeat(self.db)
         age = self._heartbeat_age(heartbeat, now)
-        unhealthy = age > self.settings.stale_seconds
-        flatten = unhealthy and age >= self.settings.flatten_seconds
+        stale_limit, flatten_limit = self._limits()
+        unhealthy = age > stale_limit
+        flatten = unhealthy and age >= flatten_limit
         killed = kill_switch_on(self.db, now)
         if not unhealthy and not killed:
             self._below_stop.clear()
@@ -279,7 +312,9 @@ class CryptoWatchdog:
             closes.append(Close(pos.instrument, qty, kind, reason))
 
         allowed, why = orders_allowed(self.broker.mode, self.settings)
-        await self._alert(age, unhealthy, flatten, killed, closes, allowed, why, result)
+        await self._alert(
+            age, unhealthy, flatten, killed, closes, bool(managed), allowed, why, result
+        )
         if not allowed:
             if closes:
                 result.skipped.append(f"not sending: {why}")
@@ -300,6 +335,25 @@ class CryptoWatchdog:
         if heartbeat is None:
             return max(0.0, (now - self._started_at).total_seconds())
         return max(0.0, (now - heartbeat).total_seconds())
+
+    def _limits(self) -> tuple[float, float]:
+        """Effective stale and flatten timeouts for this tick.
+
+        `monitor_seconds` lives in the saved settings (the dashboard), not in the
+        watchdog's env. A longer monitor loop raises both timeouts, and the warning is
+        logged once per distinct wording so a poll loop does not repeat it.
+        """
+        monitor = float(self.db.get_settings().monitor_seconds)
+        stale, flatten, warning = effective_timeouts(
+            self.settings.stale_seconds, self.settings.flatten_seconds, monitor
+        )
+        if warning != self._timeout_warning:
+            self._timeout_warning = warning
+            if warning:
+                log.warning("%s", warning)
+        self._stale_limit = stale
+        self._flatten_limit = flatten
+        return stale, flatten
 
     def _why(
         self,
@@ -402,6 +456,7 @@ class CryptoWatchdog:
         flatten: bool,
         killed: bool,
         closes: list[Close],
+        held: bool,
         allowed: bool,
         why: str,
         result: TickResult,
@@ -420,7 +475,7 @@ class CryptoWatchdog:
             wanted.append(
                 (
                     "Crypto watchdog: flattening crypto",
-                    f"App heartbeat is {age:.0f}s old (limit {self.settings.flatten_seconds:g}s). "
+                    f"App heartbeat is {age:.0f}s old (limit {self._flatten_limit:g}s). "
                     f"Selling {symbols}.",
                     "urgent",
                 )
@@ -434,7 +489,20 @@ class CryptoWatchdog:
                 )
             )
         elif unhealthy and not closes and self._was_unhealthy:
-            pass
+            # Still stale, and this poll is not selling. One alert per outage: the title
+            # stays in _active_alerts until the heartbeat recovers.
+            if held:
+                detail = "Bot crypto is still open; this check is not selling it."
+            else:
+                detail = "No crypto the bot opened is open to sell."
+            wanted.append(
+                (
+                    STALE_IDLE_TITLE,
+                    f"App heartbeat is {age:.0f}s old (stale after {self._stale_limit:g}s). "
+                    f"{detail}",
+                    "high",
+                )
+            )
         if closes and not allowed:
             wanted.append(
                 (
