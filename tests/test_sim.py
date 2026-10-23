@@ -305,6 +305,28 @@ async def test_resting_limit_fills_only_when_price_trades_through():
     assert done.avg_fill_price <= 590.0
 
 
+async def test_limit_inside_the_spread_waits_for_the_market():
+    """BRK-3: a BUY limit placed between the last price and the ask is not marketable and
+    must not fill on the next sync just because the price it was placed above keeps
+    printing; it fills at the limit once the ask comes down to it."""
+    qqrt = Instrument(symbol="QQRT")  # unknown symbol: wide hash-based spread
+    broker, _ = await make_broker(datetime(2026, 10, 22, 11, 0, tzinfo=NY), cash=10_000, seed=3)
+    quote = await broker.quote(qqrt)
+    assert quote.ask - quote.last > 0.02  # last < limit < ask is possible
+    limit = round(quote.last + 0.01, 2)
+    rec = await broker.place_order(buy(qqrt, 5, OrderType.LIMIT, limit_price=limit))
+    assert rec.status == OrderStatus.SUBMITTED
+    for seconds in (0.001, 1.0, 5.0):
+        broker.advance(seconds)
+        if (await broker.quote(qqrt)).ask > limit:
+            assert (await broker.order_status(rec.broker_order_id)).status == (
+                OrderStatus.SUBMITTED
+            )
+    broker.set_price(qqrt, limit - (quote.ask - quote.last) - 0.02)  # the ask drops to it
+    done = await broker.order_status(rec.broker_order_id)
+    assert done.status == OrderStatus.FILLED and done.avg_fill_price <= limit
+
+
 async def test_resting_limit_fill_matches_the_bars():
     broker, _ = await make_broker(cash=100_000.0)
     start_price = (await broker.quote(BTC)).last

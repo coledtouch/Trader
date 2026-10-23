@@ -37,22 +37,31 @@ Safety rules (enforced in code, covered by tests):
 - Default broker is the offline simulator. Real-money orders need **all three**:
   `TRADER_ALLOW_LIVE=true` env, a live (non-"DU") IBKR account, and the owner "arming"
   live trading in the UI with a fresh TOTP code. Otherwise a live account runs in
-  **shadow mode**: decisions are logged, orders are recorded as BLOCKED, nothing is sent.
+  **shadow mode**: decisions are logged, orders are recorded as BLOCKED, nothing is sent
+  (the engine's own exits included; only an owner-confirmed kill acts). The arm lasts only
+  while the gate stays open: a process that starts with `TRADER_ALLOW_LIVE=false` clears it,
+  and so do the CLI's `logout-all`, `reset-2fa`, `reset-password` and `disarm` (7.5).
 - Every entry must have a stop-loss below entry; long-only; no shorting; no options
   writing; no leverage beyond `max_total_exposure_pct` (≤100%).
 - Hard caps in `trader.models.HARD_CAPS` clamp user settings.
 - Daily loss limit → halt (and flatten if `flatten_on_halt`). Resume requires TOTP.
 - In LIVE mode, block stock entries when market data is delayed.
-- Block stock entries when `AccountSnapshot.day_trades_remaining` is known and < 1.
+- Block stock entries when `AccountSnapshot.day_trades_remaining` is known and < 1 (the
+  engine first subtracts its own same-day round trips closed in the last 5 minutes: IBKR
+  refreshes the counter only every few minutes, 7.5).
 - Kill switch (UI button) → halt, cancel all orders, flatten all positions.
 - LLM spend is tracked; daily LLM budget exhausted → fall back to rules-only decisions
-  (never trade blindly), and log it.
+  (never trade blindly), and log it. In consensus mode (7.4) the rules then only manage
+  exits: a BUY needs both models.
+- Default decision mode is **consensus**: a BUY only when Claude AND Grok both BUY the same
+  symbol (7.4). A missing API key is never silent (status warning).
 
 ## 2. Stack
 
 Python 3.12+ (3.13 in Docker), FastAPI + Uvicorn, asyncio throughout, SQLite (stdlib),
 `ib_async` 2.1.0 for IBKR (TWS API via IB Gateway), `anthropic` 2.1.0 for Claude,
-`argon2-cffi`, `pyotp`, `cryptography` (Fernet), `httpx` (ntfy + tests), `qrcode`.
+`argon2-cffi`, `pyotp`, `cryptography` (Fernet), `httpx` (ntfy, the xAI/Grok REST API,
+tests), `qrcode`.
 Frontend: static HTML/CSS/vanilla JS (no build step, no CDN), PWA manifest + service
 worker. Strict CSP: no inline scripts or styles.
 
@@ -82,8 +91,11 @@ trader/
   strategy/
     signals.py         # Scanner: setups -> Candidate list
     decide.py          # DecisionMaker protocol + RuleBasedDecisionMaker
+    common.py          # shared LLM output schema, validation, failure helpers (7.4)
     claude.py          # ClaudeDecisionMaker (Anthropic API, structured output)
-    prompts.py         # system prompt + context rendering for Claude
+    grok.py            # GrokDecisionMaker (xAI Responses API via httpx, structured output)
+    consensus.py       # ConsensusDecisionMaker (Claude AND Grok must agree to BUY)
+    prompts.py         # system prompt + context rendering (shared by Claude and Grok)
   security/
     auth.py            # passwords, TOTP, sessions, CSRF, rate limiting, step-up
     crypto.py          # Fernet helpers for secrets at rest
@@ -184,12 +196,18 @@ class RuleBasedDecisionMaker:   # name = "rules"; __init__(settings: BotSettings
   (→ error, no decisions), API errors with the typed exception chain (→ error, no
   decisions). On any failure the batch has **no BUY decisions** (fail safe), but the
   engine still manages exits via stops.
-- Prompt caching: stable system prompt with `cache_control`; volatile context in the
-  user message. Never put timestamps in the system prompt.
+- Prompt caching: stable system prompt with `cache_control: {"type": "ephemeral", "ttl":
+  "1h"}` (no beta header; cycles are often > 5 min apart, so a 5-minute entry would expire);
+  volatile context in the user message. Never put timestamps in the system prompt.
 - Cost: compute from `usage` (input, output, cache read, cache write) with a per-model
-  price table (USD per 1M tokens): opus-5-5 4/20 (cache read 0.20, write 5.0),
-  sonnet-5-5 2/10 (0.20, 2.5), haiku-5-5 0.10/0.50 (0.01, 0.125); unknown model →
-  opus prices. `max_tokens` 16000 (non-streaming parse).
+  price table (USD per 1M tokens): opus-5-5 4/20 (cache read 0.20, 5-min write 5.0, 1-h
+  write 8.0), sonnet-5-5 2/10 (0.20, 2.5, 4.0), haiku-5-5 0.10/0.50 (0.01, 0.125, 0.20);
+  1-hour writes cost 2x base input. `usage.cache_creation` splits writes into
+  `ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`; writes it does not explain
+  are charged at the 1-hour price. Unknown model → opus prices. `max_tokens` 16000
+  (non-streaming parse).
+- The output model (`ModelDecision(s)`, aliased `ClaudeDecision(s)`), `convert_decisions`
+  and the failure helpers live in `strategy/common.py` and are shared with Grok.
 - The system prompt makes Claude a disciplined intraday risk manager: may only BUY
   symbols present in candidates (or CLOSE/HOLD existing positions), must provide
   stop below entry, prefers HOLD when edge is unclear, never sizes up to catch a
@@ -238,7 +256,8 @@ class Engine:
     def __init__(self, config: AppConfig, db: Database, broker: Broker,
                  decider: DecisionMaker, notifier: Notifier | None = None,
                  clock: Callable[[], datetime] = utcnow, *,
-                 scanner: SignalScanner | None = None, risk: RiskManager | None = None): ...
+                 scanner: SignalScanner | None = None, risk: RiskManager | None = None,
+                 makers: Mapping[str, DecisionMaker] | None = None): ...  # 7.4
     async def start(self) -> None        # connect + monitor & decision loops (idempotent);
                                          # sets running and the engine_running flag
     async def start_monitor(self) -> None  # connect + monitor loop only (protect positions)
@@ -264,9 +283,10 @@ class Engine:
 
 def build_engine(config: AppConfig, db: Database) -> Engine
     # broker: SimBroker if config.broker == "sim" else IBKRBroker
-    # decider: ClaudeDecisionMaker(fallback=RuleBasedDecisionMaker) when an API key is
-    #          configured, else RuleBasedDecisionMaker; settings.llm_enabled is checked
-    #          every cycle, so the LLM can be switched on/off without a restart
+    # makers: {"rules"} + "claude" (Anthropic key) + "grok" (xAI key) + "consensus" (both),
+    #         Claude/Grok with the rules maker as their outage fallback; passed as
+    #         Engine(..., makers=...). settings.decision_mode and settings.llm_enabled are
+    #         read every cycle (no restart); fallbacks and warnings in 7.4
 ```
 Loops (asyncio tasks, each wrapped so one exception logs + sets `last_error` and the
 loop continues; exponential backoff on broker errors; never crash the app):
@@ -278,22 +298,27 @@ loop continues; exponential backoff on broker errors; never crash the app):
   snapshot of the day; wins/losses/loss_streak/fees/realized), record equity point at
   most every 5 min, evaluate `halt_reason` (halt + flatten per settings + notify),
   engine-side stop/target check for positions without native stops (and as a backup
-  for stocks: only if price breaches stop by > 0.5% and no protective order is working),
+  for stocks: only if price breaches stop by > 0.5% and no protective order is working;
+  every engine-side exit and the daily halts need two consecutive ticks, see 7.4),
   re-place missing protective stops for stock positions after reconnect, and flatten
   stocks at close − 10 min when `flatten_stocks_before_close`.
 - **decision loop** every `cycle_seconds`: skip when halted, disconnected, or nothing is
   tradable now (stocks closed and crypto disabled). Build universe (settings + optional
   scanner movers), fetch bars + quote per instrument (concurrency-limited, per-symbol
   errors tolerated), run Scanner, build `DecisionContext`. Call the LLM only if there is
-  a candidate scoring >= `llm_min_candidate_score` or an open position to manage and
+  a candidate scoring >= `llm_min_candidate_score` or an open position the engine opened
+  (positions_meta) to manage and
   today's LLM cost < budget; otherwise use the rule-based maker (and log why). Journal
   the batch (`insert_decision`), update `DayStats.llm_cost`. For each decision: BUY →
-  build `OrderRequest` (LIMIT at decision limit or quote ask/last; stop/target from the
+  (under the entry lock, on a fresh clock, quote, account, positions and working orders,
+  never the pre-LLM context; dropped when older than `DECISION_MAX_AGE`, 7.5) build
+  `OrderRequest` (LIMIT at decision limit or quote ask/last; stop/target from the
   decision or candidate) → size → risk check → BLOCKED (journal with reasons) or, if
   approved: shadow mode → BLOCKED("shadow mode"); autopilot off → PENDING_APPROVAL
   (+ notify); else place via broker, journal, store positions_meta (stop, target,
   entry, initial_risk = (entry − stop) × qty, setup, decision_id), count the trade.
-  CLOSE → `broker.close_position`. HOLD → nothing.
+  CLOSE → `broker.close_position`, only for a position with positions_meta (otherwise
+  journaled BLOCKED "not opened by the bot"). HOLD → nothing.
 - `approve_order` re-runs the full risk check with fresh data before sending; pending
   approvals expire after 10 minutes (→ CANCELLED, "approval expired").
 - All owner actions (start/stop/kill/resume/arm/disarm/approve/reject/settings) are
@@ -301,7 +326,8 @@ loop continues; exponential backoff on broker errors; never crash the app):
   reconnects) are audited with actor "engine".
 - Live gating: `shadow = (broker.mode == LIVE) and not (config.allow_live and
   db.get_flag("live_armed"))`. `arm_live` raises `PermissionError` if `config.allow_live`
-  is False or the broker is not LIVE.
+  is False or the broker is not LIVE. An engine constructed with `allow_live` False clears
+  a stored `live_armed` (audit `live_disarmed`, actor "engine").
 
 ### 5.8 `trader/notify.py`
 `Notifier(config)` with `async send(title, message, priority="default", tags=None)`; no-op
@@ -317,7 +343,9 @@ seed, with sensible base prices (SPY ~ 600, QQQ ~ 520, AAPL ~ 230, AMD ~ 160, F 
 SOFI ~ 15, PLTR ~ 40, INTC ~ 22, BTC ~ 65000, ETH ~ 3000; unknown symbols get a stable
 hash-based price). `bars()` returns history consistent with `quote()`; time advances
 with the injected clock (tests use a fake clock). Fills: market orders fill at ask/bid
-plus slippage (bps scaled by inverse liquidity); limit orders fill when price crosses;
+plus slippage (bps scaled by inverse liquidity); limit orders fill when price crosses
+(a limit placed between the mid and the far side of the spread fills only once the ask
+reaches it for a BUY / the bid for a SELL, 7.5);
 bracket stops/targets are simulated natively (`supports_native_stops` True for stocks,
 False for crypto so the engine path is exercised); a SELL exit carrying `stop_loss` rests
 as a standalone stop (`supports_standalone_stops` True for stocks). No shorting (sells
@@ -337,7 +365,8 @@ stocks `Stock(symbol, "SMART", "USD")`, crypto `Crypto(symbol, config.ib_crypto_
 (default "ZEROHASH"; the owner's account routes BTC via ZEROHASH, conid 541686651); qualify
 and cache. Bars via `reqHistoricalDataAsync` (useRTH False for crypto, True for
 stocks... choose sensibly), converted to UTC `Bar`s. Quotes via snapshot/streaming
-tickers with timeout; mark `delayed` when market data type is 3/4. Stock entries:
+tickers with timeout; mark `delayed` when market data type is 3/4 (`data_delayed`), or
+per instrument after error 10167; 354 means no data for that instrument (7.5). Stock entries:
 bracket order (parent LMT/MKT, child STP at stop_loss, child LMT at take_profit,
 OCA, transmit flags correct; child TIF GTC so protection survives disconnects and the
 day boundary) via `bracketOrder` helpers when available. A stock SELL exit carrying
@@ -346,8 +375,11 @@ orders, so such a request is rejected, never sold at market. Crypto: IBKR crypto
 rules differ (research them: cashQty for market buys, allowed TIFs, whether STP is
 supported) - implement what is supported, return REJECTED with a clear message
 otherwise, and report `supports_native_stops(crypto)` truthfully. Fills via
-`reqExecutionsAsync` + commission reports; order status from `trades()`/`openTrades()`.
-Event handlers: `disconnectedEvent`, `errorEvent` (log codes; 1100/1102 connectivity),
+`reqExecutionsAsync` + commission reports (only the latest revision of a corrected
+execution); order status from `trades()`/`openTrades()` (an order completed while the app
+was down is found through its executions' permId).
+Event handlers: `disconnectedEvent`, `errorEvent` (log codes; 1100/1102 connectivity; 1101
+forces a full reconnect before any data is trusted again),
 `orderStatusEvent`. Estimate commissions via `trader.fees` with `config.commission_plan`. Optional
 `async scan_movers(limit=10) -> list[str]` using `reqScannerDataAsync` (TOP_PERC_GAIN,
 US major, price 2–50, volume > 1M) that returns [] on any error. All IB calls wrapped
@@ -360,7 +392,9 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
 - Sessions: 32-byte random token in cookie `__Host-trader` (HttpOnly, Secure,
   SameSite=Strict, Path=/); store only SHA-256(token). If `cookie_secure` is False
   (local http dev), cookie name `trader_session`, Secure off. Idle timeout and absolute
-  lifetime from config; purge expired on access. Logout deletes the row.
+  lifetime from config; purge expired on access. A GET with `X-Background: 1` (the
+  dashboard's automatic status refresh) does not reset the idle timer. Logout deletes the
+  row.
 - Login: `POST /api/auth/login {password, totp}` - both required, constant-time,
   same generic error for any failure, per-IP limit (`login_max_attempts_per_ip` per
   15 min → 429) and global lockout (`login_lockout_failures` in 15 min → 429 for
@@ -371,9 +405,10 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
   `X-CSRF-Token` matching the session's csrf_token (constant-time) AND an `Origin`
   (or `Referer`) that equals the request's own origin or one of `public_origins`.
 - Step-up: `/api/live/arm`, `/api/bot/resume`, and settings changes that loosen any
-  risk limit (vs current; see `LOWER_IS_LOOSER`), enable autopilot while live, or switch
-  off `flatten_stocks_before_close` require a fresh `totp` field in the body
-  (replay-protected).
+  risk limit (vs current; see `LOWER_IS_LOOSER`), enable autopilot while live, switch
+  off `flatten_stocks_before_close`, or leave consensus decisions (another
+  `decision_mode`, or `llm_enabled` off while in consensus) require a fresh `totp` field
+  in the body (replay-protected).
 - Middleware: TrustedHostMiddleware (`allowed_hosts`), security headers on every
   response: `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src
   'self'; img-src 'self' data:; connect-src 'self'; manifest-src 'self'; worker-src
@@ -411,7 +446,7 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
 | GET | `/api/equity?days=30` | - | `[{"ts", "equity"}]` |
 | GET | `/api/days?limit=30` | - | `[DayStats]` |
 | GET | `/api/audit?limit=50` | - | `[{"id","ts","actor","action","detail","ip"}]` |
-| GET | `/api/settings` | - | `{"settings": BotSettings, "hard_caps": {...}, "llm_available": bool, "live_allowed": bool}` |
+| GET | `/api/settings` | - | `{"settings": BotSettings, "hard_caps": {...}, "llm_available": bool (any AI key), "ai_keys": {"claude": bool, "grok": bool}, "grok_model": str, "live_allowed": bool}` |
 | PUT | `/api/settings` | `{"settings": BotSettings, "totp"?: str}` | same as GET; 403 `{"detail":"step_up_required"}` when TOTP needed/invalid; 422 invalid |
 | POST | `/api/bot/start` | - | `EngineStatus` |
 | POST | `/api/bot/stop` | - | `EngineStatus` |
@@ -516,7 +551,8 @@ for the open to settle; time stops; size small.
   now means: client IP = `CF-Connecting-IP` if present, else first `X-Forwarded-For`.
 - `Quote`: `bid_size`, `ask_size`, `halted`, `spread_pct`, `exit_price` (bid, else price).
 - `RiskLimits`: `max_spread_pct` (0.3), `halt_cooldown_minutes` (15),
-  `allow_leveraged_etfs` (False). `HARD_CAPS["max_spread_pct"] = 2.0`. `LEVERAGED_ETFS`
+  `allow_leveraged_etfs` (False). `HARD_CAPS["max_spread_pct"] = 2.0`,
+  `HARD_CAPS["loss_streak_halve_after"] = 10`. `LEVERAGED_ETFS`
   blocklist. Loosening rules: `LOWER_IS_LOOSER`, `BOOL_TRUE_IS_LOOSER`,
   `BOOL_FALSE_IS_LOOSER` (web step-up uses these; every other numeric risk field: higher
   is looser).
@@ -561,7 +597,9 @@ for the open to settle; time stops; size small.
   ~3,900 are fine approximations), `set_halted(symbol, bool)` for tests, `modify_stop`
   for its native brackets.
 - **Web**: `/api/signals` and `/api/signals/stats` (table above). Cloudflare Access
-  middleware when `cf_access_enabled`: require header `Cf-Access-Jwt-Assertion` on every
+  middleware when `cf_access_enabled` (both values set; exactly one set is a configuration
+  error, the app refuses to start; the state is logged at startup, 7.5): require header
+  `Cf-Access-Jwt-Assertion` on every
   request except `/healthz`; verify RS256 signature against the team's JWKS
   (`https://<team_domain>/cdn-cgi/access/certs`, fetched with httpx, cached 1 h, refetched
   once on unknown `kid`), `aud` contains `cf_access_aud`, `iss == https://<team_domain>`,
@@ -574,7 +612,8 @@ for the open to settle; time stops; size small.
 - **Deploy/docs**: Cloudflare Tunnel is the primary access path: a `cloudflared` service
   in docker-compose (`cloudflare/cloudflared` image pinned to a version tag, `tunnel
   --no-autoupdate run`, `TUNNEL_TOKEN` from `.env`), public hostname `desk.kaxo.dev` →
-  `http://trader:8000` (plain http inside the docker network; the owner already created
+  `http://trader:8000` (plain http inside the docker network `edge`; ib-gateway is on a
+  separate network `broker` that only the trader joins, 7.5; the owner already created
   the tunnel `desk`, the Access app and policy). `.env.example`:
   `TRADER_ALLOWED_HOSTS=desk.kaxo.dev,localhost,127.0.0.1`,
   `TRADER_PUBLIC_ORIGINS=https://desk.kaxo.dev`, `TRADER_TRUST_PROXY_HEADERS=true`,
@@ -604,7 +643,8 @@ for the open to settle; time stops; size small.
 - **EngineStatus.loss_limit_usd**: how far today's P&L may fall before the daily loss halt,
   as a positive amount (after a resume halts are measured from the resume equity, so it can
   differ from start_equity x max_daily_loss_pct). The dashboard meter uses it.
-- **Engine extras**: unfilled entry orders are cancelled after 10 minutes; the kill-switch halt
+- **Engine extras**: unfilled entry orders are cancelled 10 minutes after they were sent (for an
+  approved order: after the approval, kv `order_sent:<id>`); the kill-switch halt
   carries over to the next day (the daily-loss halt does not); kill also acts in shadow mode
   (owner-confirmed); exit rules and flatten-before-close only touch positions with
   positions_meta (kill and the daily-loss flatten close everything); AI CLOSE decisions wait
@@ -620,3 +660,163 @@ for the open to settle; time stops; size small.
   app together through the HTTP API on a fake clock (entry → stop/target → trades, days,
   signal ledger and stats; kill switch; approvals and settings step-up; shadow mode;
   Cloudflare Access).
+
+### 7.4 Round 4: Grok consensus and hardening
+
+Owner decision (2026-10-23): **a BUY goes out only when Claude AND Grok both agree.**
+
+- **Config**: `xai_api_key` (`SecretStr | None`; env `TRADER_XAI_API_KEY` or `XAI_API_KEY`),
+  `xai_model` ("grok-4.7"), `xai_base_url` ("https://api.x.ai/v1"), `xai_price_input` /
+  `xai_price_cached_input` / `xai_price_output` (2.0 / 0.5 / 6.0 USD per 1M tokens:
+  third-party figures for grok-4.7, not confirmed by xAI; overridable).
+- **Models**: `BotSettings.decision_mode: Literal["consensus", "claude", "grok", "rules"] =
+  "consensus"`; `DecisionBatch.votes: dict[str, list[AIDecision]]` (each model's own
+  validated decisions in a consensus batch; db column `decisions.votes`, added to older
+  databases at startup); `EngineStatus.decision_maker` (who decides now),
+  `decision_warning` (why that differs from the configured mode), `data_warning` (broker
+  market-data problem, e.g. IBKR 10197).
+- **`strategy/grok.py`** `GrokDecisionMaker(api_key, model, fallback, *, base_url, price,
+  client=None, sleep=asyncio.sleep)`, `name = "grok"`: plain `httpx.AsyncClient` (90 s
+  timeout, 10 s connect), xAI's **Responses API**: `POST {base_url}/responses` with
+  `input` = [system: `prompts.SYSTEM_PROMPT`, user: `render_context(ctx)`], `text.format =
+  {"type": "json_schema", "name": "trading_decisions", "schema": strict_json_schema(
+  ModelDecisions), "strict": true}`, `max_output_tokens` 16000, `store: false`. The wire
+  format is isolated in `build_request` / `read_response` (switching to
+  `/chat/completions` + `response_format` touches only those). Answer text = the
+  `output_text` parts of `message` items; a `refusal` part or `incomplete_details.reason ==
+  "content_filter"` → `refused`; any other incomplete/failed status, no text, or text that
+  fails `ModelDecisions` validation → error, no decisions; then `convert_decisions` (same
+  validation as Claude). Retries: 408/409/429/5xx and connection errors, at most 2 retries,
+  `Retry-After` honoured (capped 20 s), else 1 s / 2 s; timeouts are not retried. Remaining
+  transient failures → the fallback maker's CLOSEs only; other 4xx → error, no decisions.
+  Cost from `usage` (Responses or Chat field names): cached prompt tokens at the cached
+  price; billed output = `total_tokens - input_tokens` when `total_tokens` is reported
+  (covers reasoning tokens either way), else output + reasoning; a 2xx answer without usable
+  usage is charged a worst-case estimate. The key travels only in the `Authorization` header,
+  is held as a `SecretStr`, and is scrubbed from error text.
+- **`strategy/consensus.py`** `ConsensusDecisionMaker(primary, secondary)`, `name =
+  "consensus"`: both `decide()` concurrently (an exception becomes a failed batch). BUY only
+  when both BUY the same instrument, with the primary's (Claude's) order type, limit, stop,
+  target and setup, `conviction` and `size_fraction` = the smaller of the two. CLOSE when
+  either says CLOSE. Every other instrument either side voted on becomes a HOLD whose
+  rationale starts with `"consensus: "` and names the blocker ("Grok said HOLD", "Claude
+  did not BUY", "Grok failed", "Grok refused", "both said HOLD"). A side that raised,
+  refused, or returned an error other than "dropped N invalid decision(s)" blocks every BUY;
+  the other side's CLOSEs still count. `cost_usd`/tokens = sums, `refused` = either,
+  `error` = "Claude: ...; Grok: ...", `model` = "claude-...+grok-...", `market_view` =
+  "Claude: ... | Grok: ...", `votes` = both decision lists.
+- **Engine**: `Engine(..., makers: Mapping[str, DecisionMaker] | None = None)`; `decider`
+  is a property resolving `settings.decision_mode` every call (without `makers`, the
+  injected decider serves every AI mode). Fallbacks: consensus without one key → the model
+  that has a key; without both → rules; a single-model mode without its key → rules; each
+  with a `decision_warning`. `llm_enabled` off → rules, no warning. `reload_settings`
+  updates Claude model/effort on every Claude maker, including the one inside consensus.
+  The daily LLM budget counts `batch.cost_usd`, i.e. the combined cost. When the rules
+  stand in for consensus (budget spent, nothing worth an AI call) their BUYs are dropped
+  ("consensus mode: rules manage exits only"; ledger: "consensus mode: no entries without
+  both models"). Consensus HOLD rationales become the ledger `skip_reason`.
+- **Quote sanity** (`risk.quote_problem`, `risk.sane_exit_price`): a quote is implausible when
+  crossed (bid > ask) or when its bid deviates more than 5% (stocks) / 8% (crypto) from last
+  (or mid without last); locked-and-far quotes are caught by the same test. Implausible
+  quotes are not used to mark positions (the broker's mark is kept), not used for
+  engine-side exits, and block entries in `RiskManager.check`.
+- **Breach confirmation** (`BREACH_CONFIRM_TICKS = 2`): engine-side stops (incl. the backup
+  stop and engine-managed raised stops), engine-side targets, time stops and both daily
+  halts (with the loss-limit flatten) fire only when the condition holds on two consecutive
+  monitor ticks that span at least `BREACH_MIN_SPACING` (0.5) x `monitor_seconds` (the tick
+  run_cycle runs right after the loop's never counts as a second look); a tick without the
+  condition (or without a usable quote) restarts the count. While a halt is pending, `run_cycle` skips and `approve_order` blocks entries.
+  Broker-native stops are unaffected.
+- **Account change guard**: kv `broker_account` remembers the account id the journal
+  belongs to (first sighting is just recorded). On a change (sim → paper "DU…" → live
+  "U…"): a new journal epoch (generalising the SIM-restart epoch: fills before it are not
+  matched, today's P&L baseline restarts, a stale target halt is cleared), open journal
+  orders → CANCELLED ("broker account changed: left with the previous account"), pending
+  approvals cancelled, all positions_meta/position_extra dropped (the engine never manages
+  positions it did not open on this account), live disarmed, audit `account_changed`
+  (masked ids, e.g. "DU...456") + high-priority notification. `approve_order` cancels an
+  order when the account changed since it was proposed.
+- **IBKR error 10197** ("No market data during competing live session": paper and live
+  share data and only one session gets it): the instrument (or, without a contract, every
+  subscribed instrument) is flagged; `quote()` raises `MarketDataUnavailable` (a
+  `BrokerError`) until a tick newer than the last 10197 arrives, re-subscribing every
+  `TICKER_RETRY_AFTER` to detect recovery; `Broker.data_warning` (new, default None)
+  names the symbols for 15 minutes; the engine mirrors it into `EngineStatus.data_warning`
+  and `last_error`. A reconnect clears the flags.
+- **Frontend**: Settings shows `decision_mode` as a select (help text, 2FA when leaving
+  consensus) and a note about missing keys; the dashboard shows an AI chip ("AI: Claude +
+  Grok", "AI: Claude only", ...), `decision_warning` and `data_warning`; the decision log
+  shows each model's vote ("How each model voted") for consensus batches; a note says Run
+  cycle now works while the bot is stopped. Service worker cache bumped to v3.
+- **Tests**: consensus truth table (`tests/test_consensus.py`), Grok request/response
+  parsing over `httpx.MockTransport` (`tests/test_grok.py`), engine modes, fallbacks,
+  budget, quote sanity, breach confirmation, account changes and data warnings
+  (`tests/test_engine_modes.py`), 10197 (`tests/test_ibkr.py`), 1-hour cache pricing
+  (`tests/test_claude.py`), settings step-up (`tests/test_web.py`), votes/migration
+  (`tests/test_db_votes.py`).
+
+### 7.5 Round 5: review fixes (2026-10-23)
+
+Contracts changed by the confirmed review findings (each has a regression test).
+
+- **Live arm** (SEC-1/OPS-1): `Engine.__init__` clears `flag:live_armed` when
+  `config.allow_live` is False (audit `live_disarmed`, reason "TRADER_ALLOW_LIVE=false at
+  startup"), so re-opening the gate always needs a fresh Arm + TOTP. `python -m trader
+  disarm` (new) and `logout-all` / `reset-2fa` / `reset-password` clear it too (audit
+  `live_disarmed`, actor "cli"). An arm still survives a restart while the gate stays open.
+- **Shadow mode is honest** (OPS-2): behaviour unchanged (nothing is sent, the engine's own
+  exits included), but the docs say so and the Disarm button asks for confirmation when
+  positions are open (crypto positions have no broker stop at all).
+- **Loosening rules** (SEC-2): `loss_streak_halve_after` is no longer in
+  `LOWER_IS_LOOSER` (a higher N halves later or never: raising it needs step-up) and is
+  capped at 10 (`HARD_CAPS`, also in the backtester).
+- **BUY at send time** (ENG-1/ENG-2): `_handle_buy` re-reads `broker.quote/account/
+  positions/open_orders` (merged with entries sent earlier in the batch) and the clock
+  inside `_entry_lock`, tracks halts, re-prices a model-less entry at the fresh ask and
+  runs `size_entry`/`check` with `now` = send time. It blocks while a halt is being
+  confirmed and when positions_meta exists for the instrument (an entry in flight or a
+  position still held). A BUY whose context is older than `DECISION_MAX_AGE` (3 min) is
+  dropped ("decision too old"); the reviewers' 2 x `monitor_seconds` would drop most LLM
+  answers, and the fresh re-check already covers the entry window, halts and the collar.
+- **AI CLOSE** (ENG-3): refused for positions without positions_meta (journal BLOCKED "not
+  opened by the bot"); such positions alone are not worth an LLM call; the prompt marks a
+  position without a stop "not opened by the bot: never CLOSE". An owner-approved pending
+  CLOSE is unaffected.
+- **Re-protect** (ENG-4): `_reprotect` subtracts the unfilled quantity of working market
+  SELL exits (e.g. a close queued for the open) and protects only the remainder; bracket
+  take-profit limits do not count.
+- **Breach spacing** (ENG-5): see 7.4 (`BREACH_MIN_SPACING`).
+- **Entry TTL** (ENG-6): measured from when the order was sent (7.3).
+- **IBKR 1101** (BRK-1): `connected` is False and data/order calls raise `BrokerError` until
+  `connect()` has disconnected and reconnected (re-running ib_async's startup syncs);
+  1102 needs no reconnect.
+- **PDT lag** (BRK-2): `Engine._with_day_trades` lowers a reported
+  `day_trades_remaining` by the bot's same-day stock round trips whose closing fill is
+  younger than `PDT_REFRESH` (5 min), for the decision context, autopilot BUYs and
+  approvals.
+- **Simulator inside-spread limits** (BRK-3): `_Order.inside_spread` (see 5.9).
+- **Delayed data** (BRK-4): `IBKRBroker.data_delayed` is True only for market data types
+  3/4; 10167 marks that instrument's quotes `delayed` (no contract: every current
+  subscription); 354 is logged as "no data" for the instrument (its quote stays empty).
+- **Completed orders after a restart** (BRK-5): `_find_trade` recovers an order's permId from
+  the executions ib_async loads at connect.
+- **Execution corrections** (BRK-6): `trader.models.exec_revision(exec_id)` parses IBKR ids
+  (`<base>.<revision>`); `fills_since` returns only the latest revision per base;
+  `Database.correct_fill` replaces stored earlier revisions (returning the replaced fill so
+  the engine moves the fee), and `insert_fill` ignores a revision older than a stored one.
+  A trade journaled before the correction arrived is not recomputed.
+- **Logging** (SEC-3): `cli.configure_logging` keeps the `httpx`/`httpcore` loggers at
+  WARNING so request URLs (the secret ntfy topic) never reach the logs.
+- **Compose networks** (SEC-4): `edge` (cloudflared, trader) and `broker` (trader,
+  ib-gateway; not internal, the gateway must reach IBKR).
+- **Idle sessions** (SEC-5): `Authenticator.get_session(token, touch=...)`;
+  `require_session` passes `touch=False` for a GET carrying `X-Background: 1`, which the
+  dashboard's status poll sends.
+- **Cloudflare Access config** (SEC-6): `AppConfig` validation refuses exactly one of
+  `cf_access_team_domain` / `cf_access_aud`; the CLI prints configuration errors without
+  values; `create_app` logs "Cloudflare Access check: enabled (team ..., aud ...)" or
+  "disabled".
+- **Docs/UI** (OPS-3/4/5): `setup` in a container says to apply the key with
+  `docker compose up -d` (restart keeps the old environment); consensus cost is ~1.5x
+  (Opus) / ~2x (Sonnet) / ~20x (Haiku) of Claude alone; the AI budget counts both models
+  and, once spent, consensus mode only manages exits. Service worker cache bumped to v4.

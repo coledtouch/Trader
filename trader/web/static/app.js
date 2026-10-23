@@ -289,8 +289,11 @@
     return new ApiError(403, 'Session expired - reload to sign in again', true);
   }
 
-  async function send(method, path, body) {
+  async function send(method, path, body, background = false) {
     const headers = { Accept: 'application/json' };
+    // Automatic refreshes are not owner activity: the server then does not reset the idle
+    // timer, so an unattended open tab still signs out after the idle timeout.
+    if (background && method === 'GET') headers['X-Background'] = '1';
     const init = {
       method,
       headers,
@@ -327,12 +330,12 @@
     }
   }
 
-  async function api(method, path, body) {
+  async function api(method, path, body, { background = false } = {}) {
     if (state.expired) throw new ApiError(403, 'Session expired - reload to sign in again', true);
     if (state.redirecting) throw new ApiError(401, 'Signed out.', true);
     if (method !== 'GET' && !state.csrf) await loadSession();
     for (let attempt = 0; ; attempt += 1) {
-      const res = await send(method, path, body);
+      const res = await send(method, path, body, background);
       if (res.type === 'opaqueredirect') throw sessionExpired();
       if (res.status === 401) throw toLogin();
       const { json, value } = await readJson(res);
@@ -543,7 +546,7 @@
     if (document.hidden || state.expired || state.redirecting) return;
     state.pollBusy = true;
     try {
-      const data = await api('GET', '/api/status');
+      const data = await api('GET', '/api/status', undefined, { background: true });
       if (!data || typeof data !== 'object' || !data.status) {
         throw new ApiError(200, 'Unexpected status response.');
       }
@@ -714,6 +717,15 @@
     box.append(root);
   }
 
+  const MAKER_LABELS = { claude: 'Claude', grok: 'Grok', consensus: 'Consensus', rules: 'Rules' };
+  const makerLabel = (name) => MAKER_LABELS[name] || humanize(name || 'unknown');
+  const AI_CHIP = {
+    consensus: 'AI: Claude + Grok',
+    claude: 'AI: Claude only',
+    grok: 'AI: Grok only',
+    rules: 'Rules only',
+  };
+
   function setChip(id, label, tone) {
     const chip = $(id);
     setText(chip, label);
@@ -727,6 +739,14 @@
     setChip('chip-market', s.stock_market_open ? 'Market open' : 'Market closed', s.stock_market_open ? 'ok' : null);
     setChip('chip-data', s.data_delayed ? 'Delayed data' : 'Real-time data', s.data_delayed ? 'warn' : 'ok');
     setChip('chip-autopilot', s.autopilot ? 'Autopilot on' : 'Approval required', s.autopilot ? 'ok' : 'warn');
+    setChip('chip-ai', AI_CHIP[s.decision_maker] || `AI: ${makerLabel(s.decision_maker)}`,
+      s.decision_warning ? 'warn' : s.decision_maker === 'consensus' ? 'ok' : null);
+    const decisionWarning = $('decision-warning');
+    decisionWarning.hidden = !s.decision_warning;
+    setText(decisionWarning, s.decision_warning || '');
+    const dataWarning = $('data-warning');
+    dataWarning.hidden = !s.data_warning;
+    setText(dataWarning, s.data_warning || '');
     setText($('last-cycle'), when(s.last_cycle_at));
     setText($('next-cycle'), s.running ? when(s.next_cycle_at) : 'Bot stopped');
     setText($('updated-at'), state.updatedAt ? fmtTimeSec.format(state.updatedAt) : DASH);
@@ -920,7 +940,7 @@
     if (!allowed) note = 'Set TRADER_ALLOW_LIVE=true on the server to allow arming.';
     else if (!live) note = 'Arming is only possible while a live IBKR account is connected.';
     else if (armed) note = 'Real orders are sent, and each one still passes the risk checks. Disarm at any time to go back to shadow mode.';
-    else note = 'Shadow mode: decisions are logged and orders are blocked. Arming needs a fresh 2FA code.';
+    else note = 'Shadow mode: decisions are logged and orders are blocked, including the bot\'s own exits (only stops held at IBKR still work). Arming needs a fresh 2FA code.';
     setText($('live-note'), note);
   }
 
@@ -944,11 +964,27 @@
     });
   }
 
+  /** Disarm also pauses the bot's own exits: say so when positions are open. */
+  function confirmDisarm() {
+    const positions = asList(state.data && state.data.positions).filter((p) => p && p.qty > 0);
+    if (!positions.length) return true;
+    const crypto = positions.some((p) => p.instrument && p.instrument.asset_class === 'CRYPTO');
+    return window.confirm(
+      `Disarm with ${positions.length} open position(s)?\n\n`
+      + 'Disarming blocks every order the bot would send, including its own exits: no '
+      + 'engine-side stops, no flatten before the close, no daily-loss flatten and no '
+      + 're-placed stops. Stock positions keep only their stop at IBKR'
+      + (crypto ? '; crypto positions have NO stop at all' : '')
+      + '. Manage or close them yourself (KILL closes everything).',
+    );
+  }
+
   async function disarmLive() {
+    if (!confirmDisarm()) return;
     await busy($('disarm-btn'), async () => {
       try {
         mergeStatus(await api('POST', '/api/live/disarm'));
-        toast('Live trading disarmed: orders are blocked (shadow mode).');
+        toast('Live trading disarmed: orders are blocked, including the bot\'s own exits (shadow mode).');
       } catch (err) {
         report(err, 'Could not disarm: ');
       } finally {
@@ -1231,8 +1267,28 @@
     ]);
   }
 
+  function voteList(name, decisions) {
+    return el('div', { class: 'vote' }, [
+      el('p', { class: 'vote-maker', text: `${makerLabel(name)} voted` }),
+      decisions.length
+        ? el('ul', { class: 'decision-list' }, decisions.map(decisionItem))
+        : el('p', { class: 'small muted', text: 'No decisions (HOLD on everything).' }),
+    ]);
+  }
+
+  function votesBlock(votes) {
+    const names = votes && typeof votes === 'object' ? Object.keys(votes) : [];
+    if (!names.length) return null;
+    const box = el('details', { class: 'more votes' }, [
+      el('summary', { text: 'How each model voted' }),
+      ...names.map((name) => voteList(name, asList(votes[name]))),
+    ]);
+    box.open = true;
+    return box;
+  }
+
   function decisionEntry(b) {
-    const maker = b.maker === 'claude' ? 'Claude' : b.maker === 'rules' ? 'Rules' : humanize(b.maker || 'unknown');
+    const maker = makerLabel(b.maker);
     const decisions = asList(b.decisions);
     const candidates = asList(b.candidates);
     const tokens = b.input_tokens || b.output_tokens
@@ -1249,6 +1305,7 @@
       decisions.length
         ? el('ul', { class: 'decision-list' }, decisions.map(decisionItem))
         : el('p', { class: 'small muted', text: 'No decisions in this cycle.' }),
+      votesBlock(b.votes),
       b.error ? el('p', { class: 'inline-error', text: `Error: ${b.error}` }) : null,
       candidates.length
         ? el('details', { class: 'more' }, [
@@ -1416,7 +1473,11 @@
       note: 'New York (market) time.',
       keys: ['stock_entry_start', 'stock_entry_cutoff', 'flatten_stocks_before_close'],
     },
-    { title: 'AI', keys: ['llm_enabled', 'llm_model', 'llm_effort', 'llm_min_candidate_score'] },
+    {
+      title: 'AI',
+      note: 'Consensus: a BUY needs Claude AND Grok to agree; either one can close a position. Leaving consensus needs a 2FA code.',
+      keys: ['llm_enabled', 'decision_mode', 'llm_model', 'llm_effort', 'llm_min_candidate_score'],
+    },
     {
       title: 'Risk limits',
       object: 'risk',
@@ -1453,12 +1514,16 @@
       label: 'Flatten stocks before the close',
       help: 'Day trades only: flat 10 minutes before the close. Turning it off needs a 2FA code.',
     },
-    llm_enabled: { label: 'Use Claude for decisions', help: 'Off: rules-only decisions.' },
-    llm_model: { label: 'Model', options: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'] },
-    llm_effort: { label: 'Effort', options: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    llm_enabled: { label: 'Use AI for decisions', help: 'Off: rules-only decisions, whatever the mode.' },
+    decision_mode: {
+      label: 'Decision mode', options: ['consensus', 'claude', 'grok', 'rules'],
+      help: 'consensus = Claude and Grok must both BUY (fewer trades; Grok adds about $0.02-0.03 per call: ~1.5x the AI cost with Opus, ~2x with Sonnet, ~20x with Haiku); claude / grok = one model alone; rules = no AI.',
+    },
+    llm_model: { label: 'Claude model', options: ['claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5'] },
+    llm_effort: { label: 'Claude effort', options: ['low', 'medium', 'high', 'xhigh', 'max'] },
     llm_min_candidate_score: {
       label: 'Minimum candidate score', min: 0, max: 1, step: 0.05,
-      help: 'Claude is only asked when a setup scores at least this (0 to 1).',
+      help: 'The AI is only asked when a setup scores at least this (0 to 1).',
     },
     'risk.daily_profit_target_usd': {
       label: 'Daily profit target', unit: '$', min: 0, help: 'Shown as progress only. It never increases risk.',
@@ -1487,7 +1552,7 @@
     },
     'risk.loss_streak_halve_after': { label: 'Halve size after', unit: 'losses in a row', int: true, min: 1 },
     'risk.llm_daily_budget_usd': {
-      label: 'AI budget per day', unit: '$', min: 0, help: 'Once spent, the bot falls back to rules-only decisions.',
+      label: 'AI budget per day', unit: '$', min: 0, help: 'AI spend per day, Claude and Grok together. Once spent, until tomorrow: in consensus mode no new entries (the rules only manage exits); with one model, rules-only decisions.',
     },
     'risk.flatten_on_halt': { label: 'Close everything at the loss limit' },
     'risk.max_spread_pct': { label: 'Max bid/ask spread', unit: '%', min: 0, positive: true },
@@ -1631,9 +1696,28 @@
       .filter((k) => !used.has(k))
       .map((k) => buildField(k, settings[k], FIELDS[k] || {}, caps))));
     $('settings-fields').replaceChildren(...groups.filter(Boolean));
-    $('llm-note').hidden = payload.llm_available !== false;
+    const note = aiNote(payload);
+    $('llm-note').hidden = !note;
+    setText($('llm-note'), note);
     $('settings-error').textContent = '';
     setDirty(false);
+  }
+
+  function aiNote(payload) {
+    const keys = payload.ai_keys || {};
+    const mode = payload.settings.decision_mode;
+    if (payload.llm_available === false || (!keys.claude && !keys.grok)) {
+      return 'No AI API key is configured on the server, so the bot makes rules-only decisions.';
+    }
+    if (mode === 'consensus' && !(keys.claude && keys.grok)) {
+      const have = keys.claude ? 'Claude' : 'Grok';
+      const missing = keys.claude ? 'xAI (Grok)' : 'Anthropic (Claude)';
+      return `Consensus needs both API keys. No ${missing} key is configured, so ${have} decides alone.`;
+    }
+    if ((mode === 'claude' && !keys.claude) || (mode === 'grok' && !keys.grok)) {
+      return `No ${mode === 'claude' ? 'Anthropic' : 'xAI'} API key is configured: rules-only decisions.`;
+    }
+    return '';
   }
 
   function setDirty(dirty) {

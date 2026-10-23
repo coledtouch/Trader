@@ -42,6 +42,9 @@ STALE_QUOTE_INTERVALS = 2  # a live quote older than this many monitor intervals
 DELAYED_QUOTE_GRACE = timedelta(minutes=15)  # extra age allowed for delayed-feed quotes
 RR_TOLERANCE = 1e-6
 CASH_TOLERANCE = 0.01  # dollars
+# A bid further than this from the last trade (or the mid without one) is treated as a bad
+# print: not used to value positions, trigger engine-side stops or the daily loss limit.
+MAX_BID_DEVIATION_PCT = {AssetClass.STOCK: 5.0, AssetClass.CRYPTO: 8.0}
 
 
 def clamp_limits(limits: RiskLimits) -> RiskLimits:
@@ -74,6 +77,37 @@ def max_position_value(limits: RiskLimits, equity: float) -> float:
 def position_value(pos: Position) -> float:
     price = pos.market_price if pos.market_price and pos.market_price > 0 else pos.avg_cost
     return max(0.0, pos.qty) * max(0.0, price)
+
+
+def quote_problem(quote: Quote) -> str | None:
+    """Why a quote looks wrong, or None when it is plausible. Crossed markets (bid above
+    ask) and bids far from the last trade / mid are typical of bad ticks, thin pre-market
+    books and stale feeds; acting on them would sell (or value the account) at a price
+    that is not really there."""
+    bid, ask = quote.bid, quote.ask
+    if bid is not None and ask is not None and bid > 0 and ask > 0 and bid > ask:
+        return f"crossed quote (bid {bid:g} > ask {ask:g})"
+    if bid is None or bid <= 0:
+        return None
+    ref = quote.last if quote.last and quote.last > 0 else quote.mid
+    if not ref:
+        return None
+    limit = MAX_BID_DEVIATION_PCT.get(quote.instrument.asset_class, 5.0)
+    deviation = abs(bid - ref) / ref * 100
+    if deviation > limit:
+        what = "locked quote" if ask is not None and abs(ask - bid) < 1e-12 else "bid"
+        basis = "last" if quote.last and quote.last > 0 else "mid"
+        return f"{what} {bid:g} is {deviation:.1f}% from the {basis} {ref:g} (max {limit:g}%)"
+    return None
+
+
+def sane_exit_price(quote: Quote | None) -> float | None:
+    """What a long could be sold for (the bid, else last/mid), or None when there is no
+    quote or it fails `quote_problem`."""
+    if quote is None or quote_problem(quote) is not None:
+        return None
+    price = quote.exit_price
+    return price if price is not None and math.isfinite(price) and price > 0 else None
 
 
 def working_buy_notional(open_orders: list[OrderRecord]) -> float:
@@ -295,6 +329,9 @@ class RiskManager:
                 reasons.append(f"quote for {sym} is stale ({age.total_seconds():.0f}s old)")
             if quote.halted:
                 reasons.append(f"{sym} is halted")
+            problem = quote_problem(quote)
+            if problem is not None:
+                reasons.append(f"quote for {sym} looks wrong: {problem}")
             spread = quote.spread_pct
             if spread is None and is_stock:
                 reasons.append(f"no two-sided quote for {sym}: cannot check the spread")

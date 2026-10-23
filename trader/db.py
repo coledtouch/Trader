@@ -28,6 +28,7 @@ from trader.models import (
     SetupStats,
     SignalRecord,
     TradeRecord,
+    exec_revision,
     utcnow,
 )
 
@@ -79,7 +80,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd REAL NOT NULL DEFAULT 0,
     refused INTEGER NOT NULL DEFAULT 0,
-    error TEXT
+    error TEXT,
+    votes TEXT
 );
 CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,6 +154,10 @@ CREATE INDEX IF NOT EXISTS idx_signals_eval ON signals(evaluated, ts);
 """
 
 
+# (table, column, declaration) added after the first release; applied at startup.
+MIGRATIONS: tuple[tuple[str, str, str], ...] = (("decisions", "votes", "TEXT"),)
+
+
 def _iso(dt: datetime | None) -> str | None:
     if dt is None:
         return None
@@ -184,6 +190,14 @@ class Database:
                 self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Columns added after the first release (CREATE TABLE IF NOT EXISTS skips them)."""
+        for table, column, decl in MIGRATIONS:
+            names = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            if column not in names:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def close(self) -> None:
         with self._lock:
@@ -345,8 +359,8 @@ class Database:
     def insert_decision(self, batch: DecisionBatch) -> int:
         cur = self._exec(
             "INSERT INTO decisions(ts, maker, model, market_view, decisions, candidates,"
-            " input_tokens, output_tokens, cost_usd, refused, error)"
-            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " input_tokens, output_tokens, cost_usd, refused, error, votes)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 _iso(batch.ts),
                 batch.maker,
@@ -359,6 +373,14 @@ class Database:
                 batch.cost_usd,
                 1 if batch.refused else 0,
                 batch.error,
+                json.dumps(
+                    {
+                        maker: [d.model_dump(mode="json") for d in decisions]
+                        for maker, decisions in batch.votes.items()
+                    }
+                )
+                if batch.votes
+                else None,
             ),
         )
         return int(cur.lastrowid)
@@ -379,6 +401,7 @@ class Database:
                 cost_usd=r["cost_usd"],
                 refused=bool(r["refused"]),
                 error=r["error"],
+                votes=json.loads(r["votes"]) if r["votes"] else {},
             )
             for r in rows
         ]
@@ -473,7 +496,17 @@ class Database:
 
     # ------------------------------------------------------------------ fills
     def insert_fill(self, fill: Fill) -> bool:
-        """Store a fill. Returns False if this exec_id was already recorded."""
+        """Store a fill. Returns False if this exec_id was already recorded, or when a later
+        revision of the same execution (an IBKR correction) is already stored."""
+        with self._lock:
+            revision = exec_revision(fill.exec_id)
+            if revision is not None and any(
+                rev >= revision[1] for _, rev in self._revisions(revision[0])
+            ):
+                return False
+            return self._insert_fill(fill)
+
+    def _insert_fill(self, fill: Fill) -> bool:
         cur = self._exec(
             "INSERT OR IGNORE INTO fills(exec_id, broker_order_id, instrument, side, qty, price,"
             " commission, ts) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
@@ -490,6 +523,42 @@ class Database:
         )
         return cur.rowcount == 1
 
+    def _revisions(self, base: str) -> list[tuple[Fill, int]]:
+        """Stored fills that are revisions of the execution `base` (see exec_revision)."""
+        rows = self._all("SELECT * FROM fills WHERE exec_id LIKE ?", (base + ".%",))
+        out: list[tuple[Fill, int]] = []
+        for row in rows:
+            fill = self._fill_from_row(row)
+            revision = exec_revision(fill.exec_id)
+            if revision is not None and revision[0] == base:
+                out.append((fill, revision[1]))
+        return out
+
+    def correct_fill(self, fill: Fill) -> Fill | None:
+        """Apply an IBKR execution correction: when `fill` is a later revision of a stored
+        execution (same id up to the last period), it replaces every earlier revision and
+        the replaced fill is returned (the latest of them). None when it corrects nothing,
+        e.g. a new execution, a non-IBKR id or a revision already stored."""
+        revision = exec_revision(fill.exec_id)
+        if revision is None:
+            return None
+        base, number = revision
+        with self._lock:
+            stored = self._revisions(base)
+            older = [(f, rev) for f, rev in stored if rev < number]
+            if not older or any(rev >= number for _, rev in stored):
+                return None
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                for old, _ in older:
+                    self._conn.execute("DELETE FROM fills WHERE exec_id = ?", (old.exec_id,))
+                self._insert_fill(fill)
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._conn.execute("COMMIT")
+            return max(older, key=lambda item: item[1])[0]
+
     def update_fill_commission(self, exec_id: str, commission: float) -> None:
         self._exec("UPDATE fills SET commission = ? WHERE exec_id = ?", (commission, exec_id))
 
@@ -501,19 +570,20 @@ class Database:
                 "SELECT * FROM fills WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
                 (_iso(since), limit),
             )
-        return [
-            Fill(
-                exec_id=r["exec_id"],
-                broker_order_id=r["broker_order_id"],
-                instrument=Instrument.from_key(r["instrument"]),
-                side=r["side"],
-                qty=r["qty"],
-                price=r["price"],
-                commission=r["commission"],
-                ts=_dt(r["ts"]),
-            )
-            for r in rows
-        ]
+        return [self._fill_from_row(r) for r in rows]
+
+    @staticmethod
+    def _fill_from_row(r: sqlite3.Row) -> Fill:
+        return Fill(
+            exec_id=r["exec_id"],
+            broker_order_id=r["broker_order_id"],
+            instrument=Instrument.from_key(r["instrument"]),
+            side=r["side"],
+            qty=r["qty"],
+            price=r["price"],
+            commission=r["commission"],
+            ts=_dt(r["ts"]),
+        )
 
     # ------------------------------------------------------------------ position metadata
     def set_position_meta(

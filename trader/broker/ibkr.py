@@ -66,6 +66,7 @@ from trader.models import (
     Position,
     Quote,
     Side,
+    exec_revision,
     utcnow,
 )
 
@@ -74,10 +75,18 @@ logger = logging.getLogger(__name__)
 # Error codes: https://www.interactivebrokers.com/campus/ibkr-api-page/tws-api-error-codes/
 CONNECTIVITY_LOST_CODES = frozenset({1100, 2110})  # gateway <-> IBKR servers link is down
 CONNECTIVITY_RESTORED_CODES = frozenset({1101, 1102})  # 1101 = restored, subscriptions lost
-DELAYED_DATA_CODES = frozenset({10167, 354})  # delayed data shown / not subscribed
+DATA_LOST_CODE = 1101
+DELAYED_DATA_CODE = 10167  # not subscribed: delayed data shown for this instrument
+NOT_SUBSCRIBED_CODE = 354  # not subscribed: no data at all for this instrument
 FARM_BROKEN_CODES = frozenset({2103, 2105, 2157})
 CANCEL_CONFIRM_CODE = 202  # "Order Canceled - reason: ..." (a cancel, not a rejection)
 CONTRACT_UNKNOWN_CODE = 200  # "No security definition has been found"
+# "No market data during competing live session": the paper and live logins share one set
+# of market data subscriptions and only one session gets the data. While the owner is logged
+# in to the live account elsewhere (TWS, IBKR Mobile, Client Portal), the bot's quotes for
+# the affected symbols are unusable: possibly stale prices on a ticker that stopped updating.
+COMPETING_SESSION_CODE = 10197
+COMPETING_WARN_SECONDS = 900.0  # keep the dashboard warning this long after the last 10197
 
 PENDING_IB_STATES = frozenset({"PendingSubmit", "ApiPending"})
 WORKING_IB_STATES = frozenset(
@@ -317,6 +326,10 @@ class ContractNotFound(BrokerError):
     """IBKR does not know the instrument (an ordinary rejection, not a connectivity error)."""
 
 
+class MarketDataUnavailable(BrokerError):
+    """IBKR delivers no usable market data for the instrument right now (error 10197)."""
+
+
 class _Reject(Exception):
     """Internal: the order request cannot be sent; becomes a REJECTED OrderRecord."""
 
@@ -364,8 +377,15 @@ class IBKRBroker(Broker):
         self._contracts: dict[str, _ContractInfo] = {}
         self._tickers: OrderedDict[str, _TickerSub] = OrderedDict()
         self._upstream_lost_at: float | None = None
-        self._delayed_seen = False
+        # Error 1101 ("connectivity restored - data lost"): IB dropped every subscription
+        # (account updates, positions, the account summary, market data), so the cached
+        # account and positions are frozen. Nothing is trusted until a full reconnect.
+        self._resync_needed = False
         self._delayed_keys: set[str] = set()
+        # instrument key -> wall-clock time of the last error 10197 for it
+        self._no_data: dict[str, datetime] = {}
+        self._competing_at: datetime | None = None
+        self._clock: Callable[[], datetime] = utcnow  # wall clock, comparable to Ticker.time
         self._requests: dict[int, OrderRequest] = {}  # orderId -> request placed by us
         self._perm_ids: dict[int, int] = {}  # orderId -> permId (survives ib_async resets)
         self._cancel_requested: set[int] = set()
@@ -378,12 +398,20 @@ class IBKRBroker(Broker):
         async with self._connect_lock:
             if self._ib.isConnected():
                 if self._account is not None:
-                    if self._upstream_lost_at is None:
+                    if self._resync_needed:
+                        logger.warning(
+                            "IBKR restored its link but lost the data subscriptions (1101); "
+                            "reconnecting to resync account, positions and orders"
+                        )
+                    elif self._upstream_lost_at is None:
                         return
-                    lost_for = time.monotonic() - self._upstream_lost_at
-                    if lost_for < self.UPSTREAM_GRACE:
-                        raise BrokerError("IB Gateway is up but has lost its link to IBKR servers")
-                    logger.warning("IBKR link still down after %.0fs; reconnecting", lost_for)
+                    else:
+                        lost_for = time.monotonic() - self._upstream_lost_at
+                        if lost_for < self.UPSTREAM_GRACE:
+                            raise BrokerError(
+                                "IB Gateway is up but has lost its link to IBKR servers"
+                            )
+                        logger.warning("IBKR link still down after %.0fs; reconnecting", lost_for)
                 self._safe_disconnect()
             self._syncing = True
             try:
@@ -458,8 +486,9 @@ class IBKRBroker(Broker):
     def _reset_session(self) -> None:
         self._tickers.clear()
         self._upstream_lost_at = None
-        self._delayed_seen = False
+        self._resync_needed = False
         self._delayed_keys.clear()
+        self._no_data.clear()  # a new session re-subscribes; IB repeats 10197 if it still applies
 
     @property
     def connected(self) -> bool:
@@ -468,6 +497,7 @@ class IBKRBroker(Broker):
             and not self._syncing
             and self._account is not None
             and self._upstream_lost_at is None
+            and not self._resync_needed
         )
 
     @property
@@ -478,11 +508,34 @@ class IBKRBroker(Broker):
 
     @property
     def data_delayed(self) -> bool:
-        return self._config.ib_market_data_type in (3, 4) or self._delayed_seen
+        """The whole feed is delayed (market data type 3/4). Delayed data for a single
+        instrument (error 10167) is reported on its quotes instead (Quote.delayed)."""
+        return self._config.ib_market_data_type in (3, 4)
+
+    @property
+    def data_warning(self) -> str | None:
+        """Error 10197 seen recently: which symbols have no usable data and what to do."""
+        now = self._clock()
+
+        def recent(at: datetime) -> bool:
+            return (now - at).total_seconds() < COMPETING_WARN_SECONDS
+
+        symbols = sorted(k.split(":", 1)[-1] for k, at in self._no_data.items() if recent(at))
+        if not symbols and not (self._competing_at and recent(self._competing_at)):
+            return None
+        shown = ", ".join(symbols[:8]) + (f" +{len(symbols) - 8} more" if len(symbols) > 8 else "")
+        return (
+            "IBKR error 10197: no market data while another session of this login holds it "
+            "(the live account in TWS, IBKR Mobile or Client Portal)"
+            + (f"; no entries for {shown}" if shown else "")
+            + ". Log out of the other session to restore data."
+        )
 
     def _require_connected(self) -> str:
         if self._syncing or self._account is None or not self._ib.isConnected():
             raise BrokerError("not connected to IB Gateway")
+        if self._resync_needed:
+            raise BrokerError("IBKR data was lost (error 1101): waiting for a reconnect")
         return self._account
 
     # ------------------------------------------------------------------ events
@@ -501,15 +554,50 @@ class IBKRBroker(Broker):
             logger.warning("IBKR connectivity lost (code %d): %s", code, message)
         elif code in CONNECTIVITY_RESTORED_CODES:
             self._upstream_lost_at = None
-            if code == 1101:  # market data subscriptions were lost; resubscribe lazily
+            if code == DATA_LOST_CODE:
+                # Every subscription is gone, including account updates and positions that
+                # ib_async does not resubmit on 1101: `connected` stays False until connect()
+                # has reconnected, which re-runs all of ib_async's startup syncs.
                 self._tickers.clear()
-            logger.info("IBKR connectivity restored (code %d)", code)
-        elif code in DELAYED_DATA_CODES:
-            self._delayed_seen = True
+                self._resync_needed = True
+                logger.warning("IBKR connectivity restored but data lost (code %d)", code)
+            else:
+                logger.info("IBKR connectivity restored (code %d)", code)
+        elif code == COMPETING_SESSION_CODE:
+            now = self._clock()
+            self._competing_at = now
             inst = instrument_from_contract(contract)
-            if inst is not None:
-                self._delayed_keys.add(inst.key)
-            logger.info("IBKR market data delayed/unsubscribed (code %d): %s", code, message)
+            # Without a contract the request is unknown: treat every subscription as affected.
+            keys = [inst.key] if inst is not None else list(self._tickers)
+            for key in keys:
+                self._no_data[key] = now
+            logger.warning(
+                "IBKR has no market data for %s: a competing live session holds it (code %d)",
+                ", ".join(keys) or "an unknown request",
+                code,
+            )
+        elif code == DELAYED_DATA_CODE:
+            # Delayed data for this instrument only: its quotes carry delayed=True (which
+            # blocks LIVE stock entries in it), other instruments are unaffected. Without a
+            # contract the request is unknown: every current subscription is marked.
+            inst = instrument_from_contract(contract)
+            keys = [inst.key] if inst is not None else list(self._tickers)
+            self._delayed_keys.update(keys)
+            logger.info(
+                "IBKR shows delayed market data for %s (code %d)",
+                ", ".join(keys) or "an unknown request",
+                code,
+            )
+        elif code == NOT_SUBSCRIBED_CODE:
+            # No data at all (not delayed data): the quote stays empty, so entries in it are
+            # blocked as "no quote" while every other instrument trades normally.
+            inst = instrument_from_contract(contract)
+            logger.warning(
+                "IBKR market data not subscribed for %s (code %d): %s",
+                inst.key if inst is not None else "a request",
+                code,
+                message,
+            )
         elif code == CONTRACT_UNKNOWN_CODE and contract is not None:
             inst = instrument_from_contract(contract)
             if inst is not None:
@@ -675,17 +763,20 @@ class IBKRBroker(Broker):
         info = await self._contract_info(instrument)
         key = instrument.key
         sub = self._tickers.get(key)
-        stale = (
-            sub is not None
-            and not self._has_data(sub.ticker)
-            and time.monotonic() - sub.started > self.TICKER_RETRY_AFTER
-        )
-        if sub is None or stale:
+        blocked_at = self._no_data.get(key)
+        retry_due = sub is not None and time.monotonic() - sub.started > self.TICKER_RETRY_AFTER
+        stale = sub is not None and not self._has_data(sub.ticker) and retry_due
+        if sub is None or stale or (blocked_at is not None and retry_due):
+            # (10197: re-subscribe now and then to find out whether the data is back)
             sub = self._subscribe(key, info.contract)
-            await _wait_until(lambda: self._has_data(sub.ticker), self.QUOTE_TIMEOUT)
+            await _wait_until(
+                lambda: self._has_data(sub.ticker) or self._no_data.get(key) != blocked_at,
+                self.QUOTE_TIMEOUT,
+            )
         else:
             self._tickers.move_to_end(key)
         ticker = sub.ticker
+        self._check_competing(instrument, ticker)
         ts = ticker.time if isinstance(ticker.time, datetime) else utcnow()
         delayed = (
             self._config.ib_market_data_type in (3, 4)
@@ -702,6 +793,27 @@ class IBKRBroker(Broker):
             ts=ts if ts.tzinfo else ts.replace(tzinfo=UTC),
             delayed=delayed,
             halted=_is_halted(ticker.halted),
+        )
+
+    def _check_competing(self, instrument: Instrument, ticker: Ticker) -> None:
+        """Raise MarketDataUnavailable while error 10197 applies to the instrument: data is
+        usable again only once a tick arrives after the last 10197."""
+        key = instrument.key
+        blocked_at = self._no_data.get(key)
+        if blocked_at is None:
+            return
+        tick = ticker.time if isinstance(ticker.time, datetime) else None
+        if tick is not None and self._has_data(ticker):
+            tick = tick if tick.tzinfo else tick.replace(tzinfo=UTC)
+            if tick > blocked_at:
+                del self._no_data[key]
+                if not self._no_data:
+                    self._competing_at = None  # every affected symbol has data again
+                logger.info("IBKR market data for %s is flowing again", key)
+                return
+        raise MarketDataUnavailable(
+            f"no IBKR market data for {instrument.symbol}: another session of this login "
+            "holds it (error 10197)"
         )
 
     async def bars(
@@ -1004,12 +1116,26 @@ class IBKRBroker(Broker):
         order_id = _to_int(broker_order_id)
         if not order_id:
             return None
-        perm = self._perm_ids.get(order_id)
+        perm = self._perm_ids.get(order_id) or self._perm_from_executions(order_id)
         for trade in trades:
             if (self._is_own(trade.order) and trade.order.orderId == order_id) or (
                 perm and trade.order.permId == perm
             ):
                 return trade
+        return None
+
+    def _perm_from_executions(self, order_id: int) -> int | None:
+        """The permId of one of our orders, from the executions ib_async loads at connect.
+
+        An order that completed while this process was down comes back only as a completed
+        order, which IBKR reports without orderId/clientId (ib_async keys it by permId), and
+        the orderId -> permId map of the previous process is gone. Its executions still carry
+        all three ids, so a filled order is found again instead of being marked cancelled."""
+        for fill in self._ib.fills():
+            ex = fill.execution
+            if ex.orderId == order_id and ex.clientId == self._client_id and ex.permId:
+                self._perm_ids[order_id] = ex.permId
+                return ex.permId
         return None
 
     def _request_for(self, trade: Trade) -> OrderRequest | None:
@@ -1133,7 +1259,14 @@ class IBKRBroker(Broker):
                 commission=_commission(report.commission),
                 ts=ts.astimezone(UTC),
             )
-        return sorted(fills.values(), key=lambda f: f.ts)
+        # A corrected execution repeats the id with a higher revision: keep only the latest
+        # (the journal replaces an earlier revision it already stored, see exec_revision).
+        latest: dict[str, tuple[int, Fill]] = {}
+        for fill in fills.values():
+            base, rev = exec_revision(fill.exec_id) or (fill.exec_id, 0)
+            if base not in latest or latest[base][0] < rev:
+                latest[base] = (rev, fill)
+        return sorted((fill for _, fill in latest.values()), key=lambda f: f.ts)
 
     # ------------------------------------------------------------------ capabilities
     def supports_native_stops(self, instrument: Instrument) -> bool:

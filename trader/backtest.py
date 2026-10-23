@@ -394,7 +394,9 @@ class _Backtest:
             * min(self.config.risk_pct, HARD_CAPS["max_risk_per_trade_pct"])
             / 100
         )
-        if self.loss_streak >= lim.loss_streak_halve_after:
+        if self.loss_streak >= min(
+            lim.loss_streak_halve_after, HARD_CAPS["loss_streak_halve_after"]
+        ):
             risk_usd *= 0.5
         position_pct = min(lim.max_position_pct, HARD_CAPS["max_position_pct"])
         exposure_pct = min(lim.max_total_exposure_pct, HARD_CAPS["max_total_exposure_pct"])

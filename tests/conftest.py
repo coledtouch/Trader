@@ -26,5 +26,6 @@ def config(tmp_path: Path) -> AppConfig:
         broker="sim",
         allow_live=False,
         anthropic_api_key=None,
+        xai_api_key=None,
         ntfy_url=None,
     )

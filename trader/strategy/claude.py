@@ -17,28 +17,27 @@ dropped and logged. Failure handling (fail safe, never a BUY on a failure):
 from __future__ import annotations
 
 import logging
-import math
 from dataclasses import dataclass
-from typing import Any, Literal, NamedTuple
+from typing import Any, NamedTuple
 
 import anthropic
 from anthropic import AsyncAnthropic
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, ValidationError
 
-from trader.models import (
-    HARD_CAPS,
-    AIDecision,
-    AssetClass,
-    Candidate,
-    DecisionBatch,
-    DecisionContext,
-    Instrument,
-    OrderType,
-    Position,
-    RiskLimits,
-    TradeAction,
+from trader.models import DecisionBatch, DecisionContext
+from trader.strategy.common import (
+    CHARS_PER_TOKEN,
+    MAX_MARKET_VIEW,
+    DecisionRejected,
+    ModelDecision,
+    ModelDecisions,
+    clip,
+    convert_decisions,
+    dropped_error,
+    exits_only,
+    failed_batch,
 )
-from trader.strategy.decide import RR_TOLERANCE, DecisionMaker, reward_risk
+from trader.strategy.decide import DecisionMaker
 from trader.strategy.prompts import SYSTEM_PROMPT, render_context
 
 log = logging.getLogger(__name__)
@@ -52,10 +51,16 @@ MAX_RETRIES = 2
 # Anthropic recommends for the refusal category, inside the same call.
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 TRANSIENT_STATUS = frozenset({408, 409, 429})
-MAX_RATIONALE = 400
-MAX_MARKET_VIEW = 600
-# Conservative characters-per-token used to estimate the cost of a call whose usage was lost.
-CHARS_PER_TOKEN = 3
+# The system prompt is cached for an hour: decision cycles are often more than 5 minutes
+# apart (the LLM is skipped when nothing qualifies), so a 5-minute entry would expire.
+# A 1-hour write costs 2x the base input price (5-minute: 1.25x), reads are unchanged.
+CACHE_CONTROL = {"type": "ephemeral", "ttl": "1h"}
+
+# The model-facing schema and validation are shared with the Grok maker; the old names stay.
+ClaudeDecision = ModelDecision
+ClaudeDecisions = ModelDecisions
+_Rejected = DecisionRejected
+_clip = clip
 
 
 # ---------------------------------------------------------------------- pricing
@@ -66,16 +71,17 @@ class ModelPrice:
     input: float
     output: float
     cache_read: float
-    cache_write: float  # 5-minute cache writes (the default ephemeral TTL used here)
+    cache_write: float  # 5-minute cache writes (1.25x input)
+    cache_write_1h: float  # 1-hour cache writes (2x input), what this maker requests
 
 
 PRICES: dict[str, ModelPrice] = {
-    "claude-opus-5-5": ModelPrice(4.0, 20.0, 0.20, 5.0),
-    "claude-sonnet-5-5": ModelPrice(2.0, 10.0, 0.20, 2.5),
-    "claude-haiku-5-5": ModelPrice(0.10, 0.50, 0.01, 0.125),
+    "claude-opus-5-5": ModelPrice(4.0, 20.0, 0.20, 5.0, 8.0),
+    "claude-sonnet-5-5": ModelPrice(2.0, 10.0, 0.20, 2.5, 4.0),
+    "claude-haiku-5-5": ModelPrice(0.10, 0.50, 0.01, 0.125, 0.20),
     # Likely targets of the server-side refusal fallback.
-    "claude-opus-5": ModelPrice(5.0, 25.0, 0.50, 6.25),
-    "claude-opus-4-8": ModelPrice(5.0, 25.0, 0.50, 6.25),
+    "claude-opus-5": ModelPrice(5.0, 25.0, 0.50, 6.25, 10.0),
+    "claude-opus-4-8": ModelPrice(5.0, 25.0, 0.50, 6.25, 10.0),
 }
 
 
@@ -93,15 +99,32 @@ def estimate_cost(
     output_tokens: int,
     cache_read_tokens: int = 0,
     cache_write_tokens: int = 0,
+    cache_write_1h_tokens: int = 0,
 ) -> float:
-    """USD cost of one API attempt. `input_tokens` excludes cached tokens, as in `usage`."""
+    """USD cost of one API attempt. `input_tokens` excludes cached tokens, as in `usage`;
+    `cache_write_tokens` are 5-minute writes and `cache_write_1h_tokens` 1-hour writes."""
     p = model_price(model)
     return (
         input_tokens * p.input
         + output_tokens * p.output
         + cache_read_tokens * p.cache_read
         + cache_write_tokens * p.cache_write
+        + cache_write_1h_tokens * p.cache_write_1h
     ) / 1_000_000
+
+
+def _cache_writes(attempt: Any) -> tuple[int, int, int]:
+    """(all cache-write tokens, 5-minute writes, 1-hour writes) for one usage record.
+
+    `usage.cache_creation` splits writes by TTL. Without that breakdown (or for tokens it
+    does not explain) the writes are charged as 1-hour writes, the dearer TTL and the only
+    one this maker requests, so the budget errs on the safe side."""
+    total = getattr(attempt, "cache_creation_input_tokens", 0) or 0
+    split = getattr(attempt, "cache_creation", None)
+    five = getattr(split, "ephemeral_5m_input_tokens", None) or 0
+    hour = getattr(split, "ephemeral_1h_input_tokens", None) or 0
+    hour += max(0, total - five - hour)
+    return max(total, five + hour), five, hour
 
 
 def usage_cost(usage: Any, model: str) -> tuple[int, int, float]:
@@ -122,10 +145,12 @@ def usage_cost(usage: Any, model: str) -> tuple[int, int, float]:
         fresh = getattr(attempt, "input_tokens", 0) or 0
         out = getattr(attempt, "output_tokens", 0) or 0
         read = getattr(attempt, "cache_read_input_tokens", 0) or 0
-        write = getattr(attempt, "cache_creation_input_tokens", 0) or 0
+        write, write_5m, write_1h = _cache_writes(attempt)
         prompt_tokens += fresh + read + write
         output_tokens += out
-        cost += estimate_cost(getattr(attempt, "model", None) or model, fresh, out, read, write)
+        cost += estimate_cost(
+            getattr(attempt, "model", None) or model, fresh, out, read, write_5m, write_1h
+        )
     return prompt_tokens, output_tokens, cost
 
 
@@ -139,31 +164,6 @@ class _Spend(NamedTuple):
 def _spend(response: Any, requested_model: str) -> _Spend:
     model = getattr(response, "model", None) or requested_model
     return _Spend(model, *usage_cost(response.usage, model))
-
-
-# ---------------------------------------------------------------------- output schema
-class ClaudeDecision(BaseModel):
-    """One decision as Claude writes it. Ranges and levels are validated after parsing."""
-
-    action: Literal["BUY", "CLOSE", "HOLD"]
-    symbol: str = Field(description="Symbol exactly as in the context, e.g. AAPL or BTC")
-    asset_class: Literal["STK", "CRYPTO"]
-    conviction: float = Field(description="Confidence in the edge, 0 to 1")
-    limit_price: float | None = Field(description="BUY limit in USD; null = current price")
-    stop_loss: float | None = Field(description="BUY stop in USD, below entry; else null")
-    take_profit: float | None = Field(description="BUY target in USD, above entry; else null")
-    size_fraction: float = Field(description="0 to 1 of the maximum allowed size; 1 if not BUY")
-    setup: str | None = Field(description="Candidate setup name for BUY, else position setup")
-    rationale: str = Field(description="At most two short sentences")
-
-
-class ClaudeDecisions(BaseModel):
-    market_view: str = Field(description="One or two sentences on conditions")
-    decisions: list[ClaudeDecision]
-
-
-class _Rejected(Exception):
-    """A single decision failed validation; the message says why."""
 
 
 # ---------------------------------------------------------------------- maker
@@ -246,10 +246,10 @@ class ClaudeDecisionMaker:
             "model": self.model,
             "max_tokens": MAX_TOKENS,
             "system": [
-                {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
+                {"type": "text", "text": SYSTEM_PROMPT, "cache_control": dict(CACHE_CONTROL)}
             ],
             "messages": [{"role": "user", "content": user_text}],
-            "output_format": ClaudeDecisions,
+            "output_format": ModelDecisions,
             "output_config": {"effort": self.effort},
         }
         # Haiku has no server-side fallback; the docs say not to send the parameter.
@@ -280,23 +280,21 @@ class ClaudeDecisionMaker:
         parsed = response.parsed_output
         if parsed is None:
             return self._failed(ctx, "response contained no structured output", spend=spend)
-        output = ClaudeDecisions.model_validate(
+        output = ModelDecisions.model_validate(
             parsed.model_dump() if isinstance(parsed, BaseModel) else parsed
         )
-        decisions, dropped = convert_decisions(output, ctx)
+        decisions, dropped = convert_decisions(output, ctx, source="Claude")
         return DecisionBatch(
             ts=ctx.now,
             maker=self.name,
             model=spend.model,
-            market_view=_clip(output.market_view, MAX_MARKET_VIEW),
+            market_view=clip(output.market_view, MAX_MARKET_VIEW),
             decisions=decisions,
             candidates=ctx.candidates,
             input_tokens=spend.prompt_tokens,
             output_tokens=spend.output_tokens,
             cost_usd=spend.cost,
-            error=f"dropped {len(dropped)} invalid decision(s): " + "; ".join(dropped)
-            if dropped
-            else None,
+            error=dropped_error(dropped),
         )
 
     def _failed(
@@ -309,137 +307,27 @@ class ClaudeDecisionMaker:
     ) -> DecisionBatch:
         """A batch with no decisions (fail safe), still carrying whatever the call cost."""
         spend = spend or _Spend(self.model, 0, 0, 0.0)
-        return DecisionBatch(
-            ts=ctx.now,
-            maker=self.name,
-            model=spend.model,
-            candidates=ctx.candidates,
-            input_tokens=spend.prompt_tokens,
-            output_tokens=spend.output_tokens,
-            cost_usd=spend.cost,
+        return failed_batch(
+            ctx,
+            self.name,
+            spend.model,
+            error,
             refused=refused,
-            error=error,
+            prompt_tokens=spend.prompt_tokens,
+            output_tokens=spend.output_tokens,
+            cost=spend.cost,
         )
 
     async def _exits_only(self, ctx: DecisionContext, error: str) -> DecisionBatch:
         """Transient outage: keep the fallback's risk-reducing CLOSEs, never its BUYs."""
-        fallback_name = self.fallback.name
-        try:
-            batch = await self.fallback.decide(ctx)
-        except Exception:
-            log.exception("fallback decision maker failed")
-            return self._failed(ctx, f"{error}; {fallback_name} fallback failed")
-        exits = [d for d in batch.decisions if d.action == TradeAction.CLOSE]
-        return DecisionBatch(
-            ts=ctx.now,
+        return await exits_only(
+            ctx,
             maker=self.name,
             model=self.model,
-            market_view=f"Claude unavailable; {fallback_name} exits only, no new entries.",
-            decisions=exits,
-            candidates=ctx.candidates,
-            error=f"{error}; used {fallback_name} exits only",
+            label="Claude",
+            fallback=self.fallback,
+            error=error,
         )
-
-
-# ---------------------------------------------------------------------- validation
-def convert_decisions(
-    output: ClaudeDecisions, ctx: DecisionContext
-) -> tuple[list[AIDecision], list[str]]:
-    """Validate Claude's decisions against the context. Returns (kept, reasons for drops)."""
-    candidates: dict[str, list[Candidate]] = {}
-    for cand in ctx.candidates:
-        candidates.setdefault(cand.instrument.key, []).append(cand)
-    held = {p.instrument.key: p for p in ctx.positions if p.qty > 0}
-    kept: list[AIDecision] = []
-    dropped: list[str] = []
-    acted: set[str] = set()
-    for raw in output.decisions:
-        label = f"{raw.action} {_clip(raw.symbol, 20)}"
-        try:
-            decision = _convert_one(raw, candidates, held, ctx.limits)
-            key = Instrument(symbol=decision.symbol, asset_class=decision.asset_class).key
-            if decision.action != TradeAction.HOLD:
-                if key in acted:
-                    raise _Rejected("more than one BUY/CLOSE for this instrument")
-                acted.add(key)
-        except (_Rejected, ValidationError) as exc:
-            reason = str(exc) if isinstance(exc, _Rejected) else "invalid field values"
-            log.warning("dropping Claude decision %s: %s", label, reason)
-            dropped.append(f"{label} ({reason})")
-            continue
-        kept.append(decision)
-    return kept, dropped
-
-
-def _convert_one(
-    raw: ClaudeDecision,
-    candidates: dict[str, list[Candidate]],
-    held: dict[str, Position],
-    limits: RiskLimits,
-) -> AIDecision:
-    symbol = raw.symbol.strip().upper()
-    if not symbol:
-        raise _Rejected("empty symbol")
-    asset_class = AssetClass(raw.asset_class)
-    key = Instrument(symbol=symbol, asset_class=asset_class).key
-    action = TradeAction(raw.action)
-    rationale = _clip(raw.rationale, MAX_RATIONALE)
-    if action != TradeAction.BUY:
-        pos = held.get(key)
-        if action == TradeAction.CLOSE and pos is None:
-            raise _Rejected("no open position to close")
-        conviction = min(max(raw.conviction, 0.0), 1.0) if math.isfinite(raw.conviction) else 0.0
-        return AIDecision(
-            action=action,
-            symbol=symbol,
-            asset_class=asset_class,
-            conviction=conviction,
-            order_type=OrderType.MARKET if action == TradeAction.CLOSE else OrderType.LIMIT,
-            setup=pos.setup if pos else None,
-            rationale=rationale,
-        )
-
-    cands = candidates.get(key)
-    if not cands:
-        raise _Rejected("not in the candidate list")
-    if key in held:
-        raise _Rejected("already holding this instrument")
-    if not 0 <= raw.conviction <= 1:
-        raise _Rejected(f"conviction {raw.conviction} outside 0..1")
-    if not 0 < raw.size_fraction <= 1:
-        raise _Rejected(f"size_fraction {raw.size_fraction} outside (0, 1]")
-    cand = next((c for c in cands if c.setup == raw.setup), max(cands, key=lambda c: c.score))
-    limit = raw.limit_price
-    if limit is not None:
-        if not (math.isfinite(limit) and limit > 0):
-            raise _Rejected(f"invalid limit_price {limit}")
-        # Gross-error guard only; the risk manager applies the real collar against the quote.
-        max_gap = HARD_CAPS["price_collar_pct"] / 100
-        if abs(limit - cand.price) > cand.price * max_gap:
-            raise _Rejected(f"limit_price {limit} too far from candidate price {cand.price}")
-    entry = limit if limit is not None else cand.price
-    if raw.stop_loss is None or raw.take_profit is None:
-        raise _Rejected("BUY needs both stop_loss and take_profit")
-    rr = reward_risk(entry, raw.stop_loss, raw.take_profit)
-    if rr is None:
-        raise _Rejected(
-            f"invalid levels stop {raw.stop_loss} / entry {entry} / target {raw.take_profit}"
-        )
-    if rr < limits.min_reward_risk - RR_TOLERANCE:
-        raise _Rejected(f"reward:risk {rr:.2f} below minimum {limits.min_reward_risk:.2f}")
-    return AIDecision(
-        action=TradeAction.BUY,
-        symbol=symbol,
-        asset_class=asset_class,
-        conviction=raw.conviction,
-        order_type=OrderType.LIMIT,
-        limit_price=limit,
-        stop_loss=raw.stop_loss,
-        take_profit=raw.take_profit,
-        size_fraction=raw.size_fraction,
-        setup=cand.setup,
-        rationale=rationale,
-    )
 
 
 # ---------------------------------------------------------------------- helpers
@@ -453,12 +341,7 @@ def _is_transient(exc: Exception) -> bool:
 
 def _describe(exc: Exception) -> str:
     """Short, secret-free description of an SDK error for logs and the journal."""
-    text = f"{type(exc).__name__}: {_clip(str(getattr(exc, 'message', exc)), 200)}"
+    text = f"{type(exc).__name__}: {clip(str(getattr(exc, 'message', exc)), 200)}"
     if isinstance(exc, anthropic.APIStatusError):
         text += f" (HTTP {exc.status_code}, request {exc.request_id or '-'})"
     return text
-
-
-def _clip(text: str, limit: int) -> str:
-    text = " ".join(text.split())
-    return text if len(text) <= limit else text[: limit - 3] + "..."

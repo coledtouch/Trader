@@ -1,7 +1,7 @@
-# Your setup checklist: IBKR, market data, Claude, alerts
+# Your setup checklist: IBKR, market data, Claude, Grok, alerts
 
-This page picks up from where you are now. Tick the boxes as you go. Menu names at IBKR
-and Anthropic change often; where a step says **verify on IBKR's site**, the idea is right
+This page picks up from where you are now. Tick the boxes as you go. Menu names at IBKR,
+Anthropic and xAI change often; where a step says **verify on IBKR's site**, the idea is right
 but the exact button may be named differently on your screen.
 
 Once the boxes in "Still to do" are ticked, continue with [DEPLOY.md](DEPLOY.md). You can
@@ -117,10 +117,15 @@ By default the paper account does **not** use your subscriptions.
 
 Catch: with sharing on, only one of the two users can receive live data at a time. While
 the bot runs on paper during market hours, logging in to your live account (IBKR Mobile,
-Client Portal trading) can push the paper session back to delayed data
+TWS, Client Portal trading) can take the data away from the paper session
 ([IBKR Knowledge Base: market data for paper accounts](https://ibkb.interactivebrokers.com/article/1719)).
+IB Gateway then reports error **10197** ("No market data during competing live session").
+The bot treats the affected symbols as having no usable data: no new entries in them, a
+yellow warning on the dashboard and the message under **Last error**. Broker-side stops keep
+working. Log out of the live session (or close IBKR Mobile) and the data comes back within
+a minute; see [DEPLOY.md troubleshooting](DEPLOY.md#no-market-data-error-10197).
 
-### 7. Create a Claude API key (optional; the bot works rules-only without it)
+### 7. Create a Claude API key (needed for consensus; the bot works rules-only without AI keys)
 
 - [ ] Sign in at <https://platform.claude.com> (the Claude Console; older links say
   console.anthropic.com).
@@ -130,10 +135,37 @@ Client Portal trading) can push the paper session back to delayed data
 - [ ] **API keys** > **Create key**, name it `desk`, copy it (it is shown only once) and keep
   it in your password manager until you paste it into `.env` on the droplet
   ([DEPLOY.md step 4](DEPLOY.md#4-create-the-settings-file-env)).
-- [ ] Read the [Claude cost estimate](#claude-api-cost-estimate) below and pick a daily budget
-  in the app (Settings > `llm_daily_budget_usd`; the default is $3.00/day).
+- [ ] Read the [AI cost estimate](#ai-api-cost-estimate) below and pick a daily budget
+  in the app (Settings > `llm_daily_budget_usd`; the default is $3.00/day for both models
+  together).
 
 Menu names in the Console may differ slightly.
+
+### 7b. Create an xAI (Grok) API key (needed for consensus)
+
+The default decision mode is **consensus**: a BUY goes out only when Claude **and** Grok
+both pick the same stock. Your **SuperGrok subscription does not include API access**; the
+API is billed separately with prepaid credits.
+
+- [ ] Sign in at <https://console.x.ai> with the same X/xAI account (or a new one).
+- [ ] Billing: buy a small amount of **prepaid credits**, for example $10, and leave any
+  auto top-up off, so the balance is a hard ceiling. If the console offers a monthly
+  **spending limit**, set one as well. **Verify on xAI's site**; menu names were not
+  confirmed.
+- [ ] **API Keys** > **Create API key**, name it `desk`. If the console lets you restrict a
+  key to certain models or endpoints, allow only the Grok model the bot uses
+  (`grok-4.7` by default). Copy the key (shown once) into your password manager, then into
+  `.env` on the droplet as `XAI_API_KEY=...`
+  ([DEPLOY.md step 4](DEPLOY.md#4-create-the-settings-file-env)).
+- [ ] Optional: check the model name and prices on the console's models page. If they
+  differ from `grok-4.7` at $2 / $6 per million tokens (the figures the app assumes; they
+  come from third-party price lists, not from xAI directly), set `TRADER_XAI_MODEL` and
+  `TRADER_XAI_PRICE_INPUT` / `TRADER_XAI_PRICE_CACHED_INPUT` / `TRADER_XAI_PRICE_OUTPUT` in
+  `.env` so the daily AI budget counts Grok correctly.
+
+With only one of the two keys the bot falls back to that model alone and the dashboard
+says so ("Consensus mode needs both API keys..."); with neither it makes rules-only
+decisions. Nothing pretends to be a consensus that is not one.
 
 ### 8. Phone alerts with ntfy (optional, recommended)
 
@@ -161,7 +193,7 @@ disconnects longer than a minute, halts, and orders waiting for your approval.
 |---|---|---|
 | DigitalOcean droplet, Basic 2 GB | $12 | Enough with a swap file ([DEPLOY.md](DEPLOY.md#2-add-a-swap-file-2-gb-droplets)); 4 GB is $24 ([2026 price list](https://www.cloudhim.com/cloud-costs/digitalocean-droplet-pricing-2026)). Hetzner raised US prices in June 2026 ([Hetzner notice](https://docs.hetzner.com/general/infrastructure-and-availability/price-adjustment/)) |
 | Market data | $0 delayed, or $14.50 | $10 bundle (waived at $30 commissions) + $4.50 streaming add-on |
-| Claude API | $0-90 | Depends on model, effort, crypto on/off and the daily budget; see below |
+| AI APIs (Claude + Grok) | $0-90 | Depends on decision mode, model, effort, crypto on/off and the daily budget (which covers both); see below |
 | Commissions (example) | ~$17 | 20 stock round trips of ~$220 at ~$0.84 each (Tiered) |
 | Commissions (example) | ~$40 | 20 crypto round trips of $100 at ~$2.00 each (2%) |
 | Cloudflare Tunnel + Access | $0 | Zero Trust free plan |
@@ -172,52 +204,73 @@ Three realistic totals before any trading profit or loss:
 | Setup | Per month | Share of a $650 account |
 |---|---|---|
 | Paper, delayed data, rules only | $12 | 1.8% |
-| Paper or live with data, Claude Haiku 5.5 | ~$28 | 4.3% |
-| Live with data, Claude Opus 5.5 on busy days | ~$95-115 | 15-18% |
+| Paper or live with data, Claude Haiku 5.5 alone | ~$28 | 4.3% |
+| Paper or live with data, consensus Haiku 5.5 + Grok, quiet days | ~$35-40 | 5.5-6% |
+| Live with data, consensus Opus 5.5 + Grok on busy days (budget-capped) | ~$90 | 14% |
 
 The bot has to earn these costs back before it makes you anything. On a $650 account,
 every $6.50 of monthly cost is 1% of the account.
 
-## Claude API cost estimate
+## AI API cost estimate
 
-Prices per million tokens ([Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)):
+Claude prices per million tokens ([Anthropic pricing](https://platform.claude.com/docs/en/about-claude/pricing)):
 
-| Model | Input | Output | Cached input read | Cache write (5 min) |
+| Model | Input | Output | Cached input read | Cache write (1 hour) |
 |---|---|---|---|---|
-| `claude-opus-5-5` (app default) | $4.00 | $20.00 | $0.20 | $5.00 |
-| `claude-sonnet-5-5` | $2.00 | $10.00 | $0.20 | $2.50 |
-| `claude-haiku-5-5` | $0.10 | $0.50 | $0.01 | $0.125 |
+| `claude-opus-5-5` (app default) | $4.00 | $20.00 | $0.20 | $8.00 |
+| `claude-sonnet-5-5` | $2.00 | $10.00 | $0.20 | $4.00 |
+| `claude-haiku-5-5` | $0.10 | $0.50 | $0.01 | $0.20 |
 
-**One call.** Measured from this app's prompt code: the fixed instructions are about
+Grok (`grok-4.7`, the app default): about **$2.00 input, $0.50 cached input, $6.00 output**
+per million tokens, reasoning tokens billed as output. These are third-party figures that
+were not confirmed against xAI's own price page; check console.x.ai and override them in
+`.env` if they differ.
+
+**One Claude call.** Measured from this app's prompt code: the fixed instructions are about
 1,300 tokens (about 1,700 with the answer format), and one cycle's market snapshot is about
 1,000-1,500 tokens. The answer, including the model's thinking at the default `medium`
-effort, is assumed to be about 2,000 tokens. The app asks for prompt caching, but the cache
-lasts 5 minutes and the cycle is also 5 minutes, so the estimate assumes a cache write on
-every call:
+effort, is assumed to be about 2,000 tokens. The instructions are cached for **1 hour**
+(cycles are 5 minutes apart but Claude is skipped when nothing qualifies, so a 5-minute
+cache would often expire): one cache write per hour at 2x the input price, then cheap cache
+reads:
 
-| Model | Instructions (cache write) | Snapshot | Answer | **Per call** |
+| Model | Instructions (read; write once an hour) | Snapshot | Answer | **Per call** |
 |---|---|---|---|---|
-| Opus 5.5 | 1,700 x $5/M = $0.0085 | 1,500 x $4/M = $0.006 | 2,000 x $20/M = $0.040 | **~$0.055** |
-| Sonnet 5.5 | $0.004 | $0.003 | $0.020 | **~$0.027** |
-| Haiku 5.5 | $0.0002 | $0.00015 | $0.001 | **~$0.0014** |
+| Opus 5.5 | 1,700 x $0.20/M = $0.0003 (write $0.0136) | 1,500 x $4/M = $0.006 | 2,000 x $20/M = $0.040 | **~$0.047** |
+| Sonnet 5.5 | $0.0003 (write $0.0068) | $0.003 | $0.020 | **~$0.024** |
+| Haiku 5.5 | $0.00002 (write $0.0003) | $0.00015 | $0.001 | **~$0.0012** |
+
+**One Grok call** (consensus asks Grok too, at the same moment): about 3,200 prompt tokens
+(assumed uncached) x $2/M = $0.0064 plus 2,000-4,000 answer and reasoning tokens x $6/M =
+$0.012-0.024, so **~$0.02-0.03 per call**.
+
+| Decision mode | Per call | vs. Claude alone |
+|---|---|---|
+| Consensus, Opus 5.5 + Grok | ~$0.07 | ~1.5x |
+| Consensus, Sonnet 5.5 + Grok | ~$0.05 | ~2x |
+| Consensus, Haiku 5.5 + Grok | ~$0.026 | ~20x (Grok dominates) |
 
 **How many calls.** The engine runs a cycle every 5 minutes while something is tradable
 (stocks 09:30-16:00 ET on trading days, crypto around the clock if enabled), but it only
-calls Claude when a scanner signal scores at least `llm_min_candidate_score` (0.5) **or a
+asks the AI when a scanner signal scores at least `llm_min_candidate_score` (0.5) **or a
 position is open**. Most setups score above 0.5, and an open position means a call every
-cycle. Rough scenarios:
+cycle. Rough scenarios (Claude alone; multiply by the factor above for consensus):
 
 | Scenario | Calls | Opus 5.5 | Sonnet 5.5 | Haiku 5.5 |
 |---|---|---|---|---|
-| Stocks only, quiet days | 20/day x 21 days | $23/month | $11/month | $0.60/month |
-| Stocks only, busy days (a position open most of the day) | 60/day x 21 days | $69/month | $34/month | $1.80/month |
-| Stocks + 24/7 crypto | 150/day x 30 days | $248 -> **capped at $90** | $122 -> **capped at $90** | $6/month |
+| Stocks only, quiet days | 20/day x 21 days | $20/month | $10/month | $0.50/month |
+| Stocks only, busy days (a position open most of the day) | 60/day x 21 days | $59/month | $30/month | $1.50/month |
+| Stocks + 24/7 crypto | 150/day x 30 days | $212 -> **capped at $90** | $108 -> **capped at $90** | $5.40/month |
 
-The daily budget is the real ceiling: at the default `llm_daily_budget_usd = 3.00` the bot
-switches to rules-only for the rest of the day once $3 is spent, so the worst case is about
-$63/month (stocks only) or $90/month (with crypto). Your actual numbers appear on the
-dashboard (Claude cost today) and on every decision in Activity; recheck this table after a
-week of paper trading.
+The daily budget is the real ceiling, and it covers **both** models: at the default
+`llm_daily_budget_usd = 3.00` the AI is not asked again that day once $3 is spent, so the
+worst case is about $63/month (stocks only) or $90/month (with crypto). What happens then
+depends on the mode: with one model the bot falls back to the rules (which do open
+positions); **in consensus mode the rules only manage exits**, because a BUY needs both
+models, so no new trades open for the rest of the day. On busy days consensus with Opus
+reaches $3 after roughly 40 calls (early afternoon); raise the budget, use Sonnet, or
+accept the quieter afternoons. Your actual numbers appear on the dashboard (AI cost today)
+and on every decision in Activity; recheck this table after a week of paper trading.
 
 **Recommendation (your decision):**
 
@@ -227,9 +280,14 @@ week of paper trading.
 2. **Leave crypto off** (`trade_crypto = false`, the default) unless you specifically want it: it adds
    round-the-clock calls, and at $100-250 per trade the 1.4-2% round-trip crypto fee blocks
    nearly every crypto trade anyway ([STRATEGY.md](STRATEGY.md#fee-math-for-a-small-account)).
-3. **Live, account under about $1,500:** switch to **Haiku 5.5** or **rules-only**
-   (`llm_enabled = false`) unless paper results showed the AI-approved signals clearly
-   beating the skipped ones after fees. A useful rule: keep the AI bill under about 1% of
+3. **Live, account under about $1,500:** switch to **Haiku 5.5 alone**
+   (`decision_mode = claude`) or **rules-only** (`decision_mode = rules`) unless paper
+   results showed the AI-approved signals clearly beating the skipped ones after fees.
+   Haiku **with** Grok (consensus) costs about $0.026 per call, i.e. roughly $11/month on
+   quiet days and $33/month on busy days (20-60 calls/day x 21 days): 2-5 times the 1% rule
+   below, and the $3 daily budget does not stop it. Compare the modes with the signal
+   ledger, not with one good week: consensus trades less, which also means fewer chances
+   to find out whether it works. A useful rule: keep the AI bill under about 1% of
    the account per month ($6.50 at $650).
 4. Go back to a bigger model only when the account (or a proven edge) makes the cost small
    relative to results.

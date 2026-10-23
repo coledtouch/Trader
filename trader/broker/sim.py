@@ -560,6 +560,10 @@ class _Order:
     commission: float = 0.0
     message: str = ""
     triggered: bool = False  # stop child whose stop price traded: now a market order
+    # A limit placed between the mid and the far side of the spread (a BUY above the mid but
+    # below the ask): it fills only once the market comes to it (ask <= limit for a BUY),
+    # never just because the mid it was placed above keeps printing (see _match).
+    inside_spread: bool = False
     activated_at: datetime | None = None  # first fill (activates bracket children)
     fill_minute: int = -1
     minute_filled: float = 0.0  # qty filled in fill_minute (participation cap)
@@ -1180,6 +1184,11 @@ class SimBroker(Broker):
         if placement:  # marketable limit: fills now, never worse than the limit
             if (buy and ask <= limit) or (not buy and bid >= limit):
                 self._market_fill(order, series, minute, f0, p0, volume, limit=limit)
+            else:
+                order.inside_spread = (buy and p0 < limit) or (not buy and p0 > limit)
+            return
+        if order.inside_spread:
+            self._match_inside_spread(order, series, minute, pts, volume)
             return
         if buy and p0 < limit:  # already traded through (gap): fill at the better price
             self._limit_fill(order, minute, f0, min(limit, ask), volume)
@@ -1189,6 +1198,33 @@ class SimBroker(Broker):
             hit = _first_cross(pts, limit, below=buy, strict=True)
             if hit is not None:
                 self._limit_fill(order, minute, hit[0], limit, volume)
+
+    def _match_inside_spread(
+        self,
+        order: _Order,
+        series: _Series,
+        minute: int,
+        pts: list[tuple[float, float]],
+        volume: float,
+    ) -> None:
+        """A limit resting inside the spread (placed with the mid already past it): it fills
+        at the limit once the far side reaches it (ask <= limit for a BUY, bid >= limit for
+        a SELL). Once the mid is back on the near side of the limit, the usual trade-through
+        rule applies from there."""
+        req = order.request
+        limit = req.limit_price or 0.0
+        buy = req.side == Side.BUY
+        for i, (frac, price) in enumerate(pts):
+            bid, ask = series.bid_ask(price)
+            if (buy and ask <= limit) or (not buy and bid >= limit):
+                self._limit_fill(order, minute, frac, limit, volume)
+                return
+            if (buy and price >= limit) or (not buy and price <= limit):
+                order.inside_spread = False
+                hit = _first_cross(pts[i:], limit, below=buy, strict=True)
+                if hit is not None:
+                    self._limit_fill(order, minute, hit[0], limit, volume)
+                return
 
     def _market_fill(
         self,

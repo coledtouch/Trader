@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, SecretStr
 from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -240,10 +240,11 @@ def loosened_fields(old: BotSettings, new: BotSettings, live: bool) -> list[str]
     Risk limits: LOWER_IS_LOOSER fields loosen when decreased, BOOL_TRUE_IS_LOOSER when
     switched on, BOOL_FALSE_IS_LOOSER when switched off, and every other numeric limit when
     increased (compared after clamping to HARD_CAPS, which is what the engine enforces).
-    Autopilot off -> on loosens while the broker is a live account, and switching off
-    flatten_stocks_before_close (the bot would hold stocks overnight) always loosens. Exit
-    rules and universes never count. An unclassified boolean limit counts on any change
-    (fail safe).
+    Autopilot off -> on loosens while the broker is a live account, switching off
+    flatten_stocks_before_close (the bot would hold stocks overnight) always loosens, and so
+    does leaving consensus decisions (another decision_mode, or llm_enabled off while in
+    consensus): one model or the rules alone may then open positions. Exit rules and
+    universes never count. An unclassified boolean limit counts on any change (fail safe).
     """
     loosened: list[str] = []
     for name in RiskLimits.model_fields:
@@ -266,7 +267,17 @@ def loosened_fields(old: BotSettings, new: BotSettings, live: bool) -> list[str]
         loosened.append("autopilot")
     if old.flatten_stocks_before_close and not new.flatten_stocks_before_close:
         loosened.append("flatten_stocks_before_close")
+    if _effective_mode(old) == "consensus" and _effective_mode(new) != "consensus":
+        loosened.append("decision_mode" if new.decision_mode != "consensus" else "llm_enabled")
     return loosened
+
+
+def _effective_mode(settings: BotSettings) -> str:
+    return settings.decision_mode if settings.llm_enabled else "rules"
+
+
+def _has_key(key: SecretStr | None) -> bool:
+    return bool(key is not None and key.get_secret_value().strip())
 
 
 def _normalize_universe(name: str, symbols: list[str]) -> list[str]:
@@ -396,6 +407,16 @@ def create_app(
     if config.cf_access_enabled:
         verifier = CFAccessVerifier(config.cf_access_team_domain, config.cf_access_aud)
         app.add_middleware(CFAccessMiddleware, verifier=verifier)
+        log.info(
+            "Cloudflare Access check: enabled (team %s, aud %s...)",
+            config.cf_access_team_domain,
+            config.cf_access_aud[:8],
+        )
+    else:
+        log.warning(
+            "Cloudflare Access check: disabled (TRADER_CF_ACCESS_TEAM_DOMAIN and "
+            "TRADER_CF_ACCESS_AUD are not set)"
+        )
     app.add_middleware(
         TrustedHostMiddleware, allowed_hosts=config.allowed_hosts_list, www_redirect=False
     )
@@ -454,11 +475,14 @@ def create_app(
 
     def settings_payload(request: Request) -> dict[str, Any]:
         st = state(request)
-        key = st.config.anthropic_api_key
+        claude = _has_key(st.config.anthropic_api_key)
+        grok = _has_key(st.config.xai_api_key)
         return {
             "settings": st.db.get_settings().model_dump(mode="json"),
             "hard_caps": dict(HARD_CAPS),
-            "llm_available": bool(key is not None and key.get_secret_value()),
+            "llm_available": claude or grok,  # any AI key: otherwise rules-only decisions
+            "ai_keys": {"claude": claude, "grok": grok},
+            "grok_model": st.config.xai_model,
             "live_allowed": st.config.allow_live,
         }
 

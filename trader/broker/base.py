@@ -52,6 +52,12 @@ class Broker(ABC):
         """True when quotes/bars come from the free 15-minute-delayed feed."""
         return False
 
+    @property
+    def data_warning(self) -> str | None:
+        """A market-data problem the owner should see (e.g. IBKR error 10197), or None.
+        Quotes for the affected symbols raise BrokerError, so they get no entries."""
+        return None
+
     # ------------------------------------------------------------------ account
     @abstractmethod
     async def account(self) -> AccountSnapshot: ...

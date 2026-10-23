@@ -23,8 +23,9 @@ Every **5 minutes** (`cycle_seconds`) while something is tradable:
       v
  5. Signal ledger   EVERY candidate is written down, traded or not
       v
- 6. Decision maker  Claude, if a candidate scores >= 0.5 or a position is open and today's
-      |             Claude spend is under budget; otherwise the plain rules
+ 6. Decision maker  consensus (Claude AND Grok must both BUY), or one model, or the rules;
+      |             AI only if a candidate scores >= 0.5 or a position is open and today's
+      |             AI spend is under budget; otherwise the plain rules
       v
  7. Risk manager    sizes the trade and runs ~25 checks; any failure = no order
       v
@@ -37,6 +38,23 @@ Separately, every **15 seconds** (`monitor_seconds`) the monitor loop keeps the 
 connection alive, refreshes balances and positions (valued at the **bid**), applies the
 exit rules, checks the daily halts, journals fills and closed trades, and scores old
 signals in the ledger.
+
+**Bad ticks.** A quote is ignored for valuing positions and for the bot's own exit checks
+when it is crossed (bid above ask) or its bid is more than **5%** (stocks) / **8%**
+(crypto) away from the last trade (or the mid when there is no last trade); the broker's
+own mark is used instead, and entries on such a quote are refused. The bot's own stops,
+targets and time stops, and the daily halts (with the loss-limit flatten), fire only when
+the condition shows on **two consecutive monitor checks** at least half a monitor interval
+apart (normally 15 seconds), so a single bad print cannot sell a position or flatten the
+account; the extra check a decision cycle runs right after the monitor's own never counts
+as the second look. While a halt condition is
+waiting for its second check, no new entry goes out. Stop orders that live at IBKR are not
+affected: IBKR triggers them on its own data.
+
+**No market data (IBKR error 10197).** If you log in to the live account elsewhere while the
+paper gateway runs, IBKR may give the shared market data to that session only. The bot then
+treats the affected symbols as having no usable data (no entries) until fresh prices arrive,
+and the dashboard says so ([DEPLOY.md](DEPLOY.md#no-market-data-error-10197)).
 
 ## 1-3. Universe and data
 
@@ -72,21 +90,47 @@ data (not older than 3 bars), price at least `min_price` ($1), stocks trading at
 
 ## 6. The decision makers
 
-**Claude** (`llm_enabled`, model `llm_model`, default `claude-opus-5-5`, effort
-`llm_effort`) gets the account, today's results, the risk limits, open positions, the
-candidates, indicator snapshots and recent trades. Its instructions: protect capital
-first; only buy listed candidates; every buy needs a stop below and a target above; prefer
-HOLD when the edge is unclear; never size up to reach a daily target; explain each
-decision in at most two sentences; respect delayed-data warnings. Its answer is checked
-again in code. If Claude refuses, errors or times out, **no new buys happen** that cycle
-(stops still protect open positions).
+**Claude** (model `llm_model`, default `claude-opus-5-5`, effort `llm_effort`) and **Grok**
+(xAI, `TRADER_XAI_MODEL`, default `grok-4.7`) get exactly the same input: the account,
+today's results, the risk limits, open positions, the candidates, indicator snapshots and
+recent trades, with the same instructions: protect capital first; only buy listed
+candidates; every buy needs a stop below and a target above; prefer HOLD when the edge is
+unclear; never size up to reach a daily target; explain each decision in at most two
+sentences; respect delayed-data warnings. Each answer is checked again in code (the same
+checks for both). If a model refuses, errors or times out, **it buys nothing** that cycle
+(stops still protect open positions; during an API outage the rule-based exits still run).
 
-Claude is only called when a candidate scores at least `llm_min_candidate_score` (0.5) or
-a position is open, and only while today's Claude spend is below `llm_daily_budget_usd`.
-Otherwise the **rules** decide: buy the highest-scoring candidate at or above the
-threshold (limit order at the candidate price, with its stop and target), and close a
-position whose setup broke (VWAP setups: price back below VWAP; trend pullback: EMA9 below
-EMA21 and price below EMA21). Costs: [SETUP_IBKR.md](SETUP_IBKR.md#claude-api-cost-estimate).
+**Decision mode** (`decision_mode` setting):
+
+| Mode | Who decides | Notes |
+|---|---|---|
+| `consensus` (default) | Claude **and** Grok, asked at the same time | **BUY** only when both buy the **same** symbol; Claude's limit, stop and target are used; conviction and size are the **smaller** of the two (a lukewarm second opinion can only shrink the trade). **CLOSE** when **either** says close (an exit reduces risk). Anything else is HOLD, and the signal ledger says who stood in the way, e.g. `consensus: Grok said HOLD` or `consensus: Claude did not BUY`. If either model fails or refuses, **nothing is bought** that cycle (the other's closes still count). Both calls are paid for: Grok adds about $0.02-0.03 per call, i.e. **~1.5x** the AI cost with Opus, **~2x** with Sonnet and **~20x** with Haiku |
+| `claude` / `grok` | That model alone | |
+| `rules` | The rule-based maker below | No AI cost |
+
+Consensus needs both API keys. With only one key the bot uses that model alone, and with
+neither it uses the rules; the dashboard shows a yellow warning either way (it never
+pretends a consensus that is not there). `llm_enabled` off means rules-only whatever the
+mode. Leaving consensus (another mode, or `llm_enabled` off) needs a 2FA code.
+
+What to expect from consensus: **fewer trades**. Two models that must agree filter out
+setups where either is unsure, which may avoid some bad trades and will certainly skip some
+good ones. Whether that helps after fees is an open question: published evidence that
+any single LLM, Claude or Grok, picks intraday trades with a real edge is thin and mixed
+(the Grok agent that inspired this app was a paper-trading experiment, not a track
+record), and there is no evidence yet that two together do better. Treat consensus as a
+risk filter, not an edge, and let the signal ledger decide: every skipped signal is
+scored, so after a month you can compare what the models bought with what they let pass.
+
+The AI is only asked when a candidate scores at least `llm_min_candidate_score` (0.5) or a
+position is open, and only while today's AI spend (both models together) is below
+`llm_daily_budget_usd`. Otherwise the **rules** decide: buy the highest-scoring candidate
+at or above the threshold (limit order at the candidate price, with its stop and target),
+and close a position whose setup broke (VWAP setups: price back below VWAP; trend
+pullback: EMA9 below EMA21 and price below EMA21). **In consensus mode the rules never
+open a position** (a BUY needs both models), so once the budget is spent the bot only
+manages exits for the rest of the day. Costs:
+[SETUP_IBKR.md](SETUP_IBKR.md#ai-api-cost-estimate).
 
 ## 7. The risk manager
 
@@ -128,11 +172,11 @@ is usually what binds, so most trades risk well under 2%.
 | `price_collar_pct` | 1% | 5% | A limit price must be within this % of the last price |
 | `min_reward_risk` | 1.5 | | (target - entry) / (entry - stop); scanner targets use 2.0 |
 | `max_fee_to_reward_pct` | 25% | | Round-trip commission must be at most this % of the expected reward |
-| `loss_streak_halve_after` | 3 | | Half size after this many losing trades in a row |
+| `loss_streak_halve_after` | 3 | 10 | Half size after this many losing trades in a row (raising it loosens the rule and needs 2FA) |
 | `max_spread_pct` | 0.3% | 2% | No entries when the bid/ask spread is wider |
 | `halt_cooldown_minutes` | 15 | | No entries in a stock for this long after a trading halt |
 | `allow_leveraged_etfs` | off | | Leveraged/inverse ETFs stay blocked unless turned on |
-| `llm_daily_budget_usd` | $3 | $50 | Claude spend per day; then rules-only until tomorrow |
+| `llm_daily_budget_usd` | $3 | $50 | AI spend per day (Claude + Grok together); after that, until tomorrow: consensus mode = exits only (no new entries), single-model mode = rules-only |
 
 Loosening any of these in the app needs a fresh 2FA code; tightening does not.
 
@@ -142,9 +186,11 @@ Loosening any of these in the app needs a fresh 2FA code; tightening does not.
   than `max_trades_per_day` entries; not already holding the symbol and no entry order
   already working (the bot **never adds to a position**); open positions plus entries below
   `max_open_positions`; not a leveraged ETF; IBKR's day-trade counter (when reported)
-  above 0 for stocks.
+  above 0 for stocks. IBKR updates that counter only every few minutes, so the bot first
+  subtracts its own same-day round trips that closed in the last 5 minutes.
 - **Market data:** a quote exists and is fresh (twice the monitor interval, plus 15 minutes
-  for delayed data); the symbol is not halted and was not halted in the last 15 minutes;
+  for delayed data) and plausible (not crossed, bid within 5% / 8% of the last trade); the
+  symbol is not halted and was not halted in the last 15 minutes;
   stocks need a two-sided quote with a spread of at most 0.3%; live account plus delayed
   data blocks stock entries; stocks only while the market is open and inside the entry
   window.
@@ -161,10 +207,17 @@ held (no accidental short).
 
 ## 8-9. Orders and exits
 
-- **Entry:** a limit order at the decision's price (or the current ask). Unfilled entries
-  are cancelled after **10 minutes**. With autopilot off, the order waits for your
-  approval; approving re-runs every risk check with fresh data, and unapproved orders
-  expire after 10 minutes.
+- **Entry:** a limit order at the decision's price (or the ask when the BUY is sent). The
+  AI may think for a minute or more, so every BUY is sized and checked again on the clock,
+  quote, account, positions and working orders **at the moment it is sent** (an entry that
+  filled, an order you approved, a halt or the end of the entry window in the meantime all
+  count); a BUY decided on data more than **3 minutes** old is dropped. Unfilled entries
+  are cancelled **10 minutes** after they were sent. With autopilot off, the order waits
+  for your approval; approving re-runs every risk check with fresh data, and unapproved
+  orders expire after 10 minutes.
+- **AI CLOSE:** only for positions the bot opened. A position you hold yourself (or one
+  from before an account change) is never sold by an AI decision and does not trigger AI
+  calls on its own.
 - **Stocks:** sent as a bracket: the stop-loss and the target are real orders at IBKR,
   good-till-cancelled, so they keep working if the server or the connection is down.
 - **Crypto:** IBKR only accepts limit and market crypto orders, so the bot checks the bid
@@ -175,7 +228,7 @@ Exit rules (`exits` settings; they only touch positions the bot opened):
 
 | Rule | Default | What happens |
 |---|---|---|
-| Stop-loss / target | from the setup | Stocks: IBKR fills them. Crypto: the bot sells at the bid |
+| Stop-loss / target | from the setup | Stocks: IBKR fills them. Crypto: the bot sells at the bid once the level is breached on two checks in a row |
 | Backup stop | always | A stock without a working IBKR stop is sold if the bid falls more than 0.5% below its stop (for example after a reconnect, before protection is re-placed) |
 | Re-protect | always | After a reconnect, missing stock stops are placed again |
 | Time stop | 45 min, 0.5R | A trade that has not reached +0.5R after 45 minutes is closed: stale trades tie up a small account |
@@ -183,12 +236,19 @@ Exit rules (`exits` settings; they only touch positions the bot opened):
 | Trailing stop | off (`trail_atr_mult` 0) | If set, after breakeven the stop trails that many ATRs below the best price |
 | Setup broke | rules / Claude | e.g. a VWAP setup back below VWAP: close |
 | Flatten before close | 15:50 ET (12:50 on half days) | Stock positions are closed 10 minutes before the bell (`flatten_stocks_before_close`) |
-| Daily loss limit | -6% | Halt and close everything (`flatten_on_halt`); resume needs 2FA |
+| Daily loss limit | -6% | Halt and close everything (`flatten_on_halt`) once two consecutive checks agree; resume needs 2FA |
 | Daily target | +$100 | No new entries today; open positions keep their stops |
 | KILL button | | Cancel every order and close every position |
 
 Stops only ever move **up**. P&L, stops and R multiples use the bid, because that is what
 a sale would actually get.
+
+**Trading halts.** A stop order cannot fill while a stock is halted (LULD pause or news
+halt), and the stock can reopen far below the stop: halts often reopen 30-40% away. The
+stop then fills at the first price after the reopen, so the loss can be several times the
+planned 1R. The bot does not enter a halted stock, waits 15 minutes after a halt
+(`halt_cooldown_minutes`), and never adds to a position; the small position size is the
+only real protection against such a gap.
 
 ## The signal ledger
 
@@ -196,6 +256,7 @@ Every candidate the scanner produces is written down (at most once per symbol an
 every 30 minutes), with:
 
 - whether it was **taken** (it became an order) or **why not**: `AI: HOLD`,
+  `consensus: Grok said HOLD`, `consensus: Claude did not BUY`, `consensus: Grok failed`,
   `rules: no entry`, `risk: spread 0.80% > 0.30%`, `LLM budget; ...`,
   `not top candidate`, `halt cooldown`, `outside the stock entry window`, `shadow mode`...
 - its outcome, filled in after the session close (stocks) or 24 hours later (crypto) from
@@ -223,9 +284,11 @@ setup. One great day, or one great week, proves nothing. Then:
    fees, about 45% with 0.34R of fees.
 4. **Noise.** With 30 signals, an average within about ±0.2R of zero is not evidence of
    anything. Treat 30 as a first look and 100 as a reasonable answer.
-5. **Taken vs. skipped.** If the signals Claude chose did no better than the ones it
+5. **Taken vs. skipped.** If the signals the AI chose did no better than the ones it
    skipped, the AI is adding cost, not edge: switch to Haiku or rules-only
-   ([cost advice](SETUP_IBKR.md#claude-api-cost-estimate)).
+   ([cost advice](SETUP_IBKR.md#ai-api-cost-estimate)). In consensus mode, also compare the
+   `consensus: ... said HOLD` signals with the taken ones: if the vetoed signals did as well
+   as the agreed ones, the second model is costing money without filtering anything.
 6. **Excursions.** Winners that first dropped close to -1R (`mae_r`) mean the stop is very
    tight; a high `mfe_r` with few target hits means the target is too far for that setup.
 

@@ -6,6 +6,7 @@ docs/SPEC.md at the same time.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
@@ -173,7 +174,7 @@ class OrderRecord(BaseModel):
 
 
 class Fill(BaseModel):
-    exec_id: str  # unique per execution at the broker
+    exec_id: str  # unique per execution at the broker (see exec_revision for corrections)
     broker_order_id: str
     instrument: Instrument
     side: Side
@@ -181,6 +182,19 @@ class Fill(BaseModel):
     price: float
     commission: float = 0.0
     ts: datetime = Field(default_factory=utcnow)
+
+
+_EXEC_REVISION = re.compile(r"^(?P<base>[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)+)\.(?P<rev>[0-9]+)$")
+
+
+def exec_revision(exec_id: str) -> tuple[str, int] | None:
+    """(base, revision) of an IBKR execution id, or None for other id formats.
+
+    IBKR reports a corrected execution as a new execution whose id repeats the original
+    except for a higher number after the last period ("0000e0d5.65a1b2c3.01.01" is
+    corrected by "...01.02"): the journal keeps only the latest revision of each base."""
+    match = _EXEC_REVISION.match(exec_id)
+    return (match["base"], int(match["rev"])) if match else None
 
 
 class Candidate(BaseModel):
@@ -222,7 +236,7 @@ class AIDecision(BaseModel):
 class DecisionBatch(BaseModel):
     id: int | None = None
     ts: datetime = Field(default_factory=utcnow)
-    maker: str  # "claude", "rules", ...
+    maker: str  # "claude", "grok", "consensus", "rules", ...
     model: str | None = None
     market_view: str = ""
     decisions: list[AIDecision] = Field(default_factory=list)
@@ -232,6 +246,9 @@ class DecisionBatch(BaseModel):
     cost_usd: float = 0.0
     refused: bool = False
     error: str | None = None
+    # Consensus batches: each model's own (validated) decisions, keyed by maker name
+    # ("claude", "grok"), so the journal shows how each one voted. Empty otherwise.
+    votes: dict[str, list[AIDecision]] = Field(default_factory=dict)
 
 
 class RiskLimits(BaseModel):
@@ -270,14 +287,17 @@ HARD_CAPS: dict[str, float] = {
     "price_collar_pct": 5.0,
     "llm_daily_budget_usd": 50.0,
     "max_spread_pct": 2.0,
+    # Size is halved after this many losses in a row; a huge value would switch the
+    # anti-tilt halving off, so it can never be raised past this.
+    "loss_streak_halve_after": 10,
 }
 
 # Fields where a LOWER value is riskier (loosening means decreasing them). For every other
-# numeric risk field, a HIGHER value is riskier.
+# numeric risk field, a HIGHER value is riskier (e.g. loss_streak_halve_after: a higher N
+# halves the size later, or never).
 LOWER_IS_LOOSER = {
     "min_price",
     "min_reward_risk",
-    "loss_streak_halve_after",
     "halt_cooldown_minutes",
 }
 # Boolean risk fields where switching to True loosens, and where switching to False loosens.
@@ -339,7 +359,13 @@ class BotSettings(BaseModel):
     min_avg_volume: float = Field(default=500_000, ge=0)  # skip illiquid names (shares/day)
     dynamic_universe: bool = False  # add IBKR scanner top movers (needs real-time data)
     allow_fractional_stocks: bool = False
-    llm_enabled: bool = True
+    llm_enabled: bool = True  # master switch: off means rules-only decisions
+    # Who decides. "consensus" (default): a BUY goes out only when Claude AND Grok both
+    # BUY the same symbol; either one can CLOSE. "claude" / "grok": that model alone.
+    # "rules": the deterministic rule-based maker. A mode whose API key is missing falls
+    # back (consensus -> the model that has a key; a single model -> rules) and the
+    # dashboard shows a warning.
+    decision_mode: Literal["consensus", "claude", "grok", "rules"] = "consensus"
     llm_model: str = "claude-opus-5-5"
     llm_effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
     llm_min_candidate_score: float = Field(default=0.5, ge=0, le=1)  # skip the LLM below this
@@ -413,6 +439,13 @@ class EngineStatus(BaseModel):
     trades_today: int = 0
     llm_cost_today: float = 0.0
     data_delayed: bool = False
+    # Who makes decisions right now ("consensus", "claude", "grok" or "rules"), and why it
+    # differs from the configured decision_mode (e.g. an API key is missing), if it does.
+    decision_maker: str = "rules"
+    decision_warning: str | None = None
+    # Broker market-data problem worth the owner's attention, e.g. IBKR error 10197 (no
+    # data while another session of the same login holds it). Affected symbols get no entries.
+    data_warning: str | None = None
 
 
 class DecisionContext(BaseModel):

@@ -29,6 +29,8 @@ from trader.risk import (
     available_cash,
     clamp_limits,
     is_soft_halt,
+    quote_problem,
+    sane_exit_price,
 )
 
 NOW = datetime(2026, 10, 21, 15, 0, tzinfo=UTC)  # Wednesday 11:00 New York
@@ -225,6 +227,15 @@ def test_sizing_halves_after_loss_streak() -> None:
     assert qty == 5
     assert any("halved" in n for n in notes)
     assert size(stats=day(loss_streak=2))[0] == 10
+
+
+def test_loss_streak_halving_cannot_be_switched_off() -> None:
+    """A huge loss_streak_halve_after would disable the anti-tilt halving: the hard cap
+    keeps it at most 10 losses in a row."""
+    never = RiskLimits(loss_streak_halve_after=1_000_000)
+    assert RiskManager(never).effective_limits().loss_streak_halve_after == 10
+    qty, notes = size(stats=day(loss_streak=10), limits=never)
+    assert qty == 5 and any("halved" in n for n in notes)
 
 
 def test_sizing_hard_cap_on_risk_per_trade() -> None:
@@ -552,3 +563,41 @@ def test_no_target_halt_when_disabled() -> None:
 def test_no_halt_without_start_equity() -> None:
     rm = RiskManager(RiskLimits())
     assert rm.halt_reason(account=account(equity=1), day=day(start_equity=None)) is None
+
+
+# ---------------------------------------------------------------------- quote sanity
+@pytest.mark.parametrize(
+    ("q", "problem"),
+    [
+        (quote(), None),
+        (quote(bid=10.02, ask=10.01), "crossed quote"),
+        (quote(bid=9.40, ask=9.45, last=10.0), "bid 9.4 is 6.0% from the last 10"),
+        (quote(bid=9.40, ask=9.40, last=10.0), "locked quote 9.4 is 6.0% from the last 10"),
+        (quote(bid=9.60, ask=9.62, last=10.0), None),  # 4% is still plausible for a stock
+        (quote(bid=9.60, ask=10.40, last=None), None),  # no last: compared with the mid
+        (quote(bid=9.40, ask=10.60, last=None), "bid 9.4 is 6.0% from the mid 10"),
+        (quote(bid=None, ask=10.01, last=10.0), None),  # no bid: nothing to judge
+        (quote(BTC, bid=93.0, ask=93.1, last=100.0), None),  # crypto allows 8%
+        (quote(BTC, bid=91.0, ask=91.1, last=100.0), "9.0% from the last 100 (max 8%)"),
+    ],
+)
+def test_quote_problem(q: Quote, problem: str | None) -> None:
+    found = quote_problem(q)
+    if problem is None:
+        assert found is None
+        assert sane_exit_price(q) == (q.bid or q.last)
+    else:
+        assert found is not None and problem in found
+        assert sane_exit_price(q) is None
+
+
+def test_sane_exit_price_without_quote() -> None:
+    assert sane_exit_price(None) is None
+    assert sane_exit_price(quote(bid=None, ask=None, last=None)) is None
+
+
+def test_block_implausible_quote() -> None:
+    crossed = run_check(q=quote(bid=10.03, ask=10.01))
+    assert blocked_with(crossed, "quote for F looks wrong: crossed quote")
+    far = run_check(q=quote(bid=9.0, ask=9.02, last=10.0), req=entry(limit=10.0))
+    assert blocked_with(far, "looks wrong: bid 9")

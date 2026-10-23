@@ -1204,6 +1204,23 @@ details.more ul {
   font-size: 14px;
 }
 
+/* Consensus batches: each model's own vote under the merged decisions. */
+details.votes ul.decision-list {
+  padding-left: 0;
+  color: inherit;
+}
+
+details.votes .vote + .vote {
+  margin-top: 10px;
+}
+
+.vote-maker {
+  margin-bottom: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 650;
+}
+
 /* ------------------------------------------------------------------ signals */
 .filters {
   display: flex;

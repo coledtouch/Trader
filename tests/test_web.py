@@ -1,4 +1,6 @@
+import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pyotp
@@ -138,6 +140,8 @@ def make_config(**overrides) -> AppConfig:
         "allowed_hosts": "testserver,localhost",
         "login_max_attempts_per_ip": 5,
         "login_lockout_failures": 10,
+        "anthropic_api_key": None,
+        "xai_api_key": None,
     }
     values.update(overrides)
     return AppConfig(_env_file=None, **values)
@@ -295,6 +299,39 @@ def test_missing_static_files_get_a_placeholder(env, monkeypatch, tmp_path):
 
 
 # ---------------------------------------------------------------------- auth flow
+def test_background_polling_does_not_keep_an_idle_session_alive(monkeypatch):
+    """SEC-5: the dashboard polls /api/status every few seconds while visible. Those polls
+    (marked X-Background) must not reset the idle timer: an unattended tab signs out after
+    session_idle_minutes. Real requests (no header) still count as activity."""
+    ctx = build()
+    clock = ctx.app.state.auth._clock
+    monkeypatch.setattr("trader.db.utcnow", lambda: clock.now)  # last_seen on the fake clock
+    background = {"X-Background": "1"}
+    with TestClient(ctx.app) as client:
+        ctx.client = client
+        login(ctx)
+        statuses = []
+        for _ in range(40):  # one poll a minute, nobody touching the app
+            clock.now += timedelta(minutes=1)
+            statuses.append(client.get("/api/status", headers=background).status_code)
+        assert statuses[:28] == [200] * 28 and statuses[-1] == 401
+        login(ctx)
+        for _ in range(40):  # the owner keeps using the app: the session stays
+            clock.now += timedelta(minutes=1)
+            assert client.get("/api/status").status_code == 200
+    ctx.db.close()
+
+
+def test_dashboard_marks_its_status_poll_as_background():
+    """SEC-5 (client side): the automatic status refresh sends X-Background, and only it."""
+    from trader.security.auth import BACKGROUND_HEADER
+
+    app_js = (Path(__file__).parent.parent / "trader/web/static/app.js").read_text("utf-8")
+    assert f"headers['{BACKGROUND_HEADER}'] = '1'" in app_js
+    assert app_js.count("{ background: true }") == 1
+    assert "api('GET', '/api/status', undefined, { background: true })" in app_js
+
+
 def test_login_flow(env):
     assert env.client.get("/api/session").json() == {"authenticated": False}
     bad = env.client.post("/api/auth/login", json={"password": PASSWORD, "totp": "000000"})
@@ -484,9 +521,19 @@ def put_settings(ctx, headers, settings: BotSettings, totp: str | None = None):
 def test_get_settings(env):
     login(env)
     body = env.client.get("/api/settings").json()
-    assert set(body) == {"settings", "hard_caps", "llm_available", "live_allowed"}
+    assert set(body) == {
+        "settings",
+        "hard_caps",
+        "llm_available",
+        "ai_keys",
+        "grok_model",
+        "live_allowed",
+    }
     assert body["hard_caps"]["max_daily_loss_pct"] == 25.0
     assert body["llm_available"] is False and body["live_allowed"] is False
+    assert body["ai_keys"] == {"claude": False, "grok": False}
+    assert body["grok_model"] == "grok-4.7"
+    assert body["settings"]["decision_mode"] == "consensus"
 
 
 def test_tightening_saves_without_2fa(env):
@@ -522,6 +569,49 @@ def test_loosening_requires_2fa(env):
     assert ok.status_code == 200
     assert env.db.get_settings().risk.max_risk_per_trade_pct == 4.0
     assert env.db.list_audit(1)[0]["detail"]["loosened"] == ["risk.max_risk_per_trade_pct"]
+
+
+def test_leaving_consensus_requires_2fa_and_returning_does_not(env):
+    headers = login(env)
+    single = BotSettings(decision_mode="claude")
+    missing = put_settings(env, headers, single)
+    assert missing.status_code == 403 and missing.json() == {"detail": "step_up_required"}
+    assert env.db.get_settings().decision_mode == "consensus"
+    ok = put_settings(env, headers, single, totp=env.code())
+    assert ok.status_code == 200 and ok.json()["settings"]["decision_mode"] == "claude"
+    assert env.db.list_audit(1)[0]["detail"]["loosened"] == ["decision_mode"]
+    # Back to consensus (stricter) needs no code; the setting round-trips through the db.
+    back = put_settings(env, headers, BotSettings(decision_mode="consensus"))
+    assert back.status_code == 200
+    assert env.db.get_settings().decision_mode == "consensus"
+    assert env.engine.reloads == 2
+    # Switching the AI off while in consensus is also leaving consensus.
+    off = put_settings(env, headers, BotSettings(llm_enabled=False))
+    assert off.status_code == 403
+    # Between single-model modes nothing changes in strictness.
+    env.tick()
+    grok = put_settings(env, headers, BotSettings(decision_mode="grok"), totp=env.code())
+    assert grok.status_code == 200
+    swap = put_settings(env, headers, BotSettings(decision_mode="claude"))
+    assert swap.status_code == 200
+
+
+def test_invalid_decision_mode_is_refused(env):
+    headers = login(env)
+    body = {"settings": {**BotSettings().model_dump(mode="json"), "decision_mode": "yolo"}}
+    response = env.client.put("/api/settings", json=body, headers=headers)
+    assert response.status_code == 422
+    assert env.db.get_settings().decision_mode == "consensus"
+
+
+def test_settings_payload_reports_which_ai_keys_exist():
+    ctx = build(anthropic_api_key=SecretStr("sk-ant-x"), xai_api_key=SecretStr("  "))
+    with TestClient(ctx.app) as client:
+        ctx.client = client
+        login(ctx)
+        body = client.get("/api/settings").json()
+    assert body["ai_keys"] == {"claude": True, "grok": False}  # a blank key is no key
+    assert body["llm_available"] is True
 
 
 def test_hard_caps_and_validation(env):
@@ -568,6 +658,9 @@ def test_loosened_fields_rules():
     assert changed(flatten_on_halt=False) == ["risk.flatten_on_halt"]
     assert changed(max_spread_pct=0.2) == []
     assert changed(daily_profit_target_usd=200.0) == ["risk.daily_profit_target_usd"]
+    # A higher N halves the size later (or never): raising it loosens, lowering tightens.
+    assert changed(loss_streak_halve_after=5) == ["risk.loss_streak_halve_after"]
+    assert changed(loss_streak_halve_after=2) == []
     # Above the hard cap the engine clamps anyway, so cap -> above-cap is not loosening.
     capped = base.model_copy(deep=True)
     capped.risk.max_total_exposure_pct = 100.0
@@ -595,6 +688,22 @@ def test_enabling_autopilot_on_live_requires_2fa():
         assert put_settings(ctx, headers, enabled).status_code == 403
         assert put_settings(ctx, headers, enabled, totp=ctx.code()).status_code == 200
         assert ctx.db.get_settings().autopilot is True
+
+
+def test_switching_off_loss_streak_halving_needs_2fa(env):
+    headers = login(env)
+    never = BotSettings()
+    never.risk.loss_streak_halve_after = 1_000_000  # would disable the halving
+    assert put_settings(env, headers, never).status_code == 422  # above the hard cap
+    later = BotSettings()
+    later.risk.loss_streak_halve_after = 6
+    missing = put_settings(env, headers, later)
+    assert missing.status_code == 403 and missing.json() == {"detail": "step_up_required"}
+    assert put_settings(env, headers, later, totp=env.code()).status_code == 200
+    sooner = BotSettings()
+    sooner.risk.loss_streak_halve_after = 2  # tightening needs no code
+    assert put_settings(env, headers, sooner).status_code == 200
+    assert env.db.get_settings().risk.loss_streak_halve_after == 2
 
 
 def test_enabling_autopilot_in_sim_needs_no_2fa(env):
@@ -755,3 +864,15 @@ def test_cf_access_off_by_default(env, monkeypatch):
 
     monkeypatch.setattr(cf_access, "fetch_jwks", unexpected)
     assert env.client.get("/api/session").status_code == 200
+
+
+def test_startup_log_says_whether_the_access_check_is_on(caplog):
+    """SEC-6: the log states the Cloudflare Access check's state at startup, so a missing
+    or mistyped value is visible (DEPLOY step 9 also checks `python -m trader status`)."""
+    with caplog.at_level(logging.INFO, logger="trader.web.app"):
+        on = build(cf_access_team_domain=TEAM, cf_access_aud=AUD)
+        off = build()
+    assert f"Cloudflare Access check: enabled (team {TEAM}, aud {AUD[:8]}...)" in caplog.text
+    assert "Cloudflare Access check: disabled" in caplog.text
+    on.db.close()
+    off.db.close()

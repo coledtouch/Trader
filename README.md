@@ -2,8 +2,9 @@
 
 A private, self-hosted trading assistant for **one** Interactive Brokers (IBKR) account.
 It scans a short list of liquid stocks (and optionally BTC/ETH) every few minutes, asks
-Claude (or a simple rule set) whether any setup is worth taking, runs every idea through
-a strict risk manager, and places small long-only orders with a protective stop. You
+two AI models, Claude and Grok, whether any setup is worth taking (a trade goes out only
+when **both** agree; one model alone or a simple rule set are options), runs every idea
+through a strict risk manager, and places small long-only orders with a protective stop. You
 watch and control it from a web app at `https://desk.kaxo.dev` on your laptop or Android
 phone (it installs like an app).
 
@@ -32,7 +33,9 @@ So this app does something different:
   know whether a setup has an edge instead of guessing from one good day.
 
 Running costs matter as much as trading results. A droplet ($12/month), market data
-($4.50-14.50/month) and the Claude API ($1-90/month depending on model and settings)
+($4.50-14.50/month) and the AI APIs (Claude $1-90/month depending on model and settings;
+asking Grok as well adds about $0.02-0.03 per decision: roughly 1.5x the AI bill with Opus,
+2x with Sonnet and about 20x with Haiku, see the cost table)
 can add up to 5-20% of a $650 account **per month** before the first winning trade. See
 the cost table in [docs/SETUP_IBKR.md](docs/SETUP_IBKR.md#monthly-costs).
 
@@ -80,7 +83,7 @@ Two posts on Reddit's r/ai_trading shaped the design.
  |  cloudflared --http--> trader :8000  (web app + trading engine)     |
  |                          |    |    |                                |
  |                          |    |    +--> ./data/trader.db (journal)  |
- |                          |    +-------> Claude API (optional)       |
+ |                          |    +-------> Claude + Grok APIs (optional)|
  |                          |                                          |
  |                          +--TWS API--> ib-gateway :4004 paper       |
  |                            (private        :4003 live  --> IBKR     |
@@ -88,8 +91,8 @@ Two posts on Reddit's r/ai_trading shaped the design.
  +---------------------------------------------------------------------+
 ```
 
-- **trader**: this repository. A FastAPI web app plus the trading engine (scanner, Claude
-  or rule-based decisions, risk manager, journal).
+- **trader**: this repository. A FastAPI web app plus the trading engine (scanner, AI or
+  rule-based decisions, risk manager, journal).
 - **ib-gateway**: IBKR's IB Gateway in a container
   ([gnzsnz/ib-gateway-docker](https://github.com/gnzsnz/ib-gateway-docker)) with IBC to
   log in automatically. Its API port is never reachable from outside the server.
@@ -98,17 +101,31 @@ Two posts on Reddit's r/ai_trading shaped the design.
 
 ## Features
 
+- Two-model consensus (default): Claude and Grok see the same data at the same time; a BUY
+  goes out only when both buy the same symbol (the smaller size wins), and either one can
+  close a position. Fewer trades and a higher AI bill (Grok adds about $0.02-0.03 per
+  decision: ~1.5x with Opus, ~2x with Sonnet, ~20x with Haiku); switch to one model or to
+  rules-only in Settings (leaving consensus needs a 2FA code). A missing API key never
+  passes silently: the dashboard says which model is actually deciding.
 - Dashboard: mode badge (SIM / PAPER / LIVE-SHADOW / LIVE-ARMED), equity, today's P&L vs.
   target and loss limit, open positions with stop and target, connection and market status,
-  Claude spend today.
-- Big buttons: start / stop the bot, run one cycle now, **KILL** (cancel all orders and
-  close every position), resume after a halt (needs a 2FA code).
-- Activity: every AI decision with its reasoning and cost, orders with block reasons,
-  closed trades with P&L and R multiple, equity chart, daily stats.
+  which AI is deciding, market-data warnings (such as IBKR's "competing live session"),
+  AI spend today.
+- Big buttons: start / stop the bot, run one cycle now (works even while the bot is
+  stopped), **KILL** (cancel all orders and close every position), resume after a halt
+  (needs a 2FA code).
+- Activity: every AI decision with its reasoning and cost (with consensus, how each model
+  voted), orders with block reasons, closed trades with P&L and R multiple, equity chart,
+  daily stats.
 - Signals: per-setup scorecard from the signal ledger, with a "too few to judge" badge
   under 30 evaluated signals.
-- Settings: universe, risk limits, exit rules, AI model and budget, autopilot or
-  approve-every-order mode, live-trading arm/disarm, audit log.
+- Settings: universe, risk limits, exit rules, decision mode, AI model and budget,
+  autopilot or approve-every-order mode, live-trading arm/disarm, audit log.
+- Bad-tick protection: crossed quotes and bids far from the last trade are ignored for
+  valuing positions, and the bot's own stops and the daily loss limit fire only when the
+  breach shows on two checks in a row (IBKR's own stop orders are not affected).
+- Account switch guard: when the broker account changes (simulator, paper, live), the bot
+  starts a fresh journal and never manages positions it did not open on that account.
 - Phone alerts through [ntfy](https://ntfy.sh) (optional): disconnects, halts, orders
   waiting for approval.
 - Security: Cloudflare Access + the app's own password and 2FA code, step-up 2FA for
@@ -118,7 +135,9 @@ Two posts on Reddit's r/ai_trading shaped the design.
 
 Real-money orders need **three** things at once: `TRADER_ALLOW_LIVE=true` on the server, a
 live (not paper) IBKR account, and you pressing **Arm** in the app with a fresh 2FA code.
-Anything less and the bot cannot send a real order. Climb one step at a time:
+Anything less and the bot cannot send a real order. Starting the app with
+`TRADER_ALLOW_LIVE=false` clears the arm, so turning the gate back on always needs a fresh
+Arm. Climb one step at a time:
 
 | Step | What runs | Money | Move on when |
 |---|---|---|---|
@@ -128,7 +147,9 @@ Anything less and the bot cannot send a real order. Climb one step at a time:
 | 4. **Armed live** | Live orders, small limits, autopilot off at first (you approve each order) | Real | Only increase limits after weeks of results that match paper |
 
 Paper fills are kinder than real fills, so expect live results to be worse than paper.
-You can disarm, stop or kill at any time from the app.
+You can disarm, stop or kill at any time from the app. Know the difference: **Stop** ends new
+decisions while the bot keeps protecting open positions; **Disarm** blocks every order,
+including the bot's own exits (only stops held at IBKR remain); **KILL** closes everything.
 
 ## Quick start: try the simulator on your Windows laptop
 
@@ -174,13 +195,14 @@ This takes about 10 minutes and needs no IBKR account. Commands are for PowerShe
    ```
 
 Other commands: `python -m trader status` (settings check, never prints secrets),
-`reset-password`, `reset-2fa`, `logout-all`.
+`reset-password`, `reset-2fa`, `logout-all`, `disarm` (the last four also disarm live
+trading).
 
 ## Documentation
 
 | Document | What it covers |
 |---|---|
-| [docs/SETUP_IBKR.md](docs/SETUP_IBKR.md) | Your remaining IBKR checklist (IB Key, paper account, market data, Claude key) and the monthly cost table |
+| [docs/SETUP_IBKR.md](docs/SETUP_IBKR.md) | Your remaining IBKR checklist (IB Key, paper account, market data, Claude and xAI keys) and the monthly cost table |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | Installing and running it on the droplet, updates, backups, weekly 2FA, going live, troubleshooting |
 | [docs/SECURITY.md](docs/SECURITY.md) | Who can reach what, how secrets are stored, the audit log, what to do if you lose your phone |
 | [docs/STRATEGY.md](docs/STRATEGY.md) | How decisions are made, every risk and exit rule, the signal ledger, fee math |

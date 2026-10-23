@@ -6,8 +6,10 @@
 #
 # Network exposure: the only published port is 127.0.0.1:8000 (reachable from the server
 # itself, for SSH tunnels and health checks). Docker-published ports bypass ufw, so never
-# publish anything else. IB Gateway's API has no authentication: it must stay inside this
-# private Docker network.
+# publish anything else. IB Gateway's API has no authentication, so it lives on its own
+# private network ("broker") that only the trader joins. cloudflared is on "edge" with the
+# trader only: whatever ingress rules the Cloudflare dashboard holds, the tunnel cannot
+# resolve or reach ib-gateway (API ports 4003/4004, VNC 5900).
 
 x-logging: &logging
   driver: json-file
@@ -34,6 +36,7 @@ services:
       TRADER_IB_HOST: ib-gateway
     ports:
       - "127.0.0.1:8000:8000"
+    networks: [edge, broker]
     volumes:
       - ./data:/data
       # Read-write so `docker compose run --rm trader python -m trader setup` can save
@@ -71,9 +74,10 @@ services:
       TIME_ZONE: ${TIME_ZONE:-America/New_York}
       TZ: ${TIME_ZONE:-America/New_York}
       VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
-    # API ports inside this network: 4004 = paper, 4003 = live (socat relays). No ports
-    # are published. To look at the gateway screen once, see "See the gateway screen (VNC)"
-    # in docs/DEPLOY.md (a temporary docker-compose.override.yml plus an SSH tunnel).
+    # API ports inside the broker network: 4004 = paper, 4003 = live (socat relays). No
+    # ports are published. To look at the gateway screen once, see "See the gateway screen
+    # (VNC)" in docs/DEPLOY.md (a temporary docker-compose.override.yml plus an SSH tunnel).
+    networks: [broker]
     logging: *logging
 
   cloudflared:
@@ -83,6 +87,7 @@ services:
     command: tunnel --no-autoupdate run
     environment:
       TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    networks: [edge]  # never "broker": the tunnel must not reach the gateway
     depends_on:
       trader:
         condition: service_healthy
@@ -92,3 +97,9 @@ services:
     security_opt:
       - no-new-privileges:true
     logging: *logging
+
+networks:
+  # cloudflared <-> trader (the tunnel's only destination is http://trader:8000)
+  edge: {}
+  # trader <-> ib-gateway. Not `internal: true`: the gateway must reach IBKR's servers.
+  broker: {}

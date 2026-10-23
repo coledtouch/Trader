@@ -85,6 +85,7 @@ class FakeBroker(Broker):
         self.native = native_stops
         self.fee = fee
         self.delayed = False
+        self.day_trades: int | None = None  # DayTradesRemaining as IBKR last pushed it
         self.late_commission = False
         self.standalone_stops = True
         self.reject_exits = False  # refuse market exits (e.g. no liquidity, halted)
@@ -255,6 +256,7 @@ class FakeBroker(Broker):
             cash=self.cash,
             settled_cash=self.cash,
             buying_power=self.cash,
+            day_trades_remaining=self.day_trades,
         )
 
     async def positions(self) -> list[Position]:
@@ -708,6 +710,158 @@ async def test_buy_for_non_candidate_is_ignored(db, config) -> None:
     assert not h.broker.placed
 
 
+# ------------------------------------------------- fresh state when the BUY is sent
+class SlowMaker(FakeDecisionMaker):
+    """A decision maker that thinks for a while: `during` runs inside decide(), i.e. while
+    the LLM call is in flight (the monitor loop keeps ticking meanwhile)."""
+
+    def __init__(self, during) -> None:
+        super().__init__()
+        self.during = during
+
+    async def decide(self, ctx: DecisionContext) -> DecisionBatch:
+        await self.during(ctx)
+        return await super().decide(ctx)
+
+
+async def test_entry_that_fills_during_the_llm_call_is_not_doubled(db, config) -> None:
+    """ENG-1: the resting F entry fills while the models think and the monitor loop ticks.
+    The context the models saw says F is not held, but the BUY is checked against the
+    broker's state at send time, so no second bracket goes out."""
+    h = await harness(db, config)
+    h.decider.decisions = [buy(limit_price=9.99)]  # ask 10.01: the entry rests
+    await h.engine.run_cycle()
+    assert h.broker.working("STK:F", "entry")
+    h.clock.advance(minutes=5)
+
+    async def fill_and_tick(ctx: DecisionContext) -> None:
+        assert not any(p.instrument.key == "STK:F" for p in ctx.positions)
+        h.broker.set_price("F", 9.97)  # ask 9.98 <= 9.99: the entry fills
+        h.clock.advance(seconds=30)
+        await h.engine.monitor_tick()  # the independent monitor loop
+
+    maker = SlowMaker(fill_and_tick)
+    maker.decisions = [buy(limit_price=9.99)]
+    h.engine._decider = maker
+    await h.engine.run_cycle()
+    assert len([r for r in h.broker.placed if r.side == Side.BUY]) == 1
+    assert h.broker.pos["STK:F"][0] == 25
+    blocked = h.orders(OrderStatus.BLOCKED)
+    assert len(blocked) == 1 and "never add to a position" in blocked[0].message
+
+
+async def test_order_approved_during_the_llm_call_is_not_doubled(db, config) -> None:
+    """ENG-1: the owner approves an older pending F order while the models think (no
+    monitor tick in between): the new F BUY sees the approved entry working."""
+    h = await harness(db, config, autopilot=False)
+    h.decider.decisions = [buy(limit_price=9.99)]
+    await h.engine.run_cycle()
+    [pending] = h.orders(OrderStatus.PENDING_APPROVAL)
+    db.save_settings(db.get_settings().model_copy(update={"autopilot": True}))
+    h.engine.reload_settings()
+    h.clock.advance(minutes=2)
+
+    async def approve(ctx: DecisionContext) -> None:
+        await h.engine.approve_order(pending.id)
+
+    maker = SlowMaker(approve)
+    maker.decisions = [buy(limit_price=9.99)]
+    h.engine._decider = maker
+    await h.engine.run_cycle()
+    assert len([r for r in h.broker.placed if r.side == Side.BUY]) == 1
+    assert len(h.broker.working("STK:F", "entry")) == 1
+    assert any("already working" in o.message for o in h.orders(OrderStatus.BLOCKED))
+
+
+async def test_entry_in_flight_blocks_a_second_entry(db, config) -> None:
+    """ENG-1: position metadata is written before every send and kept while an entry may
+    still open a position (e.g. the broker call failed with an unknown outcome): no second
+    entry goes out for that symbol meanwhile."""
+    h = await harness(db, config)
+    h.broker.fail.add("place_order")
+    await h.engine.run_cycle()  # outcome unknown: metadata kept
+    assert db.get_position_meta("STK:F") is not None
+    h.broker.fail.clear()
+    h.clock.advance(seconds=30)  # within the metadata grace period
+    await h.engine.run_cycle()
+    assert not h.broker.placed
+    assert "in flight or still held" in h.orders(OrderStatus.BLOCKED)[0].message
+
+
+async def test_buy_is_checked_at_send_time_not_when_the_llm_was_asked(db, config) -> None:
+    """ENG-2: the cycle starts at 15:29 ET, the models answer at 15:32 and F halted
+    meanwhile. The entry window, the halt and the quote are judged at send time."""
+    h = await harness(db, config, now=datetime(2026, 10, 21, 19, 29, tzinfo=UTC))
+
+    async def slow_and_halted(ctx: DecisionContext) -> None:
+        h.clock.advance(minutes=3)
+        h.broker.set_price("F", 10.0, halted=True)
+
+    maker = SlowMaker(slow_and_halted)
+    maker.decisions = [buy()]
+    h.engine._decider = maker
+    await h.engine.run_cycle()
+    assert not h.broker.placed
+    [rec] = h.orders(OrderStatus.BLOCKED)
+    assert "outside the stock entry window" in rec.message and "F is halted" in rec.message
+    assert rec.created_at.replace(tzinfo=UTC) == h.clock()  # journaled at send time
+
+
+async def test_buy_decided_on_too_old_data_is_dropped(db, config) -> None:
+    """ENG-2: a decision that took longer than DECISION_MAX_AGE is not sent at all."""
+    h = await harness(db, config)
+
+    async def very_slow(ctx: DecisionContext) -> None:
+        h.clock.advance(minutes=4)
+
+    maker = SlowMaker(very_slow)
+    maker.decisions = [buy()]
+    h.engine._decider = maker
+    await h.engine.run_cycle()
+    assert not h.broker.placed
+    assert "decision too old" in (db.list_signals()[0].skip_reason or "")
+
+
+async def test_entry_uses_the_ask_at_send_time(db, config) -> None:
+    """ENG-2: without a limit from the model, the entry is priced off the fresh quote."""
+    h = await harness(db, config)
+
+    async def moves(ctx: DecisionContext) -> None:
+        h.clock.advance(seconds=40)
+        h.broker.set_price("F", 10.04)  # ask 10.05
+
+    maker = SlowMaker(moves)
+    maker.decisions = [buy()]
+    h.engine._decider = maker
+    await h.engine.run_cycle()
+    [sent] = [r for r in h.broker.placed if r.side == Side.BUY]
+    assert sent.limit_price == 10.05
+
+
+async def test_recent_day_trade_counts_before_ibkr_reports_it(db, config) -> None:
+    """BRK-2: IBKR pushes DayTradesRemaining every few minutes. Right after the bot's own
+    round trip closes, the stale value (1) must not allow a stock entry; once the refresh
+    window has passed, IBKR's value is trusted again."""
+    h = await harness(db, config)
+    h.broker.day_trades = 3
+    await enter_f(h)
+    h.broker.set_price("F", 9.70)  # the bracket stop fills: a same-day round trip
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    assert db.list_trades()
+    h.broker.day_trades = 1  # stale: IBKR has not counted the new day trade yet
+    h.broker.set_price("T", 20.0)
+    h.scanner.candidates = {"STK:T": [cand("T", price=20.0, stop=19.6, target=21.0)]}
+    h.decider.decisions = [buy("T")]
+    h.clock.advance(minutes=1)
+    await h.engine.run_cycle()
+    assert not [r for r in h.broker.placed if r.instrument.symbol == "T" and r.side == Side.BUY]
+    assert "no day trades remaining" in h.orders(OrderStatus.BLOCKED)[0].message
+    h.clock.advance(minutes=5)  # IBKR's value is fresh again (still 1: one left)
+    await h.engine.run_cycle()
+    assert [r for r in h.broker.placed if r.instrument.symbol == "T" and r.side == Side.BUY]
+
+
 # =========================================================================== halts
 async def test_daily_loss_halts_and_flattens(db, config) -> None:
     h = await harness(db, config, native=False)
@@ -715,6 +869,9 @@ async def test_daily_loss_halts_and_flattens(db, config) -> None:
     h.broker.set_price("F", 8.50)  # equity at the bid ~ $463: -7.4%
     h.clock.advance(minutes=1)
     await h.engine.monitor_tick()
+    assert not h.day().halted and h.broker.pos  # one tick is not enough
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()  # the breach held for two consecutive ticks
     day = h.day()
     assert day.halted and day.halt_reason.startswith("daily loss limit")
     assert h.broker.pos == {}
@@ -734,6 +891,8 @@ async def test_resume_clears_halt_and_rebaselines(db, config) -> None:
     h = await harness(db, config, native=False)
     await enter_f(h)
     h.broker.set_price("F", 8.50)
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)  # the next monitor tick
     await h.engine.monitor_tick()
     assert h.day().halted
     await h.engine.resume()
@@ -765,6 +924,8 @@ async def test_target_reached_soft_halt_keeps_managing_stops(db, config) -> None
     h.broker.set_price("F", 10.30)  # +$6.4 at the bid
     h.clock.advance(minutes=1)
     await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)  # the next monitor tick
+    await h.engine.monitor_tick()
     day = h.day()
     assert day.halted and day.halt_reason.startswith("daily target reached")
     assert h.broker.pos  # a soft halt does not flatten
@@ -773,6 +934,9 @@ async def test_target_reached_soft_halt_keeps_managing_stops(db, config) -> None
     assert len(h.decider.calls) == calls  # no new entries
     h.broker.set_price("F", 9.70)  # through the engine-managed stop
     h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    assert h.broker.pos  # an engine-side stop needs a second tick
+    h.clock.advance(seconds=15)
     await h.engine.monitor_tick()
     assert h.broker.pos == {}
     assert db.list_trades()[0].exit_reason.startswith("stop-loss 9.8 hit")
@@ -817,11 +981,51 @@ async def test_kill_switch_with_refused_exit_restores_the_stop_and_alerts(db, co
     assert rejected and "protective stop re-placed at 9.8" in rejected[0].message
 
 
+async def test_two_looks_at_one_bad_equity_print_do_not_halt(db, config) -> None:
+    """ENG-5: run_cycle runs its own monitor tick right after the monitor loop's. A single
+    bad equity snapshot seen by both at the same moment is not a confirmed loss halt."""
+    h = await harness(db, config)
+    await enter_f(h)
+    h.clock.advance(minutes=2)
+    await h.engine.monitor_tick()
+    h.broker.cash -= 40  # one bad snapshot: -8%, past the 6% loss limit
+    await h.engine.monitor_tick()  # the monitor loop
+    assert await h.engine.run_cycle() is None  # same instant: pending, no decisions
+    assert not h.day().halted and h.broker.pos["STK:F"][0] == 24
+    h.broker.cash += 40  # the next snapshot is fine
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert not h.day().halted and h.engine._halt_pending is None
+    # A loss that is still there one monitor interval later is confirmed as before.
+    h.broker.cash -= 40
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert h.day().halted and h.day().halt_reason.startswith("daily loss limit")
+
+
+async def test_engine_stop_needs_two_ticks_apart(db, config) -> None:
+    """ENG-5: one bad bid looked at twice in the same instant does not fire an engine-side
+    stop; the next monitor tick does."""
+    h = await harness(db, config, native=False)
+    await enter_f(h)
+    h.broker.set_price("F", 9.70)  # bid 9.69 below the 9.80 stop
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    await h.engine.monitor_tick()
+    assert h.broker.pos
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert h.broker.pos == {}
+
+
 async def test_refused_flatten_after_loss_halt_alerts(db, config) -> None:
     h = await harness(db, config, native=False)
     await enter_f(h)
     h.broker.reject_exits = True
     h.broker.set_price("F", 8.50)
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)  # the next monitor tick
     await h.engine.monitor_tick()
     assert h.day().halted and h.day().halt_reason.startswith("daily loss limit")
     assert "Flatten FAILED" in h.notes.titles()
@@ -868,6 +1072,36 @@ async def test_armed_live_sends_orders(db, tmp_path) -> None:
     assert h.engine.shadow
 
 
+async def test_closing_the_server_gate_clears_the_arm(db, tmp_path) -> None:
+    """TRADER_ALLOW_LIVE true -> false -> true across restarts (the documented lockdown):
+    the arm does not survive, so the bot stays in shadow mode until a fresh Arm."""
+    on = AppConfig(_env_file=None, data_dir=tmp_path, allow_live=True)
+    off = AppConfig(_env_file=None, data_dir=tmp_path, allow_live=False)
+    h = await harness(db, on, mode=Mode.LIVE)
+    await h.engine.arm_live()
+    assert not h.engine.shadow
+
+    def restart(config: AppConfig) -> Engine:
+        return Engine(
+            config, db, h.broker, h.decider, notifier=h.notes, clock=h.clock, scanner=h.scanner
+        )
+
+    locked = restart(off)
+    assert locked.shadow and not db.get_flag("live_armed")
+    [audit] = [a for a in db.list_audit() if a["action"] == "live_disarmed"]
+    assert audit["actor"] == "engine" and "TRADER_ALLOW_LIVE=false" in audit["detail"]["reason"]
+
+    reopened = restart(on)
+    assert reopened.shadow and reopened.status().live_armed is False
+    await reopened.run_cycle()
+    assert not h.broker.placed, "no real order without a fresh arm"
+    assert h.orders()[0].status == OrderStatus.BLOCKED
+    await reopened.arm_live()  # the web layer verifies a fresh 2FA code first
+    assert not reopened.shadow
+    # An arm survives a restart only while the gate stays open.
+    assert not restart(on).shadow
+
+
 async def test_arm_live_refused_for_paper_account(db, tmp_path) -> None:
     config = AppConfig(_env_file=None, data_dir=tmp_path, allow_live=True)
     h = await harness(db, config, mode=Mode.PAPER)
@@ -891,6 +1125,25 @@ async def test_autopilot_off_pending_then_approve(db, config) -> None:
     assert h.day().trades == 1
     with pytest.raises(ValueError):
         await h.engine.approve_order(rec.id)
+
+
+async def test_late_approval_gets_the_full_entry_ttl(db, config) -> None:
+    """ENG-6: an entry approved 9.5 minutes after it was proposed rests for the full 10
+    minutes from the approval, not 30 seconds."""
+    h = await harness(db, config, autopilot=False)
+    h.decider.decisions = [buy(limit_price=9.99)]  # ask 10.01: rests after approval
+    await h.engine.run_cycle()
+    [rec] = h.orders(OrderStatus.PENDING_APPROVAL)
+    h.clock.advance(minutes=9, seconds=30)
+    assert (await h.engine.approve_order(rec.id)).status == OrderStatus.SUBMITTED
+    h.clock.advance(seconds=30)
+    await h.engine.monitor_tick()
+    assert db.get_order(rec.id).status == OrderStatus.SUBMITTED
+    assert h.broker.working("STK:F", "entry")
+    h.clock.advance(minutes=9, seconds=31)  # 10 min after the approval
+    await h.engine.monitor_tick()
+    final = db.get_order(rec.id)
+    assert final.status == OrderStatus.CANCELLED and "not filled within 10 min" in final.message
 
 
 async def test_no_duplicate_pending_orders(db, config) -> None:
@@ -1057,6 +1310,9 @@ async def test_time_stop(db, config) -> None:
     await enter_f(h)
     h.clock.advance(minutes=46)
     await h.engine.monitor_tick()
+    assert h.broker.pos
+    h.clock.advance(seconds=15)  # the next monitor tick
+    await h.engine.monitor_tick()
     assert h.broker.pos == {}
     h.clock.advance(minutes=1)
     await h.engine.monitor_tick()
@@ -1088,6 +1344,8 @@ async def test_breakeven_engine_side_when_broker_cannot_modify(db, config) -> No
     h.broker.set_price("F", 10.0)
     h.clock.advance(minutes=1)
     await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)  # the next monitor tick
+    await h.engine.monitor_tick()
     assert h.broker.pos == {}
 
 
@@ -1116,6 +1374,9 @@ async def test_backup_stop_for_stock_without_working_broker_stop(db, config) -> 
     h.broker.set_price("F", 9.73)  # bid 9.72: more than 0.5% through the stop
     h.clock.advance(minutes=1)
     await h.engine.monitor_tick()
+    assert h.broker.pos  # confirmed on the next tick, not on one print
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
     assert h.broker.pos == {}
     assert h.orders()[0].request.reason.startswith("backup stop")
 
@@ -1132,6 +1393,51 @@ async def test_reconnect_replaces_missing_protective_stop(db, config) -> None:
     assert replaced.qty == 24
     assert any(a["action"] == "reprotect" for a in db.list_audit())
     assert any(a["action"] == "broker_reconnected" for a in db.list_audit())
+
+
+class QueueingBroker(FakeBroker):
+    """Holds market exits outside regular hours (IBKR queues a DAY MKT for the open)."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.rth = True
+
+    async def place_order(self, req: OrderRequest) -> OrderRecord:
+        if self.rth or req.side != Side.SELL or req.stop_loss is not None:
+            return await super().place_order(req)
+        self._require()
+        self.placed.append(req)
+        oid = f"Q{len(self.placed)}"
+        self.orders[oid] = OrderRecord(
+            request=req, status=OrderStatus.SUBMITTED, broker_order_id=oid
+        )
+        self.kind[oid], self.parent[oid] = "exit", None
+        return self.orders[oid].model_copy()
+
+
+async def test_reconnect_never_adds_a_stop_next_to_a_queued_exit(db, config) -> None:
+    """ENG-4: a kill after hours cancels the bracket stop and queues a market SELL for the
+    open. The nightly gateway restart (a reconnect) must not add a full-size stop next to
+    it: both could execute on a gap down and sell the shares twice."""
+    h = await harness(db, config, flatten_stocks_before_close=False)
+    broker = QueueingBroker(h.clock)
+    broker.set_price("F", 10.0)
+    broker.set_price("T", 20.0)
+    await broker.connect()
+    h.engine.broker = h.broker = broker
+    await enter_f(h)
+    held = broker.pos["STK:F"][0]
+    h.clock.t = datetime(2026, 10, 22, 0, 0, tzinfo=UTC)  # 20:00 ET
+    broker.rth = False
+    await h.engine.monitor_tick()
+    await h.engine.kill()
+    assert broker.working("STK:F", "exit") and not broker.working("STK:F", "stop")
+    h.clock.advance(hours=4)
+    await broker.disconnect()
+    await h.engine.monitor_tick()  # reconnects and runs the re-protect step
+    assert not broker.working("STK:F", "stop")
+    working = broker.working("STK:F", "exit") + broker.working("STK:F", "stop")
+    assert sum(broker.orders[o].request.qty for o in working) == held
 
 
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:
@@ -1247,6 +1553,34 @@ async def test_late_commissions_update_fills_and_trade(db, config) -> None:
     assert trade.commission == pytest.approx(0.70)
     assert {f.commission for f in db.list_fills()} == {0.35}
     assert h.day().fees == pytest.approx(0.70)
+
+
+async def test_execution_correction_replaces_the_journaled_fill(db, config) -> None:
+    """BRK-6: IBKR corrects an execution with a new id that differs only after the last
+    period. The journal replaces the stored fill instead of adding a second one, so the
+    round trip is 24 shares (not 48) at the corrected price and the fees count once."""
+    h = await harness(db, config)
+    base = "0000e0d5.65a1b2c3.01"
+    await enter_f(h)
+    original = h.broker.fills[0].model_copy(update={"exec_id": f"{base}.01"})
+    h.broker.fills[0] = original
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert [f.exec_id for f in db.list_fills()] == [f"{base}.01"]
+    h.broker.fills.append(original.model_copy(update={"exec_id": f"{base}.02", "price": 10.02}))
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    [buy_fill] = [f for f in db.list_fills() if f.side == Side.BUY]
+    assert buy_fill.exec_id == f"{base}.02" and buy_fill.price == 10.02
+    h.broker.set_price("F", 9.70)  # the bracket stop fills
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    [trade] = db.list_trades()
+    assert trade.qty == 24 and trade.entry_price == pytest.approx(10.02)
+    assert h.day().fees == pytest.approx(0.70)
+    h.clock.advance(minutes=3)
+    await h.engine.monitor_tick()
+    assert db.get_position_meta("STK:F") is None  # no phantom lot keeps it alive
 
 
 async def test_late_commission_grace_expires(db, config) -> None:

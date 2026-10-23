@@ -110,7 +110,8 @@ Fill in now (everything else keeps its safe default):
 | Setting | Value |
 |---|---|
 | `TUNNEL_TOKEN` | Your tunnel token: the long `eyJ...` string only. Cloudflare dashboard > **Networking** > **Tunnels** > **desk** > **Add a replica** shows it inside an install command ([Cloudflare: tunnel tokens](https://developers.cloudflare.com/tunnel/reference/tunnel-tokens/)) |
-| `ANTHROPIC_API_KEY` | Your Claude key, if you have one already (optional; empty = rules only) |
+| `ANTHROPIC_API_KEY` | Your Claude key, if you have one already ([SETUP_IBKR step 7](SETUP_IBKR.md#7-create-a-claude-api-key-needed-for-consensus-the-bot-works-rules-only-without-ai-keys)) |
+| `XAI_API_KEY` | Your xAI (Grok) key, if you have one already ([SETUP_IBKR step 7b](SETUP_IBKR.md#7b-create-an-xai-grok-api-key-needed-for-consensus)). Consensus needs both keys; with one the bot uses that model alone, with none it makes rules-only decisions, and the dashboard says which |
 | `APP_UID`, `APP_GID` | Only if step 1 showed something other than 1000 |
 
 Leave `TRADER_SECRET_KEY` empty (the next step fills it in), `TRADER_BROKER=sim` and
@@ -169,7 +170,10 @@ Look for `Registered tunnel connection`.
 2. Cloudflare asks for your e-mail address and sends a one-time PIN. Enter it.
 3. The AI Trader login appears: your password and the 6-digit code from the authenticator.
 4. The dashboard shows the **SIM** badge. Try **Start bot**, **Run cycle now** and the
-   **KILL** button: it is all fake money. Stocks only trade 09:30-16:00 ET on weekdays (new
+   **KILL** button: it is all fake money. **Run cycle now** also works while the bot is
+   stopped: it makes exactly one decision cycle (orders still go through every risk check
+   and, with autopilot off, wait for your approval), which is handy for checking a change
+   without starting the bot. Stocks only trade 09:30-16:00 ET on weekdays (new
    entries 09:45-15:30); at other times a cycle has nothing to do unless you switch on
    **Trade crypto** in Settings (fine in the simulator; see the fee notes before using it
    for real).
@@ -205,7 +209,15 @@ This protects you if the tunnel or a Cloudflare setting is ever misconfigured.
    ```bash
    docker compose up -d
    ```
-4. Reload the app. If every page now says `{"detail":"forbidden"}`, one of the two values is
+4. Check that the check is really on (a value with a typo in its name is otherwise easy to
+   miss):
+   ```bash
+   docker compose exec trader python -m trader status
+   ```
+   `Cloudflare Access` must say `enabled`; the app log also says
+   `Cloudflare Access check: enabled` at every start. If only one of the two values is set,
+   the app refuses to start and its log names the missing variable.
+5. Reload the app. If every page now says `{"detail":"forbidden"}`, one of the two values is
    wrong: `docker compose logs --tail 20 trader` shows the reason after
    `Cloudflare Access: refused`.
 
@@ -239,9 +251,10 @@ Live market data (SETUP_IBKR steps 5-6) is optional at first.
    The paper username needs no phone approval. (If you use your *live* username with
    `TRADING_MODE=paper`, approve the IB Key push on your phone.)
 3. In the app the badge changes to **PAPER** and the connection light turns green.
-4. In the app's **Settings**, choose the stock universe and the Claude budget
-   ([SETUP_IBKR.md cost advice](SETUP_IBKR.md#claude-api-cost-estimate)) and keep the
-   dollar limits sized for your real account (max order $250).
+4. In the app's **Settings**, choose the stock universe, the decision mode and the AI
+   budget (it covers Claude and Grok together;
+   [SETUP_IBKR.md cost advice](SETUP_IBKR.md#ai-api-cost-estimate)) and keep the dollar
+   limits sized for your real account (max order $250).
 5. Once market data is subscribed and shared with the paper account, switch to live
    prices: in `.env`, set the market data line to 1:
    ```
@@ -307,8 +320,15 @@ Only after paper and shadow results convinced you. Start small.
    The gateway restarts because `READ_ONLY_API` changed: approve the IB Key push.
 3. In the app: **Settings** > **Live trading** > **Arm**, and enter a fresh 6-digit code.
    The badge turns **LIVE-ARMED**. Real orders are now possible.
-4. To stop real orders at any time: **Disarm** in the app (instant). To lock live trading on
-   the server too, set `TRADER_ALLOW_LIVE=false` and run `docker compose up -d`.
+4. To stop real orders at any time: **Disarm** in the app (instant), or from the server
+   `docker compose exec trader python -m trader disarm`. Disarm blocks **every** order,
+   including the bot's own exits: crypto stops, flatten before the close, the daily-loss
+   flatten and re-placing a lost stop all pause, and only the stock stops at IBKR keep
+   working. To stop new trades but keep the bot protecting open positions, press **Stop
+   bot** instead; to close everything, **KILL**. To lock live trading on the server too,
+   set `TRADER_ALLOW_LIVE=false` and run `docker compose up -d`: starting with the gate off
+   also clears the arm, so after setting it back to `true` real orders need a fresh
+   **Arm** with a 2FA code (step 3).
 
 ---
 
@@ -322,8 +342,9 @@ All of these start with `cd ~/Trader`.
 | App log, last 100 lines | `docker compose logs --tail 100 trader` |
 | Follow a log live (`Ctrl+C` to stop) | `docker compose logs -f trader` (or `ib-gateway`, `cloudflared`) |
 | Settings check (no secrets shown) | `docker compose exec trader python -m trader status` |
-| Restart only the app (gateway stays logged in) | `docker compose restart trader` |
-| Apply `.env` changes | `docker compose up -d` |
+| Restart only the app (gateway stays logged in) | `docker compose restart trader` (keeps the old `.env` values) |
+| Apply `.env` changes | `docker compose up -d` (`docker compose restart` does **not** reload `.env`) |
+| Disarm live trading from the server | `docker compose exec trader python -m trader disarm` |
 | Stop everything | `docker compose down` |
 
 `docker compose down` logs the gateway out. Stock positions keep their stop-loss orders at
@@ -332,7 +353,16 @@ IBKR, but **crypto stops are managed by the bot and stop working** while it is d
 **Stop bot** in the app only stops new decisions. As long as the app runs it keeps watching
 open positions (crypto stops, the daily loss limit, closing stocks before the bell), and
 after a restart the bot comes back in the same state: running if it was running, otherwise
-just watching. Only KILL closes everything.
+just watching. The exception is a live account in shadow mode (not armed, or disarmed):
+then the bot sends nothing at all, its own exits included, and only the stock stops at
+IBKR protect you. Only KILL closes everything. **Run cycle now** still works while the bot is
+stopped: it runs one decision cycle on demand (same risk checks, same autopilot rule).
+
+**Switching accounts** (simulator -> paper -> live, or another paper account): the bot
+remembers which broker account its journal belongs to. When the account changes it
+forgets the old account's positions and working orders (it will not manage them), cancels
+pending approvals, restarts today's P&L from the new account's equity, **disarms live
+trading**, writes `account_changed` to the audit log and sends a phone alert.
 
 **Emergency, app unreachable:** `docker compose stop trader` stops the bot. Then manage
 positions in IBKR Mobile. If IBKR refuses the phone login because the gateway holds the
@@ -420,6 +450,8 @@ ntfy, you get an alert when the broker connection has been down for over a minut
 | White page with `{"detail":"forbidden"}` (403) | The app's Cloudflare Access check failed | Wrong `TRADER_CF_ACCESS_TEAM_DOMAIN` or `TRADER_CF_ACCESS_AUD`. The trader log says why after `Cloudflare Access: refused`. Empty both values + `docker compose up -d` to switch the check off while you fix it |
 | `Invalid host header` (400) | `TRADER_ALLOWED_HOSTS` does not contain `desk.kaxo.dev` | Fix it in `.env`, keep `localhost,127.0.0.1` too, `docker compose up -d` |
 | Login always fails with correct password | The phone's clock is off (2FA codes are time based), or too many attempts | Set the phone to automatic date and time. After 5 wrong tries wait 15 minutes |
+| Login always fails right after `setup`; the trader log says `logins will fail` and `status` shows `TRADER_SECRET_KEY missing` | The container was created before `setup` wrote the key, and `docker compose restart` keeps the old (empty) value | `docker compose up -d --force-recreate trader` |
+| `trader` keeps restarting, log (or `status`) says `Cloudflare Access is half configured` | Only one of `TRADER_CF_ACCESS_TEAM_DOMAIN` / `TRADER_CF_ACCESS_AUD` is set, often a misspelled variable name | Set both (exact names) or neither, then `docker compose up -d` |
 | Saving settings fails ("origin" error) | `TRADER_PUBLIC_ORIGINS` is not exactly `https://desk.kaxo.dev` | Fix it, no trailing slash, `docker compose up -d` |
 | `trader` is `unhealthy` | The health check uses host `127.0.0.1` | Keep `localhost,127.0.0.1` in `TRADER_ALLOWED_HOSTS`; read the trader log |
 | `setup` fails or `trader` keeps restarting with `Permission denied: '/data/trader.db'` | `data` was created by Docker as root | `sudo chown -R $(id -u):$(id -g) ~/Trader/data && docker compose up -d` |
@@ -429,7 +461,30 @@ ntfy, you get an alert when the broker connection has been down for over a minut
 | Gateway log repeats login attempts ("login loop") | Wrong username/password; paper username with `TRADING_MODE=live`; IB Key push not approved; IBKR's nightly maintenance (around midnight ET and weekends) | Log in to the Client Portal in a browser with the same username to rule out a locked account or password problem. Check phone notifications. If it persists, look at the gateway screen (below) |
 | No IB Key notification arrives | Android blocked notifications or put IBKR Mobile to sleep | Phone settings: notifications on, battery Unrestricted. Open IBKR Mobile, then `docker compose restart ib-gateway` |
 | Dashboard shows delayed data | No subscription, not shared with paper, or `TRADER_IB_MARKET_DATA_TYPE` not 1 | See SETUP_IBKR steps 5-6 and [Part B step 5](#part-b-paper-trading). Live accounts refuse stock entries on delayed data |
+| Yellow warning "IBKR error 10197: no market data while another session of this login holds it" | You are logged in to the live account elsewhere (IBKR Mobile, TWS, Client Portal trading) while the paper gateway runs; shared market data goes to one session only. See [below](#no-market-data-error-10197) | Log out of the other session. Data returns within a minute and the warning clears; meanwhile the bot opens nothing in the affected symbols |
+| Yellow warning "Consensus mode needs both API keys..." | `ANTHROPIC_API_KEY` or `XAI_API_KEY` is empty or misspelled in `.env` | Fill in the missing key and `docker compose up -d`, or pick a single-model mode in Settings. Until then the one model with a key decides alone |
+| Every Grok decision shows an error ("HTTP 401", "HTTP 403", "HTTP 429") | Wrong xAI key, key not allowed for the model, or prepaid credits used up | console.x.ai: check the key, its model permissions and the credit balance. In consensus mode nothing is bought while Grok fails; exits still work |
+| Alert "Broker account changed" | The gateway logged in to a different account (paper/live switch, or another user) | Expected after a switch. If not: check `TWS_USERID`, `TRADING_MODE` and `TRADER_IB_ACCOUNT` in `.env`. The bot does not manage the previous account's positions |
 | Disk full | Old images | `df -h`, then `docker image prune -f`. Container logs are capped at 50 MB each |
+
+### No market data (error 10197)
+
+Your paper account uses the live account's market data subscriptions, and IBKR delivers
+that data to **one** session at a time. When you log in to the live account (IBKR Mobile,
+TWS, Client Portal trading) during market hours, the paper gateway can lose it and IB
+Gateway reports error 10197, "No market data during competing live session". Prices the
+bot already had may then simply stop updating, which looks normal but is stale.
+
+What the bot does: every symbol that got a 10197 counts as having **no usable data** until
+a fresh price arrives after the error. Those symbols get no new entries (approvals wait),
+the dashboard shows a yellow warning naming them, and **Last error** says the same. Every
+minute or so the bot re-subscribes to find out whether data is back. Stop orders already
+at IBKR keep working; the bot's own checks for those symbols pause.
+
+What to do: log out of the live session (close IBKR Mobile completely, or use it only
+outside market hours while paper trading). The warning disappears once prices flow again.
+In shadow and live mode the gateway itself is the live session, so this mostly matters
+during paper trading.
 
 ### See the gateway screen (VNC)
 

@@ -103,6 +103,8 @@
             <button id="resume-btn" class="btn btn-lg" type="button" aria-haspopup="dialog" hidden>Resume trading…</button>
             <button id="kill-btn" class="btn btn-danger btn-lg btn-kill" type="button" aria-haspopup="dialog">KILL: close everything</button>
           </div>
+          <p class="small muted mt-8">Run cycle now makes one decision cycle even while the bot is
+            stopped (orders still follow autopilot and every risk check).</p>
         </section>
 
         <section class="card" aria-labelledby="health-heading">
@@ -113,12 +115,15 @@
             <li id="chip-market" class="chip">Market</li>
             <li id="chip-data" class="chip">Data</li>
             <li id="chip-autopilot" class="chip">Autopilot</li>
+            <li id="chip-ai" class="chip">AI</li>
           </ul>
           <dl class="kv">
             <div><dt>Last cycle</dt><dd id="last-cycle">—</dd></div>
             <div><dt>Next cycle</dt><dd id="next-cycle">—</dd></div>
             <div><dt>Updated</dt><dd id="updated-at">—</dd></div>
           </dl>
+          <p id="decision-warning" class="inline-warn" role="status" hidden></p>
+          <p id="data-warning" class="inline-warn" role="status" hidden></p>
           <p id="last-error" class="inline-warn" hidden></p>
         </section>
 
@@ -250,8 +255,7 @@
         </div>
         <p class="small muted">Changes that loosen a risk limit need a fresh 2FA code. Hard caps are
           enforced on the server whatever is entered here.</p>
-        <p id="llm-note" class="inline-warn" hidden>No Anthropic API key is configured on the server, so
-          the bot makes rules-only decisions.</p>
+        <p id="llm-note" class="inline-warn" hidden></p>
         <div id="settings-error" class="form-error mt-12" role="alert"></div>
         <div id="settings-fields" class="settings-fields mt-12"><p class="empty">Loading…</p></div>
         <div class="form-actions">

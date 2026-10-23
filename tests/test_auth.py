@@ -437,8 +437,10 @@ def test_cli_setup_interactive(tmp_path, monkeypatch, capsys):
 def test_cli_reset_password_logout_all_and_status(tmp_path, monkeypatch, capsys):
     key = crypto.generate_secret_key()
     env_file = tmp_path / ".env"
-    env_file.write_text(f"TRADER_SECRET_KEY={key}\n", encoding="utf-8")
-    monkeypatch.delenv("TRADER_SECRET_KEY", raising=False)
+    xai_key = "xai-cli-secret-0123456789"
+    env_file.write_text(f"TRADER_SECRET_KEY={key}\nXAI_API_KEY={xai_key}\n", encoding="utf-8")
+    for name in ("TRADER_SECRET_KEY", "XAI_API_KEY", "TRADER_XAI_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("TRADER_DATA_DIR", str(tmp_path / "data"))
     config = AppConfig(_env_file=env_file)
     db = Database(config.db_path)
@@ -463,6 +465,11 @@ def test_cli_reset_password_logout_all_and_status(tmp_path, monkeypatch, capsys)
     out = capsys.readouterr().out
     assert "owner credentials" in out and "configured" in out
     assert key not in out and secret not in out
+    assert xai_key not in out
+    lines = {
+        line.split("  ", 1)[0].strip(): line.split("  ", 1)[-1].strip() for line in out.splitlines()
+    }
+    assert lines["xAI API key"] == "set" and lines["decision mode"] == "consensus"
     db.close()
 
 
@@ -486,3 +493,65 @@ def test_cli_reset_2fa_writes_new_secret(tmp_path, monkeypatch):
 def test_cli_setup_requires_secret_out_with_password_stdin(tmp_path, capsys):
     assert cli.main(["setup", "--env-file", str(tmp_path / ".env"), "--password-stdin"]) == 1
     assert "--totp-secret-out" in capsys.readouterr().err
+
+
+def test_cli_compromise_commands_disarm_live(tmp_path, monkeypatch, capsys):
+    """logout-all, reset-2fa, reset-password and disarm clear a stored live arm, so a phone
+    thief's arming (or the owner's) never outlives the lockdown: re-arming needs a fresh
+    2FA code in the app."""
+    key = crypto.generate_secret_key()
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"TRADER_SECRET_KEY={key}\n", encoding="utf-8")
+    monkeypatch.delenv("TRADER_SECRET_KEY", raising=False)
+    monkeypatch.setenv("TRADER_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig(_env_file=env_file)
+    db = Database(config.db_path)
+    Authenticator(config, db, hasher=FAST).set_owner(PASSWORD, new_totp_secret())
+    base = ["--env-file", str(env_file)]
+    try:
+        commands = [
+            ["logout-all", *base],
+            ["disarm", *base],
+            ["reset-2fa", *base, "--totp-secret-out", str(tmp_path / "totp.txt")],
+            ["reset-password", *base, "--password-stdin"],
+        ]
+        for argv in commands:
+            db.set_flag("live_armed", True)
+            monkeypatch.setattr("sys.stdin", io.StringIO("a brand new password\n"))
+            capsys.readouterr()
+            assert cli.main(argv) == 0, argv
+            assert db.get_flag("live_armed") is False, argv
+            assert "now disarmed" in capsys.readouterr().out, argv
+        reasons = [a["detail"]["reason"] for a in db.list_audit() if a["action"] == "live_disarmed"]
+        assert len(reasons) == 4 and all(a.endswith("(CLI)") for a in reasons)
+        assert cli.main(["disarm", *base]) == 0
+        assert "was not armed" in capsys.readouterr().out
+    finally:
+        db.close()
+
+
+def test_serve_logging_never_writes_the_ntfy_topic(caplog):
+    """httpx logs every request URL at INFO; the ntfy topic (and any ?auth= token) in that
+    URL is a secret, so the app's logging setup keeps the HTTP clients at WARNING."""
+    import asyncio
+    import logging
+
+    import httpx
+
+    from trader.notify import Notifier
+
+    url = "https://ntfy.sh/supersecret-topic-abc123?auth=TOKENINQUERY"
+    config = AppConfig(_env_file=None, ntfy_url=url, ntfy_token=SecretStr("tk_header"))
+    saved = {name: logging.getLogger(name).level for name in cli.QUIET_LOGGERS}
+    try:
+        cli.configure_logging("INFO")
+        with caplog.at_level(logging.INFO):
+            notifier = Notifier(
+                config, transport=httpx.MockTransport(lambda request: httpx.Response(200))
+            )
+            assert asyncio.run(notifier.send("Trade filled", "BUY F 24 @ 10.01")) is True
+        for secret in ("supersecret-topic-abc123", "TOKENINQUERY", "tk_header"):
+            assert secret not in caplog.text
+    finally:
+        for name, level in saved.items():
+            logging.getLogger(name).setLevel(level)

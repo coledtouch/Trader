@@ -166,7 +166,7 @@ async def test_request_parameters():
     assert kwargs["betas"] == [FALLBACK_BETA] == ["server-side-fallback-2026-07-01"]
     assert kwargs["fallbacks"] == "default"
     assert kwargs["system"] == [
-        {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral"}}
+        {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral", "ttl": "1h"}}
     ]
     assert kwargs["messages"] == [{"role": "user", "content": render_context(ctx)}]
     for forbidden in ("temperature", "top_p", "top_k", "thinking", "tool_choice"):
@@ -554,7 +554,7 @@ async def test_real_sdk_request_body_and_parse():
     assert body["output_config"]["effort"] == "medium"
     assert body["output_config"]["format"]["type"] == "json_schema"
     assert body["fallbacks"] == "default"
-    assert body["system"][0]["cache_control"] == {"type": "ephemeral"}
+    assert body["system"][0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
     assert batch.error is None and batch.market_view == "Constructive."
     assert [(d.action, d.symbol, d.size_fraction) for d in batch.decisions] == [
@@ -715,6 +715,11 @@ def test_render_context_lists_positions_candidates_and_market():
     text = render_context(rich_ctx())
     assert "STK:SPY qty 1 avg 600 | last 602" in text
     assert "stop NONE" in text  # BTC position without a stop is flagged
+    # ...as one the bot did not open (ENG-3): the models are told never to CLOSE it.
+    [btc] = [line for line in text.splitlines() if line.startswith("CRYPTO:BTC qty")]
+    assert btc.endswith("not opened by the bot: never CLOSE")
+    [spy] = [line for line in text.splitlines() if line.startswith("STK:SPY qty")]
+    assert "not opened by the bot" not in spy
     assert "## Candidates (BUY only from this list; 10)" in text
     assert "CRYPTO:ETH vwap_reclaim score 0.86 | price 109 stop 107 target 113 R:R 2.00" in text
     assert "orb_high=" in text  # candidate-only features are shown
@@ -773,3 +778,46 @@ def test_module_constants():
     assert claude_mod.DEFAULT_MODEL == "claude-opus-5-5"
     assert claude_mod.REQUEST_TIMEOUT_S == 90.0
     assert claude_mod.MAX_RETRIES == 2
+
+
+# ---------------------------------------------------------------------- 1-hour prompt cache
+def test_one_hour_cache_writes_cost_twice_the_input_price() -> None:
+    m = 1_000_000
+    for model, base in [
+        ("claude-opus-5-5", 4.0),
+        ("claude-sonnet-5-5", 2.0),
+        ("claude-haiku-5-5", 0.10),
+        ("claude-opus-5", 5.0),
+        ("claude-opus-4-8", 5.0),
+    ]:
+        assert claude_mod.PRICES[model].cache_write_1h == pytest.approx(2 * base)
+        assert estimate_cost(model, 0, 0, cache_write_1h_tokens=m) == pytest.approx(2 * base)
+    assert claude_mod.CACHE_CONTROL == {"type": "ephemeral", "ttl": "1h"}
+
+
+def test_usage_cost_splits_cache_writes_by_ttl() -> None:
+    split = SimpleNamespace(ephemeral_5m_input_tokens=1000, ephemeral_1h_input_tokens=3000)
+    use = usage(inp=500, out=100, write=4000)
+    use.cache_creation = split
+    prompt, out, cost = usage_cost(use, "claude-opus-5-5")
+    assert (prompt, out) == (4500, 100)
+    assert cost == pytest.approx((500 * 4 + 100 * 20 + 1000 * 5 + 3000 * 8) / 1e6)
+
+
+def test_usage_cost_without_breakdown_charges_one_hour_writes() -> None:
+    use = usage(inp=500, out=100, write=4000)  # no usage.cache_creation
+    _, _, cost = usage_cost(use, "claude-opus-5-5")
+    assert cost == pytest.approx((500 * 4 + 100 * 20 + 4000 * 8) / 1e6)
+
+
+async def test_real_sdk_one_hour_cache_usage_is_priced() -> None:
+    answer = output(decision("HOLD", "AMD"))
+    body = api_message([{"type": "text", "text": answer.model_dump_json()}], "end_turn")
+    body["usage"].update(
+        cache_read_input_tokens=0,
+        cache_creation_input_tokens=2500,
+        cache_creation={"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 2500},
+    )
+    batch = await sdk_maker(body, {}).decide(base_ctx())
+    assert batch.input_tokens == 2000 + 2500
+    assert batch.cost_usd == pytest.approx((2000 * 4 + 900 * 20 + 2500 * 8) / 1e6)

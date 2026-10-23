@@ -73,7 +73,9 @@ limit or the loss streak is growing, become more selective, not less.
 7. CLOSE fully exits an open position at market. Use it when the reason for the trade \
 is gone: the setup failed (lost VWAP, the EMA trend flipped), momentum clearly \
 reversed, or the position should not be held any longer. Do not CLOSE on ordinary \
-noise above the stop: every position already has a protective stop.
+noise above the stop: every position the bot opened already has a protective stop. A \
+position marked "not opened by the bot" belongs to the owner: never CLOSE it (the engine \
+refuses to).
 8. HOLD means do nothing, and it is the right answer most of the time. Prefer HOLD \
 whenever the edge is unclear: weak or extended candidates, thin volume, choppy \
 conditions, stale data or conflicting signals. Returning no decisions is fine.
@@ -219,6 +221,10 @@ def _position_line(pos: Position, now: datetime) -> str:
     if pos.opened_at is not None:
         minutes = max((_utc(now) - _utc(pos.opened_at)).total_seconds() / 60, 0.0)
         parts.append(f"held {minutes:.0f}m")
+    if pos.stop_loss is None:
+        # Every position the bot opens has a stop in its metadata; one without was opened
+        # by the owner (or on another account) and is never managed by the bot.
+        parts.append("not opened by the bot: never CLOSE")
     return " | ".join(parts)
 
 

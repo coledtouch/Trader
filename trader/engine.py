@@ -28,7 +28,7 @@ import json
 import logging
 import math
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -71,7 +71,10 @@ from trader.risk import (
     available_cash,
     is_soft_halt,
     max_position_value,
+    sane_exit_price,
 )
+from trader.strategy.consensus import PREFIX as CONSENSUS_PREFIX
+from trader.strategy.consensus import label as maker_label
 from trader.strategy.decide import DecisionMaker, RuleBasedDecisionMaker
 from trader.strategy.signals import Scanner
 from trader.timeutil import (
@@ -92,6 +95,12 @@ BROKER_DOWN_NOTIFY_AFTER = timedelta(seconds=60)
 BACKUP_STOP_BREACH = 0.005  # stocks: engine sells only 0.5% beyond a stop the broker lacks
 FLATTEN_BEFORE_CLOSE_MIN = 10.0
 CLOSE_RETRY = timedelta(seconds=60)  # do not resend an engine close sooner than this
+# A BUY decided on market data older than this is dropped instead of sent (the decision
+# maker took too long: the setup is stale). Younger ones are re-checked on fresh data.
+DECISION_MAX_AGE = timedelta(minutes=3)
+# IBKR pushes DayTradesRemaining about every 3 minutes: the bot's own day trades younger
+# than this are subtracted from it before an entry is checked.
+PDT_REFRESH = timedelta(minutes=5)
 COMMISSION_GRACE = timedelta(minutes=2)  # wait this long for late commission reports
 STALE_META_GRACE = timedelta(minutes=2)
 ORDER_FORGET_AFTER = timedelta(days=1)
@@ -113,6 +122,17 @@ EPS = 1e-9
 BAR_LOOKBACK = {"1 min": "2 D", "5 mins": "5 D", "15 mins": "10 D"}
 EXTRA_PREFIX = "position_extra:"
 BASELINE_PREFIX = "halt_baseline:"
+ACCOUNT_KEY = "broker_account"  # kv: the broker account id the journal belongs to
+SENT_PREFIX = "order_sent:"  # kv: when an approved order was actually sent (order id)
+# Engine-side stops/targets/time stops and the daily halts fire only when the breach is
+# seen on this many consecutive monitor ticks (one bad tick never sells or flattens).
+# Broker-native stops are not affected.
+BREACH_CONFIRM_TICKS = 2
+# ...and those ticks must span at least this fraction of the monitor interval, so the tick
+# run_cycle runs right after the monitor loop's never counts as a second look.
+BREACH_MIN_SPACING = 0.5
+# Which API key each LLM decision maker needs (for the "fell back" warning).
+KEY_NAMES = {"claude": "Anthropic", "grok": "xAI"}
 
 
 class SignalScanner(Protocol):
@@ -282,6 +302,16 @@ def _refused_exits(records: Iterable[OrderRecord]) -> str:
     )
 
 
+def _mask(account_id: str) -> str:
+    """Account ids in logs, the audit log and notifications: the type prefix (IBKR "DU" =
+    paper, "U" = live) and the last 3 characters."""
+    text = account_id.strip()
+    if len(text) <= 5:
+        return text
+    letters = len(text) - len(text.lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"))
+    return f"{text[: min(letters, 2)]}...{text[-3:]}"
+
+
 def _short(text: str, limit: int = 200) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 3] + "..."
@@ -299,18 +329,26 @@ class Engine:
         *,
         scanner: SignalScanner | None = None,
         risk: RiskManager | None = None,
+        makers: Mapping[str, DecisionMaker] | None = None,
     ) -> None:
+        """`makers` maps decision modes ("rules", "claude", "grok", "consensus") to the makers
+        that exist (a mode is missing when its API key is). With it, settings.decision_mode
+        picks the maker every cycle; without it, `decider` is used for every AI mode."""
         self.config = config
         self.db = db
         self.broker = broker
-        self.decider = decider
+        self._decider = decider
+        self._makers: dict[str, DecisionMaker] | None = dict(makers) if makers is not None else None
         self.notifier = notifier
         self._clock = clock
         self.settings = db.get_settings()
         self.scanner: SignalScanner = scanner or Scanner(self.settings, tz=config.market_timezone)
         self.risk = risk or RiskManager(self.settings.risk)
         fallback = getattr(decider, "fallback", None)
-        if isinstance(decider, RuleBasedDecisionMaker):
+        listed = (self._makers or {}).get("rules")
+        if isinstance(listed, RuleBasedDecisionMaker):
+            self.rules = listed
+        elif isinstance(decider, RuleBasedDecisionMaker):
             self.rules = decider
         elif isinstance(fallback, RuleBasedDecisionMaker):
             self.rules = fallback
@@ -357,16 +395,87 @@ class Engine:
         self._ledger_retry: dict[str, datetime] = {}  # instrument -> no bar requests until
         self._fallback_logged: str | None = None
         self._last_ledger_at: datetime | None = None
+        # consecutive monitor ticks that saw an engine-side exit / a daily halt condition
+        # instrument -> (kind, ticks, first seen)
+        self._breaches: dict[str, tuple[str, int, datetime]] = {}
+        self._halt_streak: tuple[str, int, datetime] | None = None  # (halt kind, ticks, first)
+        self._halt_pending: str | None = None  # halt seen once, waiting for confirmation
 
-        # The simulator keeps its account in memory, so every process trades a fresh
-        # simulated account: journal fills from before this point are never matched against
-        # it, and today's P&L restarts from its equity at the first snapshot.
-        self._sim_epoch: datetime | None = self._now() if broker.mode == Mode.SIM else None
-        self._sim_rebased = False
+        # Journal epoch. The simulator keeps its account in memory, so every process trades
+        # a fresh simulated account; a change of broker account (sim -> paper -> live) is
+        # the same situation. Journal fills from before the epoch are never matched against
+        # the new account, open journal orders from before it are closed out, and today's
+        # P&L restarts from the new account's equity at the next snapshot.
+        self._epoch: datetime | None = self._now() if broker.mode == Mode.SIM else None
+        self._epoch_reason = "simulator restarted"
+        self._rebase_pending = self._epoch is not None
+        self._enforce_live_gate()
+
+    def _enforce_live_gate(self) -> None:
+        """Arming lasts only while the server gate (TRADER_ALLOW_LIVE) stays open. The gate
+        is read from the environment at process start, so a process that starts with it
+        closed clears a stored arm: re-opening the gate later always needs a fresh Arm with
+        a 2FA code (the documented lockdown must not be undone by re-enabling the gate)."""
+        if self.config.allow_live or not self.db.get_flag("live_armed"):
+            return
+        self.db.set_flag("live_armed", False)
+        self.db.audit(
+            "live_disarmed", {"reason": "TRADER_ALLOW_LIVE=false at startup"}, actor="engine"
+        )
+        log.warning("live trading disarmed: TRADER_ALLOW_LIVE is false (a fresh Arm is needed)")
 
     # ------------------------------------------------------------------ basics
     def _now(self) -> datetime:
         return _aware(self._clock()).astimezone(UTC)
+
+    @property
+    def decider(self) -> DecisionMaker:
+        """The decision maker the settings select right now (see `_resolve_decider`)."""
+        return self._resolve_decider()[0]
+
+    def _resolve_decider(self) -> tuple[DecisionMaker, str | None]:
+        """(maker for settings.decision_mode, warning when it is not what the owner chose).
+
+        Consensus needs both API keys; with one, that model decides alone, and with none
+        (or a single-model mode without its key) the rule-based maker decides. The engine
+        never pretends: every fallback comes with a warning for the dashboard."""
+        if self._makers is None:
+            return self._decider, None
+        mode = self.settings.decision_mode
+        makers = self._makers
+        if mode == "rules":
+            return self.rules, None
+        if mode in makers:
+            return makers[mode], None
+        if mode == "consensus":
+            have = [name for name in ("claude", "grok") if name in makers]
+            if len(have) == 1:
+                alone = have[0]
+                missing = "grok" if alone == "claude" else "claude"
+                return makers[alone], (
+                    f"Consensus mode needs both API keys, but no {KEY_NAMES[missing]} key "
+                    f"is set: {maker_label(alone)} decides alone (no second opinion)."
+                )
+            return self.rules, (
+                "Consensus mode needs Anthropic and xAI API keys and neither is set: "
+                "rules-only decisions."
+            )
+        return self.rules, (
+            f"{maker_label(mode)} mode needs an {KEY_NAMES.get(mode, mode)} API key, "
+            "which is not set: rules-only decisions."
+        )
+
+    def _all_makers(self) -> list[DecisionMaker]:
+        """Every decision maker the engine may call, including those inside consensus."""
+        found: list[DecisionMaker] = []
+        pending: list[object] = [self._decider, *(self._makers or {}).values()]
+        while pending:
+            maker = pending.pop()
+            if maker is None or any(maker is m for m in found):
+                continue
+            found.append(maker)  # type: ignore[arg-type]
+            pending += [getattr(maker, attr, None) for attr in ("primary", "secondary")]
+        return found
 
     @property
     def shadow(self) -> bool:
@@ -642,14 +751,15 @@ class Engine:
         self.risk.set_limits(self.settings.risk)
         self.scanner.settings = self.settings
         self.rules.settings = self.settings
-        fallback = getattr(self.decider, "fallback", None)
-        if isinstance(fallback, RuleBasedDecisionMaker):
-            fallback.settings = self.settings
         from trader.strategy.claude import ClaudeDecisionMaker
 
-        if isinstance(self.decider, ClaudeDecisionMaker):
-            self.decider.model = self.settings.llm_model
-            self.decider.effort = self.settings.llm_effort
+        for maker in self._all_makers():  # decision_mode itself is read every cycle
+            fallback = getattr(maker, "fallback", None)
+            if isinstance(fallback, RuleBasedDecisionMaker):
+                fallback.settings = self.settings
+            if isinstance(maker, ClaudeDecisionMaker):
+                maker.model = self.settings.llm_model
+                maker.effort = self.settings.llm_effort
 
     # ------------------------------------------------------------------ approvals
     async def approve_order(self, order_id: int, actor: str = "owner") -> OrderRecord:
@@ -671,13 +781,25 @@ class Engine:
             open_orders = await self.broker.open_orders()
             day = self._today(now)
             verdict = None
+            checked_account = self._with_day_trades(account, now)
+            known_account = self.db.get_kv(ACCOUNT_KEY)
+            if known_account and account.account_id and account.account_id != known_account:
+                self.db.update_order(
+                    order_id,
+                    status=OrderStatus.CANCELLED,
+                    message="cancelled: broker account changed since this order was proposed",
+                )
+                self._revert_signal(order_id, "broker account changed")
+                return self._get_order(order_id)
             if req.instrument.key in self._pending_trades:
                 reasons = ["previous trade in this symbol is still being journaled"]
+            elif self._halt_pending is not None and not req.is_exit:
+                reasons = [f"halt condition being confirmed: {self._halt_pending}"]
             else:
                 verdict = self.risk.check(
                     req,
                     quote=quote,
-                    account=account,
+                    account=checked_account,
                     positions=positions,
                     open_orders=open_orders,
                     day=day,
@@ -712,6 +834,8 @@ class Engine:
                 self._close_reasons[order.instrument.key] = order.reason
             else:
                 placed = await self._send_entry(order, now)
+                # The stale-entry timer runs from now, not from when it was proposed.
+                self.db.set_kv(SENT_PREFIX + str(order_id), now.isoformat())
             self.db.update_order(
                 order_id,
                 request=order,
@@ -780,6 +904,7 @@ class Engine:
     def status(self) -> EngineStatus:
         now = self._now()
         day = self._day
+        maker, warning = self._resolve_decider()
         equity = self._account.equity if self._account is not None else None
         start = day.start_equity if day is not None else None
         loss_limit: float | None = None
@@ -811,6 +936,9 @@ class Engine:
             trades_today=day.trades if day else 0,
             llm_cost_today=round(day.llm_cost, 4) if day else 0.0,
             data_delayed=self.broker.data_delayed,
+            decision_maker=maker.name if self.settings.llm_enabled else self.rules.name,
+            decision_warning=warning if self.settings.llm_enabled else None,
+            data_warning=self.broker.data_warning,
         )
 
     def snapshot(self) -> dict[str, Any]:
@@ -865,21 +993,24 @@ class Engine:
             self._expire_approvals(now)
             await self._ensure_connected(now)
             account = await self.broker.account()
+            await self._check_account(account, now)
             raw_positions = await self.broker.positions()
             open_orders = await self.broker.open_orders()
             metas = self.db.all_position_meta()
             quotes = await self._quotes([p.instrument for p in raw_positions if p.qty > 0], now)
+            self._note_data_warning()
             positions = self._mark_positions(raw_positions, quotes, metas)
             account = self._mark_account(account, raw_positions, positions)
             self._account, self._positions, self._open_orders = account, positions, open_orders
 
             if math.isfinite(account.equity) and account.equity > 0:
                 changed = False
-                if self._sim_epoch is not None and not self._sim_rebased:
-                    self._sim_rebased = True
+                if self._rebase_pending:
+                    self._rebase_pending = False
                     if day.start_equity is not None and day.start_equity != account.equity:
                         log.info(
-                            "new simulated account: today's P&L restarts from $%.2f",
+                            "%s: today's P&L restarts from $%.2f",
+                            self._epoch_reason,
                             account.equity,
                         )
                         day.start_equity, changed = account.equity, True
@@ -897,7 +1028,9 @@ class Engine:
                     self._last_equity_at = now
                 await self._step("halts", self._check_halts(now, account))
             else:
-                # e.g. IBKR before the account summary arrives: never halt or flatten on it
+                # e.g. IBKR before the account summary arrives: never halt or flatten on it.
+                # A pending halt stays pending (no entries) but must be seen again twice.
+                self._halt_streak = None
                 log.warning("account equity %r is not usable; halts not evaluated", account.equity)
                 self._set_error("monitor:halts", "account equity not available")
             if not self.shadow:
@@ -926,6 +1059,116 @@ class Engine:
                 out[key] = quote
         return out
 
+    def _note_data_warning(self) -> None:
+        """Mirror the broker's market-data warning (e.g. IBKR 10197) into last_error."""
+        warning = self.broker.data_warning
+        if not warning:
+            self._clear_error("market data")
+        elif self._errors.get("market data", (None, None))[1] != _short(warning, 300):
+            log.warning("market data: %s", warning)
+            self._set_error("market data", warning)
+
+    # ------------------------------------------------------------------ day trades
+    def _with_day_trades(self, account: AccountSnapshot, now: datetime) -> AccountSnapshot:
+        """`account` with DayTradesRemaining lowered by the bot's own recent day trades.
+
+        IBKR pushes DayTradesRemaining only every few minutes, so a stock round trip that
+        just closed may not be counted yet and one more entry could become the day trade
+        that flags the account. Same-day round trips whose closing fill is younger than
+        PDT_REFRESH are subtracted. This is conservative: for a few minutes a trade IBKR
+        already counted may be subtracted twice, which can only block an entry."""
+        remaining = account.day_trades_remaining
+        if remaining is None:
+            return account
+        recent = self._recent_day_trades(now)
+        if recent <= 0:
+            return account
+        return account.model_copy(update={"day_trades_remaining": max(0, remaining - recent)})
+
+    def _recent_day_trades(self, now: datetime) -> int:
+        """Stock exit orders (by order id) filled within PDT_REFRESH that closed shares
+        bought earlier the same New York day, from the fills journal."""
+        today = trading_day(now)
+        fills = [
+            f
+            for f in self.db.list_fills(since=now - timedelta(days=1), limit=FILL_QUERY_LIMIT)
+            if f.instrument.asset_class == AssetClass.STOCK
+            and trading_day(_aware(f.ts)) == today
+            and (self._epoch is None or _aware(f.ts) >= self._epoch)
+        ]
+        fills.sort(key=lambda f: (_aware(f.ts), f.exec_id))
+        bought: set[str] = set()
+        closed: set[tuple[str, str]] = set()
+        for fill in fills:
+            key = fill.instrument.key
+            if fill.side == Side.BUY:
+                bought.add(key)
+            elif key in bought and now - _aware(fill.ts) <= PDT_REFRESH:
+                closed.add((key, fill.broker_order_id or fill.exec_id))
+        return len(closed)
+
+    # ------------------------------------------------------------------ account changes
+    async def _check_account(self, account: AccountSnapshot, now: datetime) -> None:
+        """Remember which broker account the journal belongs to. When it changes (sim ->
+        paper "DU..." -> live "U..."), start a new journal epoch so the engine never manages
+        positions or orders it did not open on this account."""
+        current = (account.account_id or "").strip()
+        if not current:
+            return
+        known = self.db.get_kv(ACCOUNT_KEY)
+        if known == current:
+            return
+        self.db.set_kv(ACCOUNT_KEY, current)
+        if not known:
+            log.info("journal belongs to broker account %s", _mask(current))
+            return
+        await self._on_account_changed(known, current, now)
+
+    async def _on_account_changed(self, old: str, new: str, now: datetime) -> None:
+        reason = "broker account changed"
+        log.warning("%s: %s -> %s; starting a new journal epoch", reason, _mask(old), _mask(new))
+        self._epoch, self._epoch_reason, self._rebase_pending = now, reason, True
+        self._cancel_pending(f"cancelled: {reason}")
+        stale = self.db.list_orders(limit=500, statuses=OPEN_ORDER_STATUSES)
+        for rec in stale:
+            if rec.id is not None:
+                self.db.update_order(
+                    rec.id,
+                    status=OrderStatus.CANCELLED,
+                    message=_short(f"{rec.message}; {reason}: left with the previous account"),
+                )
+        metas = self.db.all_position_meta()
+        for key in metas:
+            self.db.delete_position_meta(key)
+            self.db.set_kv(EXTRA_PREFIX + key, "{}")
+        for cache in (self._closing, self._close_reasons, self._open_qty, self._breaches):
+            cache.clear()
+        self._pending_trades.clear()
+        self._halt_streak, self._halt_pending = None, None
+        disarmed = self.db.get_flag("live_armed")
+        if disarmed:
+            self.db.set_flag("live_armed", False)  # arming was for the previous account
+        self.db.audit(
+            "account_changed",
+            {
+                "from": _mask(old),
+                "to": _mask(new),
+                "orders_closed_out": len(stale),
+                "positions_forgotten": len(metas),
+                "live_disarmed": disarmed,
+            },
+            actor="engine",
+        )
+        await self._notify(
+            "Broker account changed",
+            f"Now on {_mask(new)} (was {_mask(old)}). The bot forgot {len(metas)} position(s) "
+            f"and {len(stale)} working order(s) of the previous account and will not manage "
+            "them; today's P&L restarts from this account's equity."
+            + (" Live trading was disarmed." if disarmed else ""),
+            priority="high",
+            tags=["warning"],
+        )
+
     def _track_halt(self, key: str, quote: Quote, now: datetime) -> None:
         if quote.halted:
             if key not in self._last_halt_at or now - self._last_halt_at[key] > CLOSE_RETRY:
@@ -940,7 +1183,9 @@ class Engine:
         for pos in raw:
             key = pos.instrument.key
             quote = quotes.get(key)
-            mark = quote.exit_price if quote is not None and quote.exit_price else pos.market_price
+            # Implausible quotes (crossed, bid far from last) are ignored: the broker's own
+            # mark is used instead, so one bad tick cannot move equity or trigger a halt.
+            mark = sane_exit_price(quote) or pos.market_price
             meta = metas.get(key, {})
             out.append(
                 pos.model_copy(
@@ -979,10 +1224,25 @@ class Engine:
         day = self._today(now)
         reason = self.risk.halt_reason(account=account, day=self._halt_eval_day(day))
         if reason is None:
+            self._halt_streak, self._halt_pending = None, None
             return
         hard = reason.startswith(HALT_DAILY_LOSS)
         if day.halted and not (hard and is_soft_halt(day.halt_reason)):
+            self._halt_streak, self._halt_pending = None, None
             return  # already halted; only a soft halt can escalate to a hard one
+        # A halt (and the flatten that comes with a loss halt) needs the condition on
+        # consecutive ticks, so one bad equity print cannot sell everything. Meanwhile no
+        # new entry goes out (run_cycle and approvals check _halt_pending).
+        kind = "loss" if hard else "target"
+        streak = self._halt_streak
+        ticks, first = (streak[1] + 1, streak[2]) if streak and streak[0] == kind else (1, now)
+        self._halt_streak = (kind, ticks, first)
+        if not self._confirms(ticks, first, now):
+            if self._halt_pending != reason:
+                log.warning("halt condition seen (%s); confirming on the next tick", reason)
+            self._halt_pending = reason
+            return
+        self._halt_streak, self._halt_pending = None, None
         day.halted, day.halt_reason = True, reason
         self._save_day()
         log.warning("trading halted: %s", reason)
@@ -1059,6 +1319,25 @@ class Engine:
         return stops
 
     @staticmethod
+    def _queued_exits(open_orders: list[OrderRecord]) -> dict[str, float]:
+        """Unfilled quantity of working market SELL exits per instrument: closes the broker
+        holds until it can execute them (e.g. a kill or flatten sent after hours, or an exit
+        queued during a halt). A protective stop next to one could sell the shares twice.
+        Bracket take-profit children are limit orders and do not count."""
+        queued: dict[str, float] = {}
+        for order in open_orders:
+            req = order.request
+            if (
+                order.status in OPEN_ORDER_STATUSES
+                and req.side == Side.SELL
+                and req.stop_loss is None
+                and req.order_type == OrderType.MARKET
+            ):
+                key = req.instrument.key
+                queued[key] = queued.get(key, 0.0) + max(0.0, req.qty - order.filled_qty)
+        return queued
+
+    @staticmethod
     def _working_buys(open_orders: list[OrderRecord]) -> set[str]:
         return {
             o.request.instrument.key
@@ -1109,21 +1388,40 @@ class Engine:
         native_stops = self._native_stops(self._open_orders)
         stocks_open = stock_market_open(now)
         failures: list[str] = []
+        breached: set[str] = set()
         for pos in positions:
             key = pos.instrument.key
             meta = metas.get(key)
-            quote = quotes.get(key)
-            mark = quote.exit_price if quote is not None else None
+            mark = sane_exit_price(quotes.get(key))  # None: no quote, or an implausible one
             if pos.qty <= 0 or meta is None or mark is None or self._closing_now(key, now):
                 continue
             if pos.instrument.asset_class == AssetClass.STOCK and not stocks_open:
                 continue  # stock orders cannot execute now; broker stops still protect
             try:
-                await self._manage_one(pos, meta, mark, native_stops.get(key), now)
+                await self._manage_one(pos, meta, mark, native_stops.get(key), now, breached)
             except BrokerError as exc:
                 failures.append(f"{key}: {exc}")
+        # A breach must be seen on consecutive ticks; anything not seen this tick restarts.
+        self._breaches = {k: v for k, v in self._breaches.items() if k in breached}
         if failures:
             raise BrokerError("; ".join(failures))
+
+    def _confirms(self, ticks: int, first_seen: datetime, now: datetime) -> bool:
+        """Whether a condition seen on `ticks` consecutive monitor ticks since `first_seen`
+        is confirmed: BREACH_CONFIRM_TICKS ticks that span at least half a monitor interval.
+        run_cycle runs its own monitor tick right after (or even at the same moment as) the
+        monitor loop's, and two looks at one bad print must not count as two."""
+        spacing = timedelta(seconds=self.settings.monitor_seconds * BREACH_MIN_SPACING)
+        return ticks >= BREACH_CONFIRM_TICKS and now - first_seen >= spacing
+
+    def _confirmed(self, key: str, kind: str, breached: set[str], now: datetime) -> bool:
+        """Count one more tick with an engine-side exit condition; True once it is
+        confirmed (see `_confirms`)."""
+        breached.add(key)
+        last_kind, ticks, first = self._breaches.get(key, (kind, 0, now))
+        ticks, first = (ticks + 1, first) if last_kind == kind else (1, now)
+        self._breaches[key] = (kind, ticks, first)
+        return self._confirms(ticks, first, now)
 
     async def _manage_one(
         self,
@@ -1132,14 +1430,18 @@ class Engine:
         mark: float,
         broker_stop: float | None,
         now: datetime,
+        breached: set[str] | None = None,
     ) -> None:
         """Exit rules for one engine position valued at `mark` (the bid). `broker_stop` is
-        the highest protective stop working at the broker, if any."""
+        the highest protective stop working at the broker, if any. Exits fire only after
+        the condition held on BREACH_CONFIRM_TICKS consecutive ticks (`breached` collects
+        the instruments that saw one this tick)."""
         exits = self.settings.exits
         key = pos.instrument.key
         stop, target = meta.get("stop_loss"), meta.get("take_profit")
         native = self.broker.supports_native_stops(pos.instrument)
         reason: str | None = None
+        kind = "stop"
         if stop is not None:
             if not native:
                 if mark <= stop:
@@ -1153,7 +1455,7 @@ class Engine:
             elif stop > broker_stop + EPS and mark <= stop:
                 reason = f"stop-loss {stop:g} hit (engine-managed, bid {mark:g})"
         if reason is None and not native and target is not None and mark >= target:
-            reason = f"take-profit {target:g} hit (engine-managed, bid {mark:g})"
+            reason, kind = f"take-profit {target:g} hit (engine-managed, bid {mark:g})", "target"
 
         unit = self._unit_risk(key, pos.avg_cost, meta)
         r_now = (mark - pos.avg_cost) / unit if unit else None
@@ -1166,11 +1468,18 @@ class Engine:
             and now - _aware(opened) >= timedelta(minutes=exits.time_stop_minutes)
             and r_now < exits.time_stop_min_r
         ):
-            reason = (
-                f"time stop: {exits.time_stop_minutes} min with {r_now:.2f}R "
-                f"(< {exits.time_stop_min_r:g}R)"
+            reason, kind = (
+                (
+                    f"time stop: {exits.time_stop_minutes} min with {r_now:.2f}R "
+                    f"(< {exits.time_stop_min_r:g}R)"
+                ),
+                "time",
             )
         if reason is not None:
+            if not self._confirmed(key, kind, breached if breached is not None else set(), now):
+                log.info("%s: %s; confirming on the next tick", key, reason)
+                return
+            self._breaches.pop(key, None)
             await self._engine_close(pos.instrument, reason, now)
             return
 
@@ -1264,18 +1573,21 @@ class Engine:
         """After a (re)connect: re-place a broker stop for engine stock positions that have
         none working. Only brokers that rest a stop for a SELL request carrying stop_loss
         (`supports_standalone_stops`) get one; otherwise, or when the broker rejects it, the
-        owner is notified and the engine's backup stop guards the position."""
+        owner is notified and the engine's backup stop guards the position. Shares a working
+        market exit will already sell are not protected again (never sell twice)."""
         if not self._reprotect_pending:
             return
         self._reprotect_pending = False
         protected = self._native_stops(open_orders)
         buying = self._working_buys(open_orders)
+        queued = self._queued_exits(open_orders)
         for pos in positions:
             key = pos.instrument.key
             meta = metas.get(key)
             stop = meta.get("stop_loss") if meta else None
+            qty = round(pos.qty - queued.get(key, 0.0), 8)
             if (
-                pos.qty <= 0
+                qty <= EPS
                 or stop is None
                 or pos.instrument.asset_class != AssetClass.STOCK
                 or not self.broker.supports_native_stops(pos.instrument)
@@ -1296,7 +1608,7 @@ class Engine:
             req = OrderRequest(
                 instrument=pos.instrument,
                 side=Side.SELL,
-                qty=pos.qty,
+                qty=qty,
                 order_type=OrderType.MARKET,
                 stop_loss=stop,
                 is_exit=True,
@@ -1345,12 +1657,12 @@ class Engine:
             latest = await self.broker.order_status(rec.broker_order_id)
             if latest is None:
                 created = _aware(rec.created_at)
-                restarted = self._sim_epoch is not None and created < self._sim_epoch
+                restarted = self._epoch is not None and created < self._epoch
                 if restarted or now - created > ORDER_FORGET_AFTER:
                     self.db.update_order(
                         rec.id,
                         status=OrderStatus.CANCELLED,
-                        message="simulator restarted"
+                        message=self._epoch_reason
                         if restarted
                         else "no longer known to the broker",
                     )
@@ -1379,7 +1691,7 @@ class Engine:
                 or req.side != Side.BUY
                 or req.is_exit
                 or rec.filled_qty > 0
-                or now - _aware(rec.created_at) < ENTRY_ORDER_TTL
+                or now - self._sent_at(rec) < ENTRY_ORDER_TTL
             ):
                 continue
             latest = await self.broker.order_status(rec.broker_order_id)
@@ -1396,6 +1708,16 @@ class Engine:
             )
             log.info("cancelled stale entry order %s for %s", rec.id, req.instrument.key)
 
+    def _sent_at(self, rec: OrderRecord) -> datetime:
+        """When an order went to the broker: its journal time, or the approval time for an
+        order that waited for the owner."""
+        created = _aware(rec.created_at)
+        raw = self.db.get_kv(SENT_PREFIX + str(rec.id)) if rec.id is not None else None
+        if raw:
+            with contextlib.suppress(ValueError):
+                return max(created, _aware(datetime.fromisoformat(raw)))
+        return created
+
     async def _sync_fills(self, now: datetime) -> None:
         """Journal new fills (deduped by exec_id), apply late commission reports, and
         rebuild round trips for every instrument that changed."""
@@ -1410,6 +1732,26 @@ class Engine:
         touched = set(self._pending_trades)
         for fill in sorted(fills, key=lambda f: (f.ts, f.exec_id)):
             key = fill.instrument.key
+            replaced = self.db.correct_fill(fill)
+            if replaced is not None:
+                # IBKR corrected an execution: the new revision replaces the old one (never
+                # both: that would count the shares twice).
+                log.warning(
+                    "execution %s corrected by %s (%s %g @ %g -> %g @ %g)",
+                    replaced.exec_id,
+                    fill.exec_id,
+                    key,
+                    replaced.qty,
+                    replaced.price,
+                    fill.qty,
+                    fill.price,
+                )
+                self._fill_commissions.pop(replaced.exec_id, None)
+                self._fill_commissions[fill.exec_id] = (fill.commission, fill.ts)
+                self._add_fee(replaced.ts, -replaced.commission)
+                self._add_fee(fill.ts, fill.commission)
+                touched.add(key)
+                continue
             if self.db.insert_fill(fill):
                 self._fill_commissions[fill.exec_id] = (fill.commission, fill.ts)
                 self._add_fee(fill.ts, fill.commission)
@@ -1442,7 +1784,7 @@ class Engine:
     async def _reconstruct(self, key: str, now: datetime) -> None:
         """Journal every completed round trip for `key` since its last journaled exit."""
         last_exit = self._last_exit_for(key)
-        epoch = self._sim_epoch  # fills before it belong to an earlier simulated account
+        epoch = self._epoch  # fills before it belong to an earlier (simulated) account
         since = last_exit or now - TRADE_LOOKBACK
         if epoch is not None:
             since = max(since, epoch)
@@ -1652,6 +1994,9 @@ class Engine:
             if day.halted:
                 log.info("cycle skipped: trading halted (%s)", day.halt_reason)
                 return None
+            if self._halt_pending is not None:
+                log.info("cycle skipped: halt condition being confirmed (%s)", self._halt_pending)
+                return None
             if not self.broker.connected or self._account is None:
                 return None
             universe = await self._universe(now)
@@ -1759,13 +2104,19 @@ class Engine:
             return "outside the stock entry window"
         return None
 
-    def _pick_maker(self, ctx: DecisionContext) -> tuple[DecisionMaker, str | None]:
-        """The configured maker, or the rule-based one (with the reason) when the LLM is
-        disabled, over budget, or has nothing worth deciding."""
-        if self.decider is self.rules:
-            return self.rules, None
+    def _pick_maker(self, ctx: DecisionContext) -> tuple[DecisionMaker, str | None, bool]:
+        """(maker, why it is not the configured one, whether it may open positions).
+
+        The configured maker, or the rule-based one (with the reason) when the LLM is
+        disabled, over budget, or has nothing worth deciding. In consensus mode the rules
+        never open a position on their own (a BUY needs both models), so when they stand in
+        for consensus they only manage exits."""
+        configured, _ = self._resolve_decider()
+        if configured is self.rules:
+            return self.rules, None, True
         if not self.settings.llm_enabled:
-            return self.rules, "LLM disabled"
+            return self.rules, "LLM disabled", True
+        entries = configured.name != "consensus"
         budget = self.risk.limits.llm_daily_budget_usd
         if ctx.day.llm_cost >= budget:
             if self._fallback_logged != ctx.day.day:
@@ -1775,20 +2126,23 @@ class Engine:
                     ctx.day.llm_cost,
                     budget,
                 )
-            return self.rules, f"LLM budget reached (${ctx.day.llm_cost:.2f} of ${budget:.2f})"
+            why = f"LLM budget reached (${ctx.day.llm_cost:.2f} of ${budget:.2f})"
+            return self.rules, why, entries
         threshold = self.settings.llm_min_candidate_score
+        managed = self.db.all_position_meta()  # positions the owner holds are not managed
         worth = any(c.score >= threshold for c in ctx.candidates) or any(
-            p.qty > 0 for p in ctx.positions
+            p.qty > 0 and p.instrument.key in managed for p in ctx.positions
         )
         if not worth:
-            return self.rules, "no candidate worth an LLM call"
-        return self.decider, None
+            return self.rules, "no candidate worth an LLM call", entries
+        return configured, None, True
 
     async def _cycle(
         self, now: datetime, day: DayStats, universe: list[Instrument], manual: bool
     ) -> DecisionBatch:
         assert self._account is not None
         data = await self._fetch(universe, now)
+        self._note_data_warning()
         quotes = {inst.key: quote for inst, quote, _ in data}
         market: dict[str, dict[str, float]] = {}
         candidates: list[Candidate] = []
@@ -1828,7 +2182,7 @@ class Engine:
         ctx = DecisionContext(
             now=now,
             mode=self.broker.mode,
-            account=self._account,
+            account=self._with_day_trades(self._account, now),
             positions=positions,
             candidates=actionable,
             day=day.model_copy(),
@@ -1838,7 +2192,7 @@ class Engine:
             stock_market_open=stock_market_open(now),
             data_delayed=self.broker.data_delayed,
         )
-        maker, why = self._pick_maker(ctx)
+        maker, why, entries_ok = self._pick_maker(ctx)
         try:
             batch = await maker.decide(ctx)
         except Exception as exc:
@@ -1846,6 +2200,9 @@ class Engine:
             batch = DecisionBatch(maker=maker.name, error=f"{type(exc).__name__}: {exc}")
         batch.ts = now
         batch.candidates = actionable
+        if not entries_ok:
+            batch.decisions = [d for d in batch.decisions if d.action != TradeAction.BUY]
+            why = f"{why}; consensus mode: rules manage exits only"
         if why:
             batch.market_view = f"[{why}] {batch.market_view}".strip()
         if manual:
@@ -1854,9 +2211,10 @@ class Engine:
         day.llm_cost = round(day.llm_cost + batch.cost_usd, 6)
         self._save_day()
         # Orders must not be interrupted halfway (e.g. by stop()): shield the execution.
-        outcomes, holds = await asyncio.shield(self._execute(batch, ctx, quotes, now))
+        outcomes, holds = await asyncio.shield(self._execute(batch, ctx, now))
 
-        label = "AI" if maker is not self.rules else "rules"
+        consensus = batch.maker == "consensus"
+        label = "rules" if maker is self.rules else "consensus" if consensus else "AI"
         prefix = "LLM budget; " if why and why.startswith("LLM budget") else ""
         threshold = self.settings.llm_min_candidate_score
         bought = any(o.taken for o in outcomes.values())
@@ -1880,11 +2238,15 @@ class Engine:
             elif outcome is not None:
                 skip = f"same symbol traded via {outcome.setup}"
             elif key in holds:
-                skip = f"{label}: HOLD"
+                note = holds[key]
+                # Consensus HOLDs say who stood in the way ("consensus: Grok said HOLD").
+                skip = note if consensus and note.startswith(CONSENSUS_PREFIX) else f"{label}: HOLD"
             elif cand.score < threshold:
                 skip = f"score {cand.score:.2f} < {threshold:.2f}"
             elif batch.refused or batch.error:
                 skip = f"{label}: {'refused' if batch.refused else 'error'}"
+            elif not entries_ok:
+                skip = "consensus mode: no entries without both models"
             elif bought:
                 skip = "not top candidate"
             else:
@@ -1898,12 +2260,12 @@ class Engine:
         return batch
 
     async def _execute(
-        self, batch: DecisionBatch, ctx: DecisionContext, quotes: dict[str, Quote], now: datetime
-    ) -> tuple[dict[str, _BuyOutcome], set[str]]:
+        self, batch: DecisionBatch, ctx: DecisionContext, now: datetime
+    ) -> tuple[dict[str, _BuyOutcome], dict[str, str]]:
         outcomes: dict[str, _BuyOutcome] = {}
-        holds: set[str] = set()
+        holds: dict[str, str] = {}  # instrument -> the HOLD's rationale
         seen: set[str] = set()
-        open_orders = list(self._open_orders)
+        placed: list[OrderRecord] = []  # entries sent earlier in this batch
         for decision in batch.decisions:
             symbol = decision.symbol.strip().upper()
             inst = Instrument(symbol=symbol, asset_class=decision.asset_class)
@@ -1914,12 +2276,12 @@ class Engine:
             try:
                 if decision.action == TradeAction.BUY:
                     outcomes[inst.key] = await self._handle_buy(
-                        decision, inst, batch, ctx, quotes, open_orders, now
+                        decision, inst, batch, ctx, placed, now
                     )
                 elif decision.action == TradeAction.CLOSE:
                     await self._handle_close(decision, inst, batch, ctx, now)
                 else:
-                    holds.add(inst.key)
+                    holds[inst.key] = decision.rationale
             except BrokerError as exc:
                 log.warning("decision for %s failed: %s", inst.key, exc)
                 self._set_error("decision", f"{inst.symbol}: {exc}")
@@ -1933,10 +2295,17 @@ class Engine:
         inst: Instrument,
         batch: DecisionBatch,
         ctx: DecisionContext,
-        quotes: dict[str, Quote],
-        open_orders: list[OrderRecord],
+        placed: list[OrderRecord],
         now: datetime,
     ) -> _BuyOutcome:
+        """Size, risk-check and send (or queue for approval) one BUY.
+
+        The decision maker may have thought for minutes, and meanwhile the monitor loop kept
+        running: an earlier entry may have filled, the owner may have approved an order, the
+        symbol may have halted or the entry window may have closed. So under the entry lock
+        the clock, the quote, the account, positions and working orders are read again and
+        the BUY is sized and checked on that fresh state, never on the context the models
+        saw (`now` is when that context was built)."""
         key = inst.key
         mine = [c for c in ctx.candidates if c.instrument.key == key]
         cand = next((c for c in mine if c.setup == decision.setup), None) or next(
@@ -1949,61 +2318,80 @@ class Engine:
             return _BuyOutcome(cand.setup, False, skip_reason="previous trade still settling")
         if key in self._awaiting_approval():
             return _BuyOutcome(cand.setup, False, skip_reason="already waiting for approval")
-        quote = quotes.get(key) or await self.broker.quote(inst)
-        entry = decision.limit_price or quote.ask or quote.last
         stop = decision.stop_loss or cand.suggested_stop
         target = decision.take_profit or cand.suggested_target
-        if not entry or not math.isfinite(entry) or entry <= 0:
-            return _BuyOutcome(cand.setup, False, skip_reason="no entry price")
-        qty, notes = self.risk.size_entry(
-            decision=decision,
-            entry=entry,
-            stop=stop,
-            account=ctx.account,
-            positions=ctx.positions,
-            day=self._today(now),
-            broker=self.broker,
-            allow_fractional=self.settings.allow_fractional_stocks,
-        )
-        if qty <= 0:
-            log.info("BUY %s skipped: %s", key, notes[-1])
-            return _BuyOutcome(cand.setup, False, skip_reason=f"risk: {notes[-1]}")
-        req = OrderRequest(
-            instrument=inst,
-            side=Side.BUY,
-            qty=qty,
-            order_type=OrderType.LIMIT,
-            limit_price=entry,
-            stop_loss=stop,
-            take_profit=target,
-            reason=_short(decision.rationale),
-            decision_id=batch.id,
-            setup=decision.setup or cand.setup,
-        )
         async with self._entry_lock:
+            send_now = self._now()
+            age = send_now - now
+            if age > DECISION_MAX_AGE:
+                log.warning("BUY %s dropped: decided on data %.0fs old", key, age.total_seconds())
+                return _BuyOutcome(
+                    cand.setup,
+                    False,
+                    skip_reason=f"decision too old ({age.total_seconds():.0f}s after its data)",
+                )
+            quote = await self.broker.quote(inst)
+            self._track_halt(key, quote, send_now)
+            account = self._with_day_trades(await self.broker.account(), send_now)
+            positions = await self.broker.positions()
+            open_orders = self._merge_orders(await self.broker.open_orders(), placed)
+            day = self._today(send_now)
+            entry = decision.limit_price or quote.ask or quote.last
+            if not entry or not math.isfinite(entry) or entry <= 0:
+                return _BuyOutcome(cand.setup, False, skip_reason="no entry price")
+            qty, notes = self.risk.size_entry(
+                decision=decision,
+                entry=entry,
+                stop=stop,
+                account=account,
+                positions=positions,
+                day=day,
+                broker=self.broker,
+                allow_fractional=self.settings.allow_fractional_stocks,
+            )
+            if qty <= 0:
+                log.info("BUY %s skipped: %s", key, notes[-1])
+                return _BuyOutcome(cand.setup, False, skip_reason=f"risk: {notes[-1]}")
+            req = OrderRequest(
+                instrument=inst,
+                side=Side.BUY,
+                qty=qty,
+                order_type=OrderType.LIMIT,
+                limit_price=entry,
+                stop_loss=stop,
+                take_profit=target,
+                reason=_short(decision.rationale),
+                decision_id=batch.id,
+                setup=decision.setup or cand.setup,
+            )
             verdict = self.risk.check(
                 req,
                 quote=quote,
-                account=ctx.account,
-                positions=ctx.positions,
+                account=account,
+                positions=positions,
                 open_orders=open_orders,
-                day=self._today(now),
+                day=day,
                 mode=self.broker.mode,
                 data_delayed=self.broker.data_delayed,
                 broker=self.broker,
-                now=now,
+                now=send_now,
                 settings=self.settings,
                 last_halt_at=self._last_halt_at.get(key),
             )
-            if not verdict.approved:
-                message = "; ".join(verdict.reasons)
+            reasons = list(verdict.reasons) if not verdict.approved else []
+            if self._halt_pending is not None:
+                reasons.append(f"halt condition being confirmed: {self._halt_pending}")
+            if not reasons and self.db.get_position_meta(key) is not None:
+                # Metadata is written before every entry is sent and removed only once the
+                # position is flat: an entry is in flight or the position is still held.
+                reasons.append(f"an entry for {inst.symbol} is in flight or still held")
+            if reasons:
+                message = "; ".join(reasons)
                 order_id = self._journal_order(
-                    OrderRecord(request=req, status=OrderStatus.BLOCKED, message=message), now
+                    OrderRecord(request=req, status=OrderStatus.BLOCKED, message=message), send_now
                 )
                 log.info("BUY %s blocked: %s", key, message)
-                return _BuyOutcome(
-                    cand.setup, False, order_id, skip_reason=f"risk: {verdict.reasons[0]}"
-                )
+                return _BuyOutcome(cand.setup, False, order_id, skip_reason=f"risk: {reasons[0]}")
             order = verdict.order or req
             sizing = "; ".join([*notes, *verdict.reasons])
             if self.shadow:
@@ -2013,7 +2401,7 @@ class Engine:
                         status=OrderStatus.BLOCKED,
                         message=f"shadow mode: live trading is not armed ({sizing})",
                     ),
-                    now,
+                    send_now,
                 )
                 return _BuyOutcome(cand.setup, False, order_id, skip_reason="shadow mode")
             if not self.settings.autopilot:
@@ -2023,7 +2411,7 @@ class Engine:
                         status=OrderStatus.PENDING_APPROVAL,
                         message=f"waiting for approval, expires in 10 min ({sizing})",
                     ),
-                    now,
+                    send_now,
                 )
                 await self._notify(
                     f"Approve BUY {inst.symbol}?",
@@ -2032,18 +2420,26 @@ class Engine:
                     tags=["question"],
                 )
                 return _BuyOutcome(cand.setup, True, order_id)
-            placed = await self._send_entry(order, now)
+            sent = await self._send_entry(order, send_now)
             order_id = self._journal_order(
-                placed.model_copy(update={"message": _short(f"{sizing}; {placed.message}")}), now
+                sent.model_copy(update={"message": _short(f"{sizing}; {sent.message}")}), send_now
             )
-            if placed.status not in _ACCEPTED:
+            if sent.status not in _ACCEPTED:
                 return _BuyOutcome(
-                    cand.setup, False, order_id, skip_reason=f"broker rejected: {placed.message}"
+                    cand.setup, False, order_id, skip_reason=f"broker rejected: {sent.message}"
                 )
-            open_orders.append(
-                placed.model_copy(update={"status": OrderStatus.SUBMITTED, "filled_qty": 0.0})
+            placed.append(
+                sent.model_copy(update={"status": OrderStatus.SUBMITTED, "filled_qty": 0.0})
             )
             return _BuyOutcome(cand.setup, True, order_id)
+
+    @staticmethod
+    def _merge_orders(fresh: list[OrderRecord], placed: list[OrderRecord]) -> list[OrderRecord]:
+        """The broker's working orders plus entries sent earlier in this batch that it does
+        not list (yet), without counting one order twice."""
+        known = {o.broker_order_id for o in fresh if o.broker_order_id}
+        extra = [o for o in placed if not o.broker_order_id or o.broker_order_id not in known]
+        return fresh + extra
 
     async def _send_entry(self, order: OrderRequest, now: datetime) -> OrderRecord:
         """Place an entry. Position metadata is written first, so a position that appears
@@ -2113,6 +2509,28 @@ class Engine:
         if inst.asset_class == AssetClass.STOCK and not stock_market_open(now):
             log.info("CLOSE %s deferred: the stock market is closed", inst.key)
             return
+        if self.db.get_position_meta(inst.key) is None:
+            # The engine never manages positions it did not open on this account (the
+            # owner's own holdings, or positions forgotten after an account change). The
+            # owner can still close them at the broker.
+            log.warning("CLOSE %s refused: the bot did not open this position", inst.key)
+            self._journal_order(
+                OrderRecord(
+                    request=OrderRequest(
+                        instrument=inst,
+                        side=Side.SELL,
+                        qty=pos.qty,
+                        order_type=OrderType.MARKET,
+                        is_exit=True,
+                        reason=_short(f"AI close: {decision.rationale}"),
+                        decision_id=batch.id,
+                    ),
+                    status=OrderStatus.BLOCKED,
+                    message="not opened by the bot: the engine never closes it",
+                ),
+                now,
+            )
+            return
         req = OrderRequest(
             instrument=inst,
             side=Side.SELL,
@@ -2154,9 +2572,12 @@ _ACCEPTED = frozenset({OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED, Orde
 
 
 def build_engine(config: AppConfig, db: Database) -> Engine:
-    """Engine wired from config: SimBroker or IBKRBroker; Claude (with the rule-based maker
-    as its fallback) when an Anthropic API key is configured, else rules only. The engine
-    uses Claude only while settings.llm_enabled is on, so the owner can toggle it live."""
+    """Engine wired from config: SimBroker or IBKRBroker, plus every decision maker the
+    configured API keys allow: Claude (Anthropic key), Grok (xAI key), consensus (both),
+    each with the rule-based maker as its outage fallback, and the rule-based maker itself.
+    settings.decision_mode and settings.llm_enabled are read every cycle, so the owner can
+    switch modes without a restart; a mode whose key is missing falls back with a warning
+    in the status (see Engine._resolve_decider)."""
     settings = db.get_settings()
     broker: Broker
     if config.broker == "sim":
@@ -2172,15 +2593,38 @@ def build_engine(config: AppConfig, db: Database) -> Engine:
 
         broker = IBKRBroker(config)
     rules = RuleBasedDecisionMaker(settings)
-    decider: DecisionMaker = rules
-    api_key = config.anthropic_api_key.get_secret_value() if config.anthropic_api_key else ""
-    if api_key.strip():
+    makers: dict[str, DecisionMaker] = {"rules": rules}
+    anthropic_key = config.anthropic_api_key.get_secret_value() if config.anthropic_api_key else ""
+    if anthropic_key.strip():
         from trader.strategy.claude import ClaudeDecisionMaker
 
-        decider = ClaudeDecisionMaker(
-            api_key=api_key,
+        makers["claude"] = ClaudeDecisionMaker(
+            api_key=anthropic_key,
             model=settings.llm_model,
             effort=settings.llm_effort,
             fallback=rules,
         )
-    return Engine(config, db, broker, decider, notifier=Notifier(config))
+    xai_key = config.xai_api_key.get_secret_value() if config.xai_api_key else ""
+    if xai_key.strip():
+        from trader.strategy.grok import GrokDecisionMaker, GrokPrice
+
+        makers["grok"] = GrokDecisionMaker(
+            api_key=xai_key,
+            model=config.xai_model,
+            fallback=rules,
+            base_url=config.xai_base_url,
+            price=GrokPrice(
+                input=config.xai_price_input,
+                cached_input=config.xai_price_cached_input,
+                output=config.xai_price_output,
+            ),
+        )
+    if "claude" in makers and "grok" in makers:
+        from trader.strategy.consensus import ConsensusDecisionMaker
+
+        makers["consensus"] = ConsensusDecisionMaker(makers["claude"], makers["grok"])
+    engine = Engine(config, db, broker, rules, notifier=Notifier(config), makers=makers)
+    _, warning = engine._resolve_decider()
+    if warning:
+        log.warning("decision mode: %s", warning)
+    return engine

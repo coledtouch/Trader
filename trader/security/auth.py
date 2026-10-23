@@ -41,6 +41,9 @@ TOTP_ACCOUNT = "owner"
 CSRF_HEADER = "X-CSRF-Token"
 SECURE_COOKIE = "__Host-trader"
 DEV_COOKIE = "trader_session"  # plain-http local development only (cookie_secure=False)
+# Sent by the dashboard's automatic status refresh: such a GET is not owner activity, so it
+# does not keep an idle session alive (it is still refused once the session has expired).
+BACKGROUND_HEADER = "X-Background"
 UNKNOWN_IP = "unknown"
 
 
@@ -306,9 +309,9 @@ class Authenticator:
         now = utcnow()
         return token, Session(token_hash, csrf, created_at=now, last_seen=now)
 
-    def get_session(self, token: str | None) -> Session | None:
-        """The live session for a cookie token (refreshing its idle timer), else None.
-        Expired sessions are purged on every lookup."""
+    def get_session(self, token: str | None, *, touch: bool = True) -> Session | None:
+        """The live session for a cookie token, else None. Expired sessions are purged on
+        every lookup. `touch` refreshes the idle timer (off for background polling)."""
         if not token or len(token) > 256:
             return None
         now = self._clock()
@@ -322,7 +325,8 @@ class Authenticator:
         if row["last_seen"] < idle_before or row["created_at"] < created_before:
             self.db.delete_session(token_hash)
             return None
-        self.db.touch_session(token_hash)
+        if touch:
+            self.db.touch_session(token_hash)
         return Session(token_hash, row["csrf_token"], row["created_at"], now)
 
     def end_session(self, token: str | None) -> None:
@@ -396,7 +400,8 @@ def get_authenticator(request: Request) -> Authenticator:
 
 def require_session(request: Request) -> Session:
     auth = get_authenticator(request)
-    session = auth.get_session(request.cookies.get(auth.cookie_name))
+    background = request.method == "GET" and request.headers.get(BACKGROUND_HEADER) == "1"
+    session = auth.get_session(request.cookies.get(auth.cookie_name), touch=not background)
     if session is None:
         raise HTTPException(status_code=401, detail="not authenticated")
     return session

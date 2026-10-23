@@ -1,6 +1,8 @@
 """Command line interface: `python -m trader <command>`.
 
-Commands: serve, setup, reset-password, reset-2fa, logout-all, status, backtest.
+Commands: serve, setup, reset-password, reset-2fa, logout-all, disarm, status, backtest.
+reset-password, reset-2fa, logout-all and disarm also clear the live-trading arm (the
+compromise response): real-money orders then need a fresh Arm with a 2FA code.
 
 Configuration comes from the process environment plus an env file: `.env` in the current
 working directory by default, or `--env-file PATH`. `setup` writes TRADER_SECRET_KEY into
@@ -22,7 +24,7 @@ import sys
 from pathlib import Path
 
 import qrcode
-from pydantic import SecretStr
+from pydantic import SecretStr, ValidationError
 
 from trader.config import AppConfig
 from trader.db import Database
@@ -178,7 +180,36 @@ def enroll_totp(secret_out: Path | None) -> tuple[str, int | None]:
 
 # ---------------------------------------------------------------------- commands
 def _config(args: argparse.Namespace) -> AppConfig:
-    return AppConfig(_env_file=args.env_file)
+    try:
+        return AppConfig(_env_file=args.env_file)
+    except ValidationError as exc:
+        # Field names and messages only: the offending values may be secrets.
+        problems = "; ".join(
+            ": ".join(
+                part
+                for part in (
+                    ".".join(str(loc) for loc in err.get("loc", ())),
+                    str(err.get("msg", "")).removeprefix("Value error, "),
+                )
+                if part
+            )
+            for err in exc.errors()
+        )
+        raise CLIError(f"invalid configuration: {problems}") from None
+
+
+# HTTP client libraries log every request URL at INFO. The ntfy topic URL is a secret (anyone
+# who knows it can read or fake the alerts), so their logs are limited to warnings.
+QUIET_LOGGERS = ("httpx", "httpcore")
+
+
+def configure_logging(level: str) -> None:
+    """Root logging for the app; request-URL logging of the HTTP clients is switched off."""
+    logging.basicConfig(
+        level=level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
+    for name in QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
@@ -187,9 +218,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from trader.web.app import create_app
 
     config = _config(args)
-    logging.basicConfig(
-        level=config.log_level.upper(), format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
+    configure_logging(config.log_level)
     uvicorn.run(
         create_app(config),
         host=config.host,
@@ -227,8 +256,32 @@ def cmd_setup(args: argparse.Namespace) -> int:
     finally:
         db.close()
     print("\nOwner password and 2FA saved; any existing sessions were signed out.")
-    print("Start the app with `python -m trader serve` (or restart the container).")
+    if _in_container():
+        # A container keeps the environment it was created with: `docker compose restart`
+        # would keep an empty TRADER_SECRET_KEY and every login would fail.
+        print("Apply it with `docker compose up -d` (it recreates the container when .env")
+        print("changed; or `docker compose up -d --force-recreate trader`).")
+        print("`docker compose restart` does NOT reload .env.")
+    else:
+        print("Start the app with `python -m trader serve`.")
     return 0
+
+
+def disarm_live(db: Database, reason: str) -> bool:
+    """Clear the stored live-trading arm (the running app reads it on every order, so this
+    takes effect at once). Returns True when it was armed. Re-arming needs the owner to press
+    Arm in the app with a fresh 2FA code."""
+    if not db.get_flag("live_armed"):
+        return False
+    db.set_flag("live_armed", False)
+    db.audit("live_disarmed", {"reason": reason}, actor="cli")
+    return True
+
+
+def _print_disarmed(was_armed: bool) -> None:
+    if was_armed:
+        print("Live trading was armed and is now disarmed: press Arm in the app (with a fresh")
+        print("2FA code) to send real-money orders again.")
 
 
 def cmd_reset_password(args: argparse.Namespace) -> int:
@@ -240,9 +293,11 @@ def cmd_reset_password(args: argparse.Namespace) -> int:
             raise CLIError("no owner credentials yet: run `python -m trader setup`")
         auth.change_password(read_new_password(args.password_stdin))
         db.audit("reset_password", actor="cli")
+        was_armed = disarm_live(db, "password reset (CLI)")
     finally:
         db.close()
     print("Password changed; all sessions were signed out.")
+    _print_disarmed(was_armed)
     return 0
 
 
@@ -259,9 +314,11 @@ def cmd_reset_2fa(args: argparse.Namespace) -> int:
         if step is not None:
             auth.mark_totp_used(step)
         db.audit("reset_2fa", actor="cli")
+        was_armed = disarm_live(db, "2FA reset (CLI)")
     finally:
         db.close()
     print("2FA secret replaced; all sessions were signed out.")
+    _print_disarmed(was_armed)
     return 0
 
 
@@ -271,9 +328,25 @@ def cmd_logout_all(args: argparse.Namespace) -> int:
     try:
         Authenticator(config, db).logout_all()
         db.audit("logout_all", actor="cli")
+        was_armed = disarm_live(db, "logout-all (CLI)")
     finally:
         db.close()
     print("All sessions were signed out.")
+    _print_disarmed(was_armed)
+    return 0
+
+
+def cmd_disarm(args: argparse.Namespace) -> int:
+    config = _config(args)
+    db = Database(config.db_path)
+    try:
+        was_armed = disarm_live(db, "disarm (CLI)")
+    finally:
+        db.close()
+    if was_armed:
+        _print_disarmed(True)
+    else:
+        print("Live trading was not armed; nothing changed.")
     return 0
 
 
@@ -290,6 +363,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     except crypto.SecretKeyError:
         key_state = "missing" if not config.secret_key.get_secret_value() else "invalid"
     api_key = config.anthropic_api_key
+    xai_key = config.xai_api_key
     rows = [
         ("data dir", str(config.data_dir.resolve())),
         ("broker", config.broker),
@@ -302,6 +376,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         ("Cloudflare Access", "enabled" if config.cf_access_enabled else "disabled"),
         ("live trading allowed", _yes(config.allow_live)),
         ("Anthropic API key", "set" if api_key and api_key.get_secret_value() else "not set"),
+        ("xAI API key", "set" if xai_key and xai_key.get_secret_value() else "not set"),
+        ("Grok model", config.xai_model),
         ("ntfy notifications", "set" if config.ntfy_url else "not set"),
         (SECRET_KEY_VAR, key_state),
     ]
@@ -325,6 +401,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 ("live armed flag", _yes(db.get_flag("live_armed"))),
                 ("autopilot", _yes(settings.autopilot)),
                 ("LLM enabled", _yes(settings.llm_enabled)),
+                ("decision mode", settings.decision_mode),
             ]
         finally:
             db.close()
@@ -378,9 +455,12 @@ def build_parser() -> argparse.ArgumentParser:
     reset_2fa.add_argument("--totp-secret-out", type=Path, metavar="FILE")
     reset_2fa.set_defaults(func=cmd_reset_2fa)
 
-    sub.add_parser("logout-all", parents=[common], help="sign out every session").set_defaults(
-        func=cmd_logout_all
-    )
+    sub.add_parser(
+        "logout-all", parents=[common], help="sign out every session (also disarms live trading)"
+    ).set_defaults(func=cmd_logout_all)
+    sub.add_parser(
+        "disarm", parents=[common], help="disarm live trading (re-arming needs a fresh 2FA code)"
+    ).set_defaults(func=cmd_disarm)
     sub.add_parser("status", parents=[common], help="show configuration (no secrets)").set_defaults(
         func=cmd_status
     )

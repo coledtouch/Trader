@@ -35,6 +35,7 @@ from trader import fees
 from trader.broker.base import BrokerError
 from trader.broker.ibkr import (
     IBKRBroker,
+    MarketDataUnavailable,
     ib_bar_size,
     ib_duration,
     map_ib_status,
@@ -389,14 +390,50 @@ async def test_connectivity_codes_gate_orders_and_reconnect() -> None:
     assert broker.connected
 
 
+async def test_data_lost_1101_forces_a_full_resync() -> None:
+    """BRK-1: after 1101 ("restored - data lost") IB has dropped the account, position and
+    market data subscriptions, so the cached account and positions are frozen. The broker
+    reports itself disconnected and refuses data until connect() has reconnected (which
+    re-runs ib_async's startup syncs); 1102 ("data maintained") needs no reconnect."""
+    broker, fake = await connected_broker()
+    fake.errorEvent.emit(-1, 1100, "Connectivity between IB and TWS has been lost.", None)
+    fake.errorEvent.emit(-1, 1101, "Connectivity restored - data lost.", None)
+    assert not broker.connected
+    with pytest.raises(BrokerError, match="1101"):
+        await broker.positions()
+    with pytest.raises(BrokerError, match="1101"):
+        await broker.place_order(entry())
+    await broker.connect()
+    assert fake.connect_calls == 2  # disconnected and connected again
+    assert broker.connected
+    await broker.positions()
+    await broker.connect()
+    assert fake.connect_calls == 2  # resynced once; connected again means idempotent
+
+
 async def test_delayed_data_codes_mark_data_delayed() -> None:
+    """10167 marks that instrument's quotes delayed (which blocks LIVE stock entries in it);
+    the whole feed is reported delayed only for market data types 3/4."""
     broker, fake = await connected_broker(ib_market_data_type=1)
     assert not broker.data_delayed
     fake.errorEvent.emit(5, 10167, "Displaying delayed market data.", stock())
-    assert broker.data_delayed
+    assert not broker.data_delayed  # only AAPL is affected
     fake.ticker_values[stock().conId] = {"last": 101.0}
     quote = await broker.quote(AAPL)
     assert quote.delayed
+    delayed_feed, _ = await connected_broker(ib_market_data_type=3)
+    assert delayed_feed.data_delayed
+
+
+async def test_one_unsubscribed_symbol_does_not_block_every_entry() -> None:
+    """BRK-4: a single 354 ("not subscribed") for an unrelated symbol under live data
+    (type 1) must not mark the whole broker delayed until the next reconnect."""
+    broker, fake = await connected_broker(ib_market_data_type=1)
+    fake.errorEvent.emit(7, 354, "Requested market data is not subscribed.", stock("ZZZZ", 1))
+    assert not broker.data_delayed
+    fake.ticker_values[stock().conId] = {"bid": 100.9, "ask": 101.1, "last": 101.0}
+    quote = await broker.quote(AAPL)
+    assert not quote.delayed and not broker.data_delayed
 
 
 async def test_disconnect_event_drops_tickers() -> None:
@@ -993,6 +1030,53 @@ async def test_fills_since() -> None:
     assert fake.exec_filter.time == (since - timedelta(hours=1)).strftime("%Y%m%d-%H:%M:%S")
 
 
+async def test_fills_since_keeps_only_the_latest_correction() -> None:
+    """BRK-6: IBKR reports a corrected execution with the same id except a higher number
+    after the last period; only the latest revision is a fill (never both)."""
+    broker, fake = await connected_broker()
+    base = "0000e0d5.65a1b2c3.01"
+
+    def ex(rev: str, price: float) -> IBFill:
+        return IBFill(
+            stock(),
+            execution(f"{base}.{rev}", "BOT", NOW, shares=10, price=price, orderId=101,
+                      clientId=CLIENT_ID, permId=9),
+            CommissionReport(),
+            NOW,
+        )  # fmt: skip
+
+    fake.executions = [ex("01", 100.0), ex("02", 100.05)]
+    [fill] = await broker.fills_since(NOW - timedelta(hours=1))
+    assert fill.exec_id == f"{base}.02" and fill.price == 100.05 and fill.qty == 10
+
+
+async def test_order_completed_while_the_app_was_down_is_found() -> None:
+    """BRK-5: after a restart, an order that filled while the app was down comes back only
+    as a completed order without orderId/clientId (ib_async keys it by permId). Its
+    executions carry all three ids, so order_status finds it as FILLED, not unknown."""
+    broker, fake = await connected_broker()
+    completed = Trade(
+        stock(),
+        Order(orderId=0, clientId=0, permId=777, action="BUY", totalQuantity=3,
+              orderType="LMT", lmtPrice=100.0, account=PAPER),
+        IBOrderStatus(status="Filled", filled=3, avgFillPrice=99.9),
+    )  # fmt: skip
+    fake.trade_list = [completed]
+    fake.known_fills = [
+        IBFill(
+            stock(),
+            execution("e9", "BOT", NOW, shares=3, price=99.9, orderId=123, clientId=CLIENT_ID,
+                      permId=777),
+            CommissionReport(),
+            NOW,
+        )
+    ]  # fmt: skip
+    status = await broker.order_status("123")
+    assert status is not None and status.status is OrderStatus.FILLED
+    assert status.filled_qty == 3
+    assert await broker.order_status("124") is None
+
+
 # ---------------------------------------------------------------------- costs / sizing
 @pytest.mark.parametrize(
     ("plan", "qty", "price", "side", "expected"),
@@ -1158,3 +1242,74 @@ async def test_modify_stop_without_a_position_or_connection() -> None:
     fake.disconnect()
     assert await broker.modify_stop(AAPL, 100.0) is False  # fail safe, no exception
     assert fake.modified == []
+
+
+# ---------------------------------------------------------------------- error 10197
+def flag_competing(fake: FakeIB, contract: Contract | None = None) -> None:
+    fake.errorEvent.emit(9, 10197, "No market data during competing live session", contract)
+
+
+async def test_competing_session_makes_quotes_unusable_until_fresh_data() -> None:
+    broker, fake = await connected_broker(ib_market_data_type=1)
+    broker._clock = lambda: NOW + timedelta(seconds=1)
+    fake.ticker_values[stock().conId] = {"bid": 100.0, "ask": 100.02, "last": 100.01}
+    assert (await broker.quote(AAPL)).bid == 100.0
+    assert broker.data_warning is None
+
+    flag_competing(fake, stock())  # the ticker still holds the old (now stale) prices
+    with pytest.raises(MarketDataUnavailable, match="error 10197") as caught:
+        await broker.quote(AAPL)
+    assert isinstance(caught.value, BrokerError)  # the engine skips the symbol
+    warning = broker.data_warning or ""
+    assert "10197" in warning and "no entries for AAPL" in warning and "Log out" in warning
+
+    broker._tickers["STK:AAPL"].ticker.time = NOW + timedelta(seconds=5)  # a fresh tick
+    quote = await broker.quote(AAPL)
+    assert quote.bid == 100.0
+    assert broker.data_warning is None
+
+
+async def test_competing_session_resubscribes_to_find_out_when_data_is_back() -> None:
+    broker, fake = await connected_broker(ib_market_data_type=1)
+    broker._clock = lambda: NOW + timedelta(seconds=1)
+    fake.ticker_values[stock().conId] = {"last": 100.0}
+    await broker.quote(AAPL)
+    flag_competing(fake, stock())
+    broker.TICKER_RETRY_AFTER = 0.0
+    with pytest.raises(MarketDataUnavailable):
+        await broker.quote(AAPL)  # re-subscribed, but nothing new arrived yet
+    assert fake.mkt_requests == 2 and fake.mkt_cancels == 1
+    broker.TICKER_RETRY_AFTER = 60.0
+    broker._tickers["STK:AAPL"].ticker.time = NOW + timedelta(minutes=1)
+    assert (await broker.quote(AAPL)).last == 100.0
+
+
+async def test_competing_session_without_contract_flags_every_subscription() -> None:
+    broker, fake = await connected_broker(ib_market_data_type=1)
+    broker._clock = lambda: NOW + timedelta(seconds=1)
+    fake.ticker_values[stock().conId] = {"last": 100.0}
+    fake.ticker_values[crypto().conId] = {"last": 81_700.0}
+    await broker.quote(AAPL)
+    await broker.quote(BTC)
+    flag_competing(fake, None)
+    for inst in (AAPL, BTC):
+        with pytest.raises(MarketDataUnavailable):
+            await broker.quote(inst)
+    assert "AAPL, BTC" in (broker.data_warning or "")
+
+
+async def test_competing_warning_expires_and_reconnect_clears_it() -> None:
+    broker, fake = await connected_broker(ib_market_data_type=1)
+    now = {"t": NOW + timedelta(seconds=1)}
+    broker._clock = lambda: now["t"]
+    fake.ticker_values[stock().conId] = {"last": 100.0}
+    await broker.quote(AAPL)
+    flag_competing(fake, stock())
+    now["t"] += timedelta(minutes=16)
+    assert broker.data_warning is None  # old news for the dashboard...
+    with pytest.raises(MarketDataUnavailable):
+        await broker.quote(AAPL)  # ...but still no fresh data, so still unusable
+    fake.disconnect()
+    await broker.connect()
+    now["t"] = NOW - timedelta(seconds=1)
+    assert (await broker.quote(AAPL)).last == 100.0  # new session, new subscription

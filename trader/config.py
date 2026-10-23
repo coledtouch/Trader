@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -68,6 +68,21 @@ class AppConfig(BaseSettings):
         default=None,
         validation_alias=AliasChoices("TRADER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
     )
+    # xAI (Grok) API key from console.x.ai (prepaid API credits; a SuperGrok subscription
+    # does not include API access). With both keys the default "consensus" decision mode
+    # only buys when Claude AND Grok agree.
+    xai_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("TRADER_XAI_API_KEY", "XAI_API_KEY"),
+    )
+    xai_model: str = "grok-4.7"
+    xai_base_url: str = "https://api.x.ai/v1"
+    # Grok prices in USD per million tokens, used for the daily AI budget. The defaults are
+    # third-party figures for grok-4.7 (not confirmed against xAI's own price page): check
+    # console.x.ai and override them here if they differ.
+    xai_price_input: float = Field(default=2.0, ge=0)
+    xai_price_cached_input: float = Field(default=0.5, ge=0)
+    xai_price_output: float = Field(default=6.0, ge=0)
 
     # --- notifications -------------------------------------------------------------
     # Optional ntfy topic URL, e.g. "https://ntfy.sh/<long-random-topic>"
@@ -79,6 +94,20 @@ class AppConfig(BaseSettings):
     log_level: str = "INFO"
     sim_seed: int = 7
     sim_starting_cash: float = 250.0
+
+    @model_validator(mode="after")
+    def _cf_access_both_or_neither(self) -> AppConfig:
+        """A half-configured Cloudflare Access check would be silently off (it needs both
+        values), e.g. after a typo in one variable name. Refuse to start instead."""
+        team, aud = self.cf_access_team_domain.strip(), self.cf_access_aud.strip()
+        if bool(team) != bool(aud):
+            missing = "TRADER_CF_ACCESS_AUD" if team else "TRADER_CF_ACCESS_TEAM_DOMAIN"
+            raise ValueError(
+                f"Cloudflare Access is half configured: {missing} is empty. Set both "
+                "TRADER_CF_ACCESS_TEAM_DOMAIN and TRADER_CF_ACCESS_AUD (check the spelling of "
+                "the variable names) or neither"
+            )
+        return self
 
     @property
     def allowed_hosts_list(self) -> list[str]:
