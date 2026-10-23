@@ -887,6 +887,75 @@ async def test_daily_loss_halts_and_flattens(db, config) -> None:
     assert len(h.decider.calls) == calls
 
 
+async def flat_for_a_while(h: H) -> None:
+    """Monitor ticks over 11 quiet minutes: no position, order or fill."""
+    await h.engine.monitor_tick()
+    h.clock.advance(minutes=11)
+    await h.engine.monitor_tick()
+
+
+async def test_deposit_while_flat_is_not_profit(db, config) -> None:
+    h = await harness(db, config)
+    await flat_for_a_while(h)
+    start = h.day().start_equity
+    h.broker.cash += 150.0  # a deposit: more than the $100 daily target
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert h.day().start_equity == pytest.approx(start + 150.0)
+    assert not h.day().halted, "a deposit must not count toward the daily target"
+    assert h.engine.status().pnl_today == pytest.approx(0.0)
+    [flow] = [a for a in db.list_audit() if a["action"] == "cash_flow"]
+    assert flow["detail"]["amount"] == pytest.approx(150.0)
+    assert "Balance change detected" in h.notes.titles()
+
+
+async def test_paper_reset_while_flat_is_not_a_loss(db, config) -> None:
+    h = await harness(db, config)
+    await flat_for_a_while(h)
+    h.broker.cash = 50.0  # e.g. a paper account reset to a smaller balance
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert not h.day().halted, "a reset must not trip the daily loss limit"
+    assert h.day().start_equity == pytest.approx(50.0)
+    curve = db.list_equity()
+    assert curve and all(p["equity"] == pytest.approx(50.0) for p in curve)  # restarted
+
+
+async def test_balance_change_soon_after_a_trade_still_counts(db, config) -> None:
+    """IBKR's account values can lag a closed trade: a change within the quiet window of a
+    fill is trading P&L and must still count toward the loss limit."""
+    h = await harness(db, config, native=False)
+    await enter_f(h)
+    h.broker.set_price("F", 9.0)
+    for _ in range(2):  # the engine stop closes F at a loss
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    assert h.broker.pos == {}
+    start = h.day().start_equity
+    h.broker.cash -= 40.0  # a late loss adjustment shows up a few minutes later
+    h.clock.advance(minutes=3)
+    await h.engine.monitor_tick()
+    assert h.day().start_equity == pytest.approx(start)
+    assert not [a for a in db.list_audit() if a["action"] == "cash_flow"]
+
+
+async def test_balance_change_with_a_position_open_still_counts(db, config) -> None:
+    h = await harness(db, config)
+    await enter_f(h)
+    h.clock.advance(minutes=11)
+    await h.engine.monitor_tick()
+    start = h.day().start_equity
+    h.broker.cash += 150.0
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert h.day().start_equity == pytest.approx(start)
+    assert not [a for a in db.list_audit() if a["action"] == "cash_flow"]
+
+
 async def test_resume_clears_halt_and_rebaselines(db, config) -> None:
     h = await harness(db, config, native=False)
     await enter_f(h)

@@ -93,6 +93,13 @@ KILL_REASON = "kill switch"
 APPROVAL_TTL = timedelta(minutes=10)
 ENTRY_ORDER_TTL = timedelta(minutes=10)  # unfilled entry orders are cancelled after this
 EQUITY_POINT_EVERY = timedelta(minutes=5)
+# A balance change after the account has been flat (no position, no working order, no fill)
+# for this long cannot be trading P&L: it is a deposit, a withdrawal or a paper-account
+# reset, and it is kept out of today's P&L and limits. The wait also covers IBKR's account
+# values, which can lag a closed trade by a few minutes.
+CASH_FLOW_QUIET = timedelta(minutes=10)
+CASH_FLOW_MIN_USD = 1.0
+CURVE_RESTART_FRACTION = 0.5  # a change this large (e.g. a paper reset) restarts the curve
 BROKER_DOWN_NOTIFY_AFTER = timedelta(seconds=60)
 BACKUP_STOP_BREACH = 0.005  # stocks: engine sells only 0.5% beyond a stop the broker lacks
 FLATTEN_BEFORE_CLOSE_MIN = 10.0
@@ -411,6 +418,7 @@ class Engine:
         self._epoch: datetime | None = self._now() if broker.mode == Mode.SIM else None
         self._epoch_reason = "simulator restarted"
         self._rebase_pending = self._epoch is not None
+        self._busy_at = self._now()  # last time the account held a position or order
         self._enforce_live_gate()
         self._backfill_equity_floor()
 
@@ -564,6 +572,50 @@ class Engine:
         stats = self._stats_for(trading_day(ts))
         stats.fees = round(stats.fees + amount, 4)
         self.db.upsert_day(stats)
+
+    def _external_cash_flow(
+        self, previous: AccountSnapshot | None, account: AccountSnapshot, now: datetime
+    ) -> float:
+        """The equity change since the last snapshot when it cannot be trading P&L (the
+        account has been flat for CASH_FLOW_QUIET), else 0.0."""
+        if (
+            previous is None
+            or previous.account_id != account.account_id
+            or not math.isfinite(previous.equity)
+            or previous.equity <= 0
+        ):
+            return 0.0
+        delta = account.equity - previous.equity
+        if abs(delta) < CASH_FLOW_MIN_USD or now - self._busy_at < CASH_FLOW_QUIET:
+            return 0.0
+        if self.db.list_fills(since=now - CASH_FLOW_QUIET, limit=1):
+            return 0.0
+        return round(delta, 2)
+
+    async def _apply_cash_flow(
+        self, flow: float, account: AccountSnapshot, day: DayStats, now: datetime
+    ) -> None:
+        """Keep a deposit, withdrawal or paper reset out of today's P&L and limits."""
+        if day.start_equity is not None:
+            day.start_equity = round(day.start_equity + flow, 2)
+        raw = self.db.get_kv(BASELINE_PREFIX + day.day)
+        if raw:
+            with contextlib.suppress(ValueError):
+                self.db.set_kv(BASELINE_PREFIX + day.day, repr(float(raw) + flow))
+        previous = account.equity - flow
+        if previous > 0 and abs(flow) / previous >= CURVE_RESTART_FRACTION:
+            self.db.start_equity_history(now)
+            self._last_equity_at = None
+        kind = "deposit" if flow > 0 else "withdrawal or reset"
+        log.warning("balance change of %+.2f with no positions open: %s", flow, kind)
+        self.db.audit(
+            "cash_flow", {"amount": flow, "equity": round(account.equity, 2)}, actor="engine"
+        )
+        await self._notify(
+            "Balance change detected",
+            f"{'+' if flow > 0 else '-'}${abs(flow):,.2f} while no positions were open: "
+            f"treated as a {kind}. Today's P&L and limits leave it out.",
+        )
 
     def _halt_eval_day(self, day: DayStats) -> DayStats:
         """After a resume, halts are measured from the equity at the resume."""
@@ -1014,10 +1066,18 @@ class Engine:
             self._note_data_warning()
             positions = self._mark_positions(raw_positions, quotes, metas)
             account = self._mark_account(account, raw_positions, positions)
+            previous = self._account
+            if any(p.qty > 0 for p in raw_positions) or open_orders:
+                self._busy_at = now
             self._account, self._positions, self._open_orders = account, positions, open_orders
 
             if math.isfinite(account.equity) and account.equity > 0:
                 changed = False
+                if not self._rebase_pending:
+                    flow = self._external_cash_flow(previous, account, now)
+                    if flow:
+                        await self._apply_cash_flow(flow, account, day, now)
+                        changed = True
                 if self._rebase_pending:
                     self._rebase_pending = False
                     if day.start_equity is not None and day.start_equity != account.equity:

@@ -822,3 +822,17 @@ Contracts changed by the confirmed review findings (each has a regression test).
   `docker compose up -d` (restart keeps the old environment); consensus cost is ~1.5x
   (Opus) / ~2x (Sonnet) / ~20x (Haiku) of Claude alone; the AI budget counts both models
   and, once spent, consensus mode only manages exits. Service worker cache bumped to v4.
+
+
+### 7.6 Round 6: owner deployment fixes (2026-10-23)
+- **Equity curve restarts** with a new broker account (or a fresh simulator run):
+  `Database.start_equity_history(ts)` stores kv `equity_since`; `list_equity` hides earlier
+  points. Older journals start the curve at the last `account_changed` audit entry.
+- **External cash flows** (deposits, withdrawals, paper resets): when the account has had no
+  position, working order or fill for `CASH_FLOW_QUIET` (10 min), an equity change of at
+  least $1 between monitor ticks is applied to `DayStats.start_equity` (and any resume
+  baseline) instead of counting as P&L; audit `cash_flow`, notification "Balance change
+  detected"; a change of 50%+ restarts the equity curve. Changes while a position is open or
+  within 10 minutes of a fill still count (IBKR account values can lag a closed trade).
+- **IBKR password**: letters and digits only (a `$` was cut off on the way to the
+  gateway); `.env.example` and DEPLOY show a length check that prints no secret.

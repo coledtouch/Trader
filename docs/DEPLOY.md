@@ -341,6 +341,14 @@ Only after paper and shadow results convinced you. Start small.
 
 ## Everyday operations
 
+**Deposits, withdrawals and paper-account resets.** When the account has had no position,
+no working order and no fill for 10 minutes, the bot treats a balance change as money moved
+in or out (or a paper reset), not as profit or loss: today's P&L, the daily target and the
+loss limit leave it out, and the app sends a "Balance change detected" notice. Move money
+while the bot is flat (outside market hours is simplest). A change that arrives while a
+position is open, or within 10 minutes of a trade, counts as trading P&L, so a deposit then
+could stop the bot for the day at "daily target reached" (press **Resume** to continue).
+
 All of these start with `cd ~/Trader`.
 
 | Task | Command |
