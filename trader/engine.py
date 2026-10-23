@@ -102,6 +102,9 @@ EQUITY_POINT_EVERY = timedelta(minutes=5)
 CASH_FLOW_QUIET = timedelta(minutes=10)
 CASH_FLOW_MIN_USD = 1.0
 CURVE_RESTART_FRACTION = 0.5  # a change this large (e.g. a paper reset) restarts the curve
+# The untraded-day rebase only treats a gap this large (of today's start equity) as a
+# reset or transfer; a smaller unexplained gap keeps counting as P&L (safe direction).
+UNTRADED_REBASE_MIN_FRACTION = 0.5
 BROKER_DOWN_NOTIFY_AFTER = timedelta(seconds=60)
 BACKUP_STOP_BREACH = 0.005  # stocks: engine sells only 0.5% beyond a stop the broker lacks
 FLATTEN_BEFORE_CLOSE_MIN = 10.0
@@ -393,6 +396,11 @@ class Engine:
         # journal bookkeeping
         self._fill_commissions: dict[str, tuple[float, datetime]] | None = None
         self._fills_synced = False
+        # When broker fills were last journaled on the current connection (None: not yet).
+        # Balance changes are judged only after that, so a fill made while the app was
+        # stopped or disconnected (e.g. a stop-loss) is journaled first, never mistaken for
+        # a deposit, withdrawal or reset.
+        self._fills_journaled_at: datetime | None = None
         self._last_exit: dict[str, datetime] | None = None
         self._open_qty: dict[str, float] = {}
         self._pending_trades: set[str] = set()
@@ -583,6 +591,7 @@ class Engine:
         account has been flat for CASH_FLOW_QUIET), else 0.0."""
         if (
             previous is None
+            or self._fills_journaled_at is None
             or previous.account_id != account.account_id
             or not math.isfinite(previous.equity)
             or previous.equity <= 0
@@ -621,16 +630,22 @@ class Engine:
         )
 
     def _untraded_day_gap(self, day: DayStats, account: AccountSnapshot, now: datetime) -> float:
-        """Equity minus today's start equity when today cannot have trading P&L (no fills or
-        trades since the day began, and the account flat for CASH_FLOW_QUIET), else 0.0.
-        Catches a balance change the snapshot comparison never saw: one made while the app
-        was stopped, or before an upgrade that added the comparison."""
+        """Equity minus today's start equity when today cannot have trading P&L, else 0.0:
+        no fills or trades since the day began (with this connection's fills journaled), the
+        account flat for CASH_FLOW_QUIET since it last held anything or (re)connected, and a
+        gap of at least UNTRADED_REBASE_MIN_FRACTION, i.e. one that looks like a reset or a
+        transfer. Catches a balance change the snapshot comparison never saw: one made while
+        the app was stopped, or before an upgrade that added the comparison."""
         start = day.start_equity
         if start is None or not math.isfinite(start) or start <= 0:
             return 0.0
         if day.trades or day.wins or day.losses or abs(day.realized_pnl) > EPS:
             return 0.0
+        if self._fills_journaled_at is None:
+            return 0.0
         gap = account.equity - start
+        if abs(gap) / start < UNTRADED_REBASE_MIN_FRACTION:
+            return 0.0
         if abs(gap) < CASH_FLOW_MIN_USD or now - self._busy_at < CASH_FLOW_QUIET:
             return 0.0
         if self.db.list_fills(since=trading_day_start(day.day), limit=1):
@@ -1133,6 +1148,8 @@ class Engine:
         self._down_since = None
         self._down_notified = False
         self._reprotect_pending = True
+        self._busy_at = now  # what happened while disconnected is not known to be quiet
+        self._fills_journaled_at = None
 
     # ------------------------------------------------------------------ monitor
     async def monitor_tick(self) -> None:
@@ -1963,6 +1980,7 @@ class Engine:
         }
         for key in sorted(touched):
             await self._reconstruct(key, now)
+        self._fills_journaled_at = now
 
     def _last_exit_for(self, key: str) -> datetime | None:
         if self._last_exit is None:

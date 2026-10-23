@@ -836,11 +836,16 @@ Contracts changed by the confirmed review findings (each has a regression test).
   within 10 minutes of a fill still count (IBKR account values can lag a closed trade).
   **Untraded days**: a change the tick comparison never saw (made while the app was
   stopped, or before this check existed) is caught too: with no trades, wins, losses,
-  realized P&L or fills since the trading day began, and the account flat for 10 minutes,
-  `start_equity` (and any resume baseline) is set to the current equity (audit `cash_flow`
+  realized P&L or fills since the trading day began, a gap of at least 50% of the day's
+  start (`UNTRADED_REBASE_MIN_FRACTION`; smaller gaps keep counting), and the account flat
+  for 10 minutes, `start_equity` (and any resume baseline) is set to the current equity (audit `cash_flow`
   with `source: "untraded day"`); the curve restarts after the newest jump of 50%+ between
   two consecutive points that day (gradual moves are never hidden), also backfilled at
   startup from the newest `cash_flow` audit. A halt stays until the owner resumes.
+  **Both checks wait for the journal**: neither runs until broker fills have been journaled
+  on the current connection (`_fills_journaled_at`), and every (re)connect restarts the
+  10-minute quiet window, so a stop that filled while the app was stopped or disconnected
+  is journaled (and halts the day if it must) before any balance change is judged.
 - **Loss limit after a resume**: `DecisionContext.loss_baseline` carries the resume baseline
   so the prompt's "left before the halt" matches the engine's halt check instead of showing
   $0 for the rest of the day.

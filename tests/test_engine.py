@@ -970,6 +970,79 @@ async def test_missed_balance_change_restarts_a_curve_that_shows_the_jump(db, co
     assert curve and all(p["equity"] == pytest.approx(500.0) for p in curve)
 
 
+_TUE_11_NY = datetime(2026, 10, 20, 15, 0, tzinfo=UTC)
+_WED_0005_NY = datetime(2026, 10, 21, 4, 5, tzinfo=UTC)
+
+
+async def _overnight_stop_while_away(db, config) -> tuple[H, float]:
+    """F held overnight with a broker stop; the broker becomes unreachable and the stop
+    fills at the open, losing more than the daily limit. Returns (harness, start equity)."""
+    h = await harness(
+        db,
+        config,
+        mode=Mode.PAPER,
+        now=_TUE_11_NY,
+        flatten_stocks_before_close=False,
+        exits={"time_stop_minutes": 0},
+    )
+    await enter_f(h)
+    h.clock.t = _WED_0005_NY
+    await h.engine.monitor_tick()  # today's start equity is recorded with F open
+    assert h.broker.pos and h.day().trades == 0
+    h.broker._connected = False
+    h.broker.can_connect = False
+    h.clock.t = datetime(2026, 10, 21, 13, 35, tzinfo=UTC)
+    h.broker.set_price("F", 8.50)  # gaps through the stop
+    assert h.broker.pos == {}
+    return h, h.day().start_equity
+
+
+async def _connect_late_and_run(h: H, engine: Engine, wait: timedelta) -> None:
+    with pytest.raises(BrokerError):
+        await engine.monitor_tick()
+    h.clock.advance(seconds=wait.total_seconds())
+    h.broker.can_connect = True
+    for _ in range(60):
+        await engine.monitor_tick()
+        h.clock.advance(seconds=15)
+
+
+@pytest.mark.parametrize("wait", [timedelta(minutes=2), timedelta(minutes=12)])
+async def test_stop_filled_while_the_app_was_restarting_still_halts(db, config, wait) -> None:
+    """Review finding: with a slow gateway after a restart, the untraded-day check ran
+    before the stop fill was journaled and booked the loss as a balance change."""
+    h, start = await _overnight_stop_while_away(db, config)
+    h.clock.t = datetime(2026, 10, 21, 14, 0, tzinfo=UTC)  # the app starts again
+    engine = Engine(
+        config, db, h.broker, h.decider, notifier=h.notes, clock=h.clock, scanner=h.scanner
+    )
+    await _connect_late_and_run(h, engine, wait)
+    day = db.get_day("2026-10-21")
+    assert day.start_equity == pytest.approx(start)
+    assert day.halted and day.halt_reason.startswith("daily loss limit")
+    assert not [a for a in db.list_audit() if a["action"] == "cash_flow"]
+
+
+async def test_stop_filled_during_a_long_disconnect_still_halts(db, config) -> None:
+    h, start = await _overnight_stop_while_away(db, config)
+    await _connect_late_and_run(h, h.engine, timedelta(minutes=12))
+    day = h.day()
+    assert day.start_equity == pytest.approx(start)
+    assert day.halted and day.halt_reason.startswith("daily loss limit")
+    assert not [a for a in db.list_audit() if a["action"] == "cash_flow"]
+
+
+async def test_small_unexplained_gap_on_an_untraded_day_still_counts(db, config) -> None:
+    """Only a gap that looks like a reset or transfer (50%+) is rebased."""
+    h = await harness(db, config)
+    await h.engine.monitor_tick()
+    _start_day_on_old_balance(h, 700.0)  # equity 500: a 29% gap
+    h.clock.advance(minutes=11)
+    await h.engine.monitor_tick()
+    assert h.day().start_equity == 700.0
+    assert not [a for a in db.list_audit() if a["action"] == "cash_flow"]
+
+
 async def test_a_real_loss_is_never_rebased_away(db, config) -> None:
     """A day with trades keeps its start equity however long the account then sits flat."""
     h = await harness(db, config, native=False)
