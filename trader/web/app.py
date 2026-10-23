@@ -101,6 +101,10 @@ def _apply_headers(headers: MutableHeaders, path: str, base: dict[str, str]) -> 
         headers["Cache-Control"] = "no-store"
     if path == "/static/sw.js":
         headers["Service-Worker-Allowed"] = "/"  # the shell's service worker controls "/"
+    if path.startswith("/static/") and path.endswith((".js", ".css")):
+        # Revalidate executable/layout assets across deployments. Versioned page
+        # references also bypass a still-controlling older service worker's cache.
+        headers["Cache-Control"] = "no-cache"
 
 
 class SecurityHeadersMiddleware:

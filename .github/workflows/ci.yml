@@ -26,6 +26,11 @@ jobs:
         run: ruff format --check .
       - name: Tests (offline)
         run: pytest -q
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Browser cache upgrade regression
+        run: node --test tests/service_worker.test.cjs
 
   docker:
     runs-on: ubuntu-latest

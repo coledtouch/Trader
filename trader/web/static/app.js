@@ -744,7 +744,7 @@
         metric('Hosting estimate', money(p.hosting_cost), 'Prorated monthly input'),
         metric('Data estimate', money(p.data_cost), 'Prorated monthly input'),
         metric('Net expectancy', signedMoney(p.net_expectancy), 'Per closed trade, after commissions'),
-        metric('Max drawdown', pct(p.max_drawdown_pct), 'Account equity, before operating costs'),
+        metric('Max drawdown', pct(p.max_drawdown_pct), 'Daily equity; before operating costs'),
         metric('Profit factor', isNum(p.profit_factor) ? p.profit_factor.toFixed(2) : DASH, 'Closed trades after commissions'),
         metric('Signal evidence', `${p.evaluated_signals ?? 0} / ${p.signal_count ?? 0}`, 'Evaluated / recorded · before costs'),
       ]),
