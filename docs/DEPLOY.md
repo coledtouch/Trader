@@ -272,8 +272,9 @@ to judge the results; the **Signals** tab shows the scorecard.
 ## Part C: shadow mode (live account, orders blocked)
 
 The bot connects to your real account and makes real decisions on real data, but every
-order is recorded as BLOCKED ("shadow mode") and nothing is sent. This checks live data,
-balances and the day-trade counter without risk.
+new entry is recorded as BLOCKED ("shadow mode") and nothing is bought. This checks live
+data, balances and the day-trade counter without risk. (Shadow mode still lets the bot
+close positions *it* opened; at this stage it has none.)
 
 1. Edit `.env`:
    ```
@@ -286,7 +287,7 @@ balances and the day-trade counter without risk.
    TRADER_IB_MARKET_DATA_TYPE=1
    ```
    `READ_ONLY_API=yes` makes the gateway itself refuse orders: a second lock on top of
-   shadow mode. (It also means the KILL button cannot sell anything; in shadow mode the bot
+   shadow mode. (It also means the KILL button cannot sell anything; at this stage the bot
    holds nothing, and anything you bought yourself you manage in IBKR's apps.)
 2. Apply, then **approve the IB Key notification on your phone** within about 3 minutes:
    ```bash
@@ -321,11 +322,10 @@ Only after paper and shadow results convinced you. Start small.
 3. In the app: **Settings** > **Live trading** > **Arm**, and enter a fresh 6-digit code.
    The badge turns **LIVE-ARMED**. Real orders are now possible.
 4. To stop real orders at any time: **Disarm** in the app (instant), or from the server
-   `docker compose exec trader python -m trader disarm`. Disarm blocks **every** order,
-   including the bot's own exits: crypto stops, flatten before the close, the daily-loss
-   flatten and re-placing a lost stop all pause, and only the stock stops at IBKR keep
-   working. To stop new trades but keep the bot protecting open positions, press **Stop
-   bot** instead; to close everything, **KILL**. To lock live trading on the server too,
+   `docker compose exec trader python -m trader disarm`. Disarm blocks every new entry;
+   the bot keeps closing the positions it opened (stops, targets, time stops, closing
+   stocks before the bell, the daily-loss flatten), because exits only reduce risk. To close
+   everything now, **KILL**. To lock live trading on the server too,
    set `TRADER_ALLOW_LIVE=false` and run `docker compose up -d`: starting with the gate off
    also clears the arm, so after setting it back to `true` real orders need a fresh
    **Arm** with a 2FA code (step 3).
@@ -353,9 +353,9 @@ IBKR, but **crypto stops are managed by the bot and stop working** while it is d
 **Stop bot** in the app only stops new decisions. As long as the app runs it keeps watching
 open positions (crypto stops, the daily loss limit, closing stocks before the bell), and
 after a restart the bot comes back in the same state: running if it was running, otherwise
-just watching. The exception is a live account in shadow mode (not armed, or disarmed):
-then the bot sends nothing at all, its own exits included, and only the stock stops at
-IBKR protect you. Only KILL closes everything. **Run cycle now** still works while the bot is
+just watching. That also holds in shadow mode (live account not armed, or disarmed): no
+new entries, but exits for the bot's own positions still go out. Only KILL closes
+everything, including positions you opened yourself. **Run cycle now** still works while the bot is
 stopped: it runs one decision cycle on demand (same risk checks, same autopilot rule).
 
 **Switching accounts** (simulator -> paper -> live, or another paper account): the bot

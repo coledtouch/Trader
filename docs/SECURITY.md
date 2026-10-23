@@ -45,7 +45,7 @@ secrets live, what gets logged, and what to do when a device is lost.
 | Someone reaches the droplet directly, skipping Cloudflare | Nothing listens on the internet except SSH: ufw allows only SSH, the tunnel is an outbound connection, and the app's port is published on `127.0.0.1` only. With `TRADER_CF_ACCESS_TEAM_DOMAIN`/`TRADER_CF_ACCESS_AUD` set, the app also refuses any request without a valid, signed Cloudflare Access token for your application (checked against your team's public keys, audience, issuer and expiry). |
 | Your password leaks | Useless without the 2FA code. Each code works only once (replay protection). |
 | Another website tries to act with your logged-in browser | Session cookie is `HttpOnly`, `Secure`, `SameSite=Strict` with the `__Host-` prefix; every change needs a CSRF token and a matching `Origin`. Sessions end after 30 minutes without you using the app (the dashboard's automatic refresh does not count, so an unattended open tab signs out too) or after 12 hours. |
-| Someone picks up your unlocked phone with the app open | Arming live trading, resuming after a halt, loosening risk limits (including raising "halve size after N losses"), enabling autopilot while live, leaving consensus decisions and turning off "flatten stocks before the close" all need a **fresh** 2FA code. Disarm, stop and KILL need no code: they never open a position. But **Disarm is not free of risk**: it blocks every order, including the bot's own exits (engine-managed crypto stops, flatten before the close, the daily-loss flatten, re-placing a lost stop). Only stops held at IBKR (stocks) keep working, so the app asks for confirmation when positions are open. To stop new trades but keep the bot protecting positions, press **Stop** instead. |
+| Someone picks up your unlocked phone with the app open | Arming live trading, resuming after a halt, loosening risk limits (including raising "halve size after N losses"), enabling autopilot while live, leaving consensus decisions and turning off "flatten stocks before the close" all need a **fresh** 2FA code. Disarm, stop and KILL need no code: they never open a position. **Disarm** blocks new entries; the bot keeps managing exits for the positions it opened (stops, targets, time stops, flatten before the close, the daily-loss flatten, re-placing a lost stop), because exits only reduce risk. Positions you opened yourself are never touched. |
 | A bug or a misbehaving AI | Real orders need all three gates in [7]. Every order passes the risk manager; hard caps in code clamp any setting; the AI can only shrink size; every stock entry carries a stop at IBKR; daily loss limit halts trading. See [STRATEGY.md](STRATEGY.md). |
 | Abuse of the IB Gateway API (it has no password of its own) | The gateway publishes no ports and sits on its own Docker network (`broker`) that only the trader container joins ([gnzsnz: leaving localhost](https://github.com/gnzsnz/ib-gateway-docker#leaving-localhost)). cloudflared is on a separate network (`edge`) with the trader only, so even a tunnel route added in the Cloudflare dashboard (by mistake or by someone with access to your Cloudflare account) cannot reach the gateway's API or VNC. Never add a `ports:` line to it except the temporary loopback-only VNC in DEPLOY.md, and never put cloudflared on the `broker` network. |
 | Docker bypassing the firewall | Docker-published ports skip ufw ([Docker docs](https://docs.docker.com/engine/network/packet-filtering-firewalls/)). Only `127.0.0.1:8000` is published. An optional DigitalOcean Cloud Firewall sits outside the droplet as a second wall. |
@@ -111,10 +111,10 @@ e-mail, and possibly a logged-in AI Trader app. Work through this list from your
    docker compose exec trader python -m trader logout-all
    ```
    This also **disarms live trading** at once (as do `reset-2fa`, `reset-password` and
-   `python -m trader disarm`): the bot drops to shadow mode and sends nothing more, not even
-   its own exits. Stock positions keep their IBKR stops; crypto positions have no stop at
-   IBKR, and nothing flattens stocks before the close, so check open positions in IBKR
-   Mobile or the Client Portal and close what you do not want to hold.
+   `python -m trader disarm`): the bot drops to shadow mode and opens nothing new. It keeps
+   closing the positions it opened (stops, targets, time stops, closing stocks before the
+   bell, the daily-loss flatten). Check open positions in IBKR Mobile or the Client Portal
+   and close anything else you do not want to hold.
 2. **Lock the server gate** so nobody can arm again (the phone holds your 2FA codes): set
    `TRADER_ALLOW_LIVE=false` in `.env` (`nano .env`), then `docker compose up -d`. Starting
    with the gate off also clears any stored arm, so when you later set it back to `true`,
@@ -169,7 +169,7 @@ e-mail, and possibly a logged-in AI Trader app. Work through this list from your
 
 ## If you think the server is compromised
 
-1. In the app: **KILL** (disarm alone also stops the bot's own exits, see the table above).
+1. In the app: **KILL** (disarm alone only blocks new entries, see the table above).
    Then in IBKR Mobile or the Client Portal, check that all orders are cancelled and close
    what you want closed.
 2. Change the IBKR password and rotate every secret in step 6 above. Delete the GitHub

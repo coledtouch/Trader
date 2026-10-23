@@ -579,7 +579,7 @@
   function modeInfo(s) {
     if (s.mode === 'live') {
       return s.shadow
-        ? { key: 'live-shadow', label: 'LIVE-SHADOW', desc: 'live account in shadow mode: decisions are logged, orders are blocked' }
+        ? { key: 'live-shadow', label: 'LIVE-SHADOW', desc: 'live account in shadow mode: new entries are blocked; the bot still closes positions it opened' }
         : { key: 'live-armed', label: 'LIVE-ARMED', desc: 'live account, armed: real orders are sent' };
     }
     if (s.mode === 'paper') return { key: 'paper', label: 'PAPER', desc: 'IBKR paper account' };
@@ -940,7 +940,7 @@
     if (!allowed) note = 'Set TRADER_ALLOW_LIVE=true on the server to allow arming.';
     else if (!live) note = 'Arming is only possible while a live IBKR account is connected.';
     else if (armed) note = 'Real orders are sent, and each one still passes the risk checks. Disarm at any time to go back to shadow mode.';
-    else note = 'Shadow mode: decisions are logged and orders are blocked, including the bot\'s own exits (only stops held at IBKR still work). Arming needs a fresh 2FA code.';
+    else note = 'Shadow mode: decisions are logged and new entries are blocked. The bot still closes positions it opened (stops, targets, time stops, closing before 4 PM). Arming needs a fresh 2FA code.';
     setText($('live-note'), note);
   }
 
@@ -964,18 +964,15 @@
     });
   }
 
-  /** Disarm also pauses the bot's own exits: say so when positions are open. */
+  /** Disarm blocks new entries only: say what keeps running when positions are open. */
   function confirmDisarm() {
     const positions = asList(state.data && state.data.positions).filter((p) => p && p.qty > 0);
     if (!positions.length) return true;
-    const crypto = positions.some((p) => p.instrument && p.instrument.asset_class === 'CRYPTO');
     return window.confirm(
       `Disarm with ${positions.length} open position(s)?\n\n`
-      + 'Disarming blocks every order the bot would send, including its own exits: no '
-      + 'engine-side stops, no flatten before the close, no daily-loss flatten and no '
-      + 're-placed stops. Stock positions keep only their stop at IBKR'
-      + (crypto ? '; crypto positions have NO stop at all' : '')
-      + '. Manage or close them yourself (KILL closes everything).',
+      + 'No new entries will be sent. The bot keeps closing the positions it opened '
+      + '(stops, targets, time stops, closing stocks before 4 PM, the daily-loss limit). '
+      + 'Positions you opened yourself are yours to manage. KILL closes everything now.',
     );
   }
 
@@ -984,7 +981,7 @@
     await busy($('disarm-btn'), async () => {
       try {
         mergeStatus(await api('POST', '/api/live/disarm'));
-        toast('Live trading disarmed: orders are blocked, including the bot\'s own exits (shadow mode).');
+        toast('Live trading disarmed: no new entries; the bot still closes positions it opened (shadow mode).');
       } catch (err) {
         report(err, 'Could not disarm: ');
       } finally {

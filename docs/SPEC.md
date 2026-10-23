@@ -37,8 +37,11 @@ Safety rules (enforced in code, covered by tests):
 - Default broker is the offline simulator. Real-money orders need **all three**:
   `TRADER_ALLOW_LIVE=true` env, a live (non-"DU") IBKR account, and the owner "arming"
   live trading in the UI with a fresh TOTP code. Otherwise a live account runs in
-  **shadow mode**: decisions are logged, orders are recorded as BLOCKED, nothing is sent
-  (the engine's own exits included; only an owner-confirmed kill acts). The arm lasts only
+  **shadow mode**: decisions are logged and every ENTRY is recorded as BLOCKED. Exits
+  for positions the engine opened (those with positions_meta) still go out: engine-side
+  stops/targets, time stops, breakeven/trailing moves, re-placed stops, flatten before
+  the close, AI/approved CLOSEs, and the daily-loss flatten (bot positions only). The
+  owner-confirmed kill closes everything (owner decision, 2026-10-23: exits only reduce risk). The arm lasts only
   while the gate stays open: a process that starts with `TRADER_ALLOW_LIVE=false` clears it,
   and so do the CLI's `logout-all`, `reset-2fa`, `reset-password` and `disarm` (7.5).
 - Every entry must have a stop-loss below entry; long-only; no shorting; no options
@@ -314,7 +317,7 @@ loop continues; exponential backoff on broker errors; never crash the app):
   never the pre-LLM context; dropped when older than `DECISION_MAX_AGE`, 7.5) build
   `OrderRequest` (LIMIT at decision limit or quote ask/last; stop/target from the
   decision or candidate) → size → risk check → BLOCKED (journal with reasons) or, if
-  approved: shadow mode → BLOCKED("shadow mode"); autopilot off → PENDING_APPROVAL
+  approved: shadow mode → BLOCKED("shadow mode") for entries; autopilot off → PENDING_APPROVAL
   (+ notify); else place via broker, journal, store positions_meta (stop, target,
   entry, initial_risk = (entry − stop) × qty, setup, decision_id), count the trade.
   CLOSE → `broker.close_position`, only for a position with positions_meta (otherwise
@@ -764,9 +767,8 @@ Contracts changed by the confirmed review findings (each has a regression test).
   startup"), so re-opening the gate always needs a fresh Arm + TOTP. `python -m trader
   disarm` (new) and `logout-all` / `reset-2fa` / `reset-password` clear it too (audit
   `live_disarmed`, actor "cli"). An arm still survives a restart while the gate stays open.
-- **Shadow mode is honest** (OPS-2): behaviour unchanged (nothing is sent, the engine's own
-  exits included), but the docs say so and the Disarm button asks for confirmation when
-  positions are open (crypto positions have no broker stop at all).
+- **Shadow mode** (OPS-2, then owner decision 2026-10-23): entries are blocked; exits for
+  the engine's own positions keep running (see section 1). The Disarm confirmation says so.
 - **Loosening rules** (SEC-2): `loss_streak_halve_after` is no longer in
   `LOWER_IS_LOOSER` (a higher N halves later or never: raising it needs step-up) and is
   capped at 10 (`HARD_CAPS`, also in the backtester).

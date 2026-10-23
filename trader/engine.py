@@ -16,8 +16,10 @@ journal together (docs/SPEC.md 5.7 and 7.2).
 `start_monitor()` restores that state after an app restart.
 Exit rules only touch positions the engine opened (those with positions_meta); the kill
 switch and the daily-loss flatten close everything. In shadow mode (live account, not
-armed) nothing is sent except an owner-confirmed kill. Every broker failure is logged and
-survived; when in doubt, no order is sent.
+armed) no entry is ever sent, but exits still are for positions the engine opened (stops,
+targets, time stops, flatten before the close, the daily-loss flatten, AI closes) because
+they only reduce risk; the owner-confirmed kill closes everything. Every broker failure is
+logged and survived; when in doubt, no order is sent.
 """
 
 from __future__ import annotations
@@ -479,7 +481,8 @@ class Engine:
 
     @property
     def shadow(self) -> bool:
-        """Live account without the owner's arming: decisions are logged, orders blocked."""
+        """Live account without the owner's arming: decisions are logged and entries are
+        blocked; exits for positions the engine opened still go out."""
         armed = self.config.allow_live and self.db.get_flag("live_armed")
         return self.broker.mode == Mode.LIVE and not armed
 
@@ -732,15 +735,15 @@ class Engine:
         await self._notify("Live trading armed", f"Real-money orders enabled by {actor}.", "high")
 
     async def disarm_live(self, actor: str = "owner") -> None:
-        """Back to shadow mode on a live account: the engine sends nothing, so the owner
-        manages any open positions (broker-side stops stay in place)."""
+        """Back to shadow mode on a live account: no new entries, while the engine keeps
+        managing exits for the positions it opened (broker-side stops stay in place)."""
         self.db.set_flag("live_armed", False)
         log.warning("live trading disarmed by %s", actor)
         if self.shadow and any(p.qty > 0 for p in self._positions):
             await self._notify(
                 "Live trading disarmed",
-                "Engine exits are paused for open positions; broker stops remain. "
-                "Manage or close them yourself.",
+                "No new entries. The bot keeps managing exits (stops, targets, time stops, "
+                "close before 4 PM) for positions it opened; other positions are yours.",
                 priority="high",
                 tags=["warning"],
             )
@@ -816,13 +819,13 @@ class Engine:
                 self.db.update_order(order_id, status=OrderStatus.BLOCKED, message=message)
                 self._revert_signal(order_id, f"risk at approval: {reasons[0]}")
                 return self._get_order(order_id)
-            if self.shadow:
+            order = verdict.order or req
+            if self.shadow and not order.is_exit:  # exits only reduce risk: still allowed
                 self.db.update_order(
                     order_id, status=OrderStatus.BLOCKED, message="shadow mode: live not armed"
                 )
                 self._revert_signal(order_id, "shadow mode")
                 return self._get_order(order_id)
-            order = verdict.order or req
             if order.is_exit:
                 placed = await self.broker.close_position(order.instrument, order.reason)
                 if placed is None:
@@ -1033,10 +1036,10 @@ class Engine:
                 self._halt_streak = None
                 log.warning("account equity %r is not usable; halts not evaluated", account.equity)
                 self._set_error("monitor:halts", "account equity not available")
-            if not self.shadow:
-                await self._step("exits", self._manage_positions(now, positions, quotes, metas))
-                await self._step("flatten", self._flatten_before_close(now, positions, metas))
-                await self._step("re-protect", self._reprotect(now, positions, open_orders, metas))
+            # Also in shadow mode: these only exit or protect positions the engine opened.
+            await self._step("exits", self._manage_positions(now, positions, quotes, metas))
+            await self._step("flatten", self._flatten_before_close(now, positions, metas))
+            await self._step("re-protect", self._reprotect(now, positions, open_orders, metas))
             await self._step("journal", self._sync_journal(now, positions, open_orders))
             await self._step("signals", self._evaluate_signals(now))
 
@@ -1250,12 +1253,14 @@ class Engine:
         self._cancel_pending(f"cancelled: trading halted ({reason})")
         flatten = hard and self.risk.limits.flatten_on_halt
         detail = reason
-        if flatten and self.shadow:
-            detail += " (shadow mode: nothing flattened)"
-        elif flatten:
+        if flatten:
             try:
-                records = await self._flatten_all(reason, now)
-                detail += f"; closing {len(records)} position(s)"
+                if self.shadow:
+                    records = await self._flatten_engine_positions(reason, now)
+                    detail += f"; shadow mode: closing {len(records)} bot position(s) only"
+                else:
+                    records = await self._flatten_all(reason, now)
+                    detail += f"; closing {len(records)} position(s)"
             except Exception as exc:
                 log.exception("flatten after halt failed")
                 self._set_error("flatten", f"flatten failed: {exc}")
@@ -1281,6 +1286,32 @@ class Engine:
         for rec in records:
             self._journal_order(rec, now)
         self.db.audit("flatten", {"reason": reason, "orders": len(records)}, actor="engine")
+        refused = _refused_exits(records)
+        if refused:
+            raise BrokerError(f"the broker refused to close {refused}")
+        self._clear_error("flatten")
+        return records
+
+    async def _flatten_engine_positions(self, reason: str, now: datetime) -> list[OrderRecord]:
+        """Shadow-mode flatten: close only the positions the engine opened (with
+        positions_meta). Positions the owner holds on the live account are never touched."""
+        metas = self.db.all_position_meta()
+        records: list[OrderRecord] = []
+        async with self._entry_lock:
+            for pos in list(self._positions):
+                key = pos.instrument.key
+                if pos.qty <= 0 or key not in metas:
+                    continue
+                self._closing[key] = now
+                self._close_reasons[key] = reason
+                rec = await self.broker.close_position(pos.instrument, reason=reason)
+                if rec is not None:
+                    records.append(rec)
+        for rec in records:
+            self._journal_order(rec, now)
+        self.db.audit(
+            "flatten", {"reason": reason, "orders": len(records), "scope": "bot"}, actor="engine"
+        )
         refused = _refused_exits(records)
         if refused:
             raise BrokerError(f"the broker refused to close {refused}")
@@ -1645,8 +1676,7 @@ class Engine:
         self, now: datetime, positions: list[Position], open_orders: list[OrderRecord]
     ) -> None:
         await self._sync_orders(now)
-        if not self.shadow:
-            await self._cancel_stale_entries(now)
+        await self._cancel_stale_entries(now)  # cancelling only reduces risk (shadow too)
         await self._sync_fills(now)
         await self._cleanup_meta(now, positions, open_orders)
 
@@ -1912,8 +1942,7 @@ class Engine:
             for order in open_orders:
                 req = order.request
                 if (
-                    not self.shadow
-                    and req.instrument.key == key
+                    req.instrument.key == key
                     and req.side == Side.SELL
                     and order.status in OPEN_ORDER_STATUSES
                     and order.broker_order_id
@@ -2541,11 +2570,7 @@ class Engine:
             decision_id=batch.id,
             setup=pos.setup,
         )
-        if self.shadow:
-            self._journal_order(
-                OrderRecord(request=req, status=OrderStatus.BLOCKED, message="shadow mode"), now
-            )
-            return
+        # Shadow mode still closes positions the bot opened: exits only reduce risk.
         if not self.settings.autopilot:
             if inst.key in self._awaiting_approval():
                 return

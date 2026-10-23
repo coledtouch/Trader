@@ -143,13 +143,14 @@ Arm. Climb one step at a time:
 |---|---|---|---|
 | 1. **Sim** | Built-in simulator with synthetic prices | Fake | You know the dashboard, the kill switch, approvals and the logs (a few days) |
 | 2. **Paper** | IBKR paper account, real prices (with a data subscription) | Fake | 4+ weeks and 30+ evaluated signals for the setups you rely on, and the numbers still look positive after fees ([how to judge](docs/STRATEGY.md#judging-a-setup)) |
-| 3. **Shadow** | Your live account, but every order is recorded as BLOCKED | None at risk | 1-2 weeks of sensible decisions on live data, PDT counter and balances read correctly |
+| 3. **Shadow** | Your live account, but every new entry is recorded as BLOCKED | None at risk | 1-2 weeks of sensible decisions on live data, PDT counter and balances read correctly |
 | 4. **Armed live** | Live orders, small limits, autopilot off at first (you approve each order) | Real | Only increase limits after weeks of results that match paper |
 
 Paper fills are kinder than real fills, so expect live results to be worse than paper.
 You can disarm, stop or kill at any time from the app. Know the difference: **Stop** ends new
-decisions while the bot keeps protecting open positions; **Disarm** blocks every order,
-including the bot's own exits (only stops held at IBKR remain); **KILL** closes everything.
+decisions while the bot keeps protecting open positions; **Disarm** blocks new real-money
+entries while the bot keeps closing the positions it opened (stops, targets, time stops,
+closing before 4 PM, the daily-loss flatten); **KILL** closes everything.
 
 ## Quick start: try the simulator on your Windows laptop
 

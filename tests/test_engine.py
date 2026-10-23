@@ -1072,6 +1072,81 @@ async def test_armed_live_sends_orders(db, tmp_path) -> None:
     assert h.engine.shadow
 
 
+async def disarmed_with_bot_position(db, tmp_path, **kw) -> H:
+    """Live account, armed, the bot opens F, then the owner disarms (shadow mode)."""
+    config = AppConfig(_env_file=None, data_dir=tmp_path, allow_live=True)
+    h = await harness(db, config, mode=Mode.LIVE, **kw)
+    await h.engine.arm_live()
+    await enter_f(h)
+    assert "STK:F" in h.broker.pos
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()  # the position cache now shows F
+    await h.engine.disarm_live()
+    assert h.engine.shadow
+    return h
+
+
+async def test_disarmed_live_keeps_exiting_bot_positions_but_never_enters(db, tmp_path) -> None:
+    """Owner decision: disarming blocks new entries, but the bot keeps closing the positions
+    it opened (exits only reduce risk)."""
+    h = await disarmed_with_bot_position(db, tmp_path)
+    [message] = [m for t, m, _ in h.notes.sent if t == "Live trading disarmed"]
+    assert "No new entries" in message
+    h.clock.advance(minutes=46)
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)  # the next monitor tick confirms the time stop
+    await h.engine.monitor_tick()
+    assert h.broker.pos == {}, "the time stop must still close the bot's position"
+    sent = len(h.broker.placed)
+    h.clock.advance(minutes=5)
+    await h.engine.run_cycle()
+    assert not [r for r in h.broker.placed[sent:] if r.side == Side.BUY]
+    assert h.orders()[0].status == OrderStatus.BLOCKED
+    assert "shadow mode" in h.orders()[0].message
+
+
+async def test_disarmed_loss_flatten_closes_only_bot_positions(db, tmp_path) -> None:
+    h = await disarmed_with_bot_position(db, tmp_path, native=False)
+    h.broker.pos["STK:T"] = [5.0, 20.0]  # the owner's own shares: the bot never opened them
+    h.broker.cash -= 100.0  # same equity, so only F's drop moves the day's P&L
+    h.broker.set_price("F", 8.50)
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert h.day().halted and h.day().halt_reason.startswith("daily loss limit")
+    assert "STK:F" not in h.broker.pos
+    assert h.broker.pos["STK:T"][0] == 5.0, "the owner's position must not be touched"
+    [detail] = [m for t, m, _ in h.notes.sent if t == "Trading halted"]
+    assert "bot position(s) only" in detail
+    flatten = [a for a in db.list_audit() if a["action"] == "flatten"]
+    assert flatten and flatten[0]["detail"]["scope"] == "bot"
+
+
+async def test_disarmed_ai_close_and_approved_close_are_sent(db, tmp_path) -> None:
+    h = await disarmed_with_bot_position(db, tmp_path)
+    settings = db.get_settings()
+    settings.autopilot = False
+    db.save_settings(settings)
+    h.engine.reload_settings()
+    h.decider.decisions = [
+        AIDecision(
+            action=TradeAction.CLOSE,
+            symbol="F",
+            asset_class=AssetClass.STOCK,
+            conviction=0.7,
+            rationale="setup failed",
+        )
+    ]
+    h.clock.advance(minutes=5)
+    await h.engine.run_cycle()
+    [pending] = h.orders(OrderStatus.PENDING_APPROVAL)
+    assert pending.request.is_exit
+    rec = await h.engine.approve_order(pending.id)
+    assert rec.status != OrderStatus.BLOCKED
+    assert h.broker.pos == {}
+
+
 async def test_closing_the_server_gate_clears_the_arm(db, tmp_path) -> None:
     """TRADER_ALLOW_LIVE true -> false -> true across restarts (the documented lockdown):
     the arm does not survive, so the bot stays in shadow mode until a fresh Arm."""

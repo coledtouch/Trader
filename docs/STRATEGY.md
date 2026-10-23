@@ -29,7 +29,7 @@ Every **5 minutes** (`cycle_seconds`) while something is tradable:
       v
  7. Risk manager    sizes the trade and runs ~25 checks; any failure = no order
       v
- 8. Mode gate       shadow mode -> BLOCKED | autopilot off -> waits for your approval
+ 8. Mode gate       shadow mode -> entries BLOCKED (exits still go out) | autopilot off -> waits for approval
       v
  9. Broker          limit order; for stocks a bracket: stop-loss + target held at IBKR
 ```
