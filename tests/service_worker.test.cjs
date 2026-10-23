@@ -39,12 +39,16 @@ function worker(network = async () => response('fresh')) {
   const listeners = new Map();
   const stores = new Map();
   const requests = [];
+  const lifecycleCalls = [];
   let quotaFailure = false;
+  let storageFailure = false;
+  let readFailure = false;
   const cache = (name) => {
     if (!stores.has(name)) stores.set(name, new Map());
     const values = stores.get(name);
     return {
       async match(request, options) {
+        if (readFailure) throw new Error('cache read unavailable');
         assert.notEqual(options?.ignoreSearch, true, 'asset release query must remain part of key');
         return values.get(urlKey(request))?.clone();
       },
@@ -59,11 +63,18 @@ function worker(network = async () => response('fresh')) {
     self: {
       location: { origin: ORIGIN },
       addEventListener(name, fn) { listeners.set(name, fn); },
-      async skipWaiting() {}, clients: { async claim() {} },
+      async skipWaiting() { lifecycleCalls.push('skipWaiting'); },
+      clients: { async claim() { lifecycleCalls.push('claim'); } },
     },
     caches: {
-      async open(name) { return cache(name); },
-      async keys() { return [...stores.keys()]; },
+      async open(name) {
+        if (storageFailure) throw new Error('CacheStorage unavailable');
+        return cache(name);
+      },
+      async keys() {
+        if (storageFailure) throw new Error('CacheStorage unavailable');
+        return [...stores.keys()];
+      },
       async delete(name) { return stores.delete(name); },
     },
     async fetch(request) {
@@ -72,8 +83,10 @@ function worker(network = async () => response('fresh')) {
     },
   });
   return {
-    requests, stores,
+    requests, stores, lifecycleCalls,
     setQuotaFailure() { quotaFailure = true; },
+    setStorageFailure() { storageFailure = true; },
+    setReadFailure() { readFailure = true; },
     async seed(request, value, name = `trader-shell-${VERSION}`) {
       await cache(name).put(request, value);
     },
@@ -160,6 +173,40 @@ test('fresh script still runs when updating optional offline cache fails', async
   await w.seed(assetUrl, response('stale script'));
   w.setQuotaFailure();
   assert.equal((await w.request(assetUrl)).body, 'fresh script');
+});
+
+test('healthy network serves scripts, styles and icons when CacheStorage cannot open', async () => {
+  const w = worker(async (request) => response('fresh asset', {
+    mime: request.url.includes('.css') ? 'text/css' : 'text/javascript',
+  }));
+  w.setStorageFailure();
+  for (const asset of ['app.js', 'styles.css', 'icon.svg']) {
+    assert.equal((await w.request(`/static/${asset}?v=${RELEASE}`)).body, 'fresh asset');
+  }
+  assert.equal(w.requests.length, 3, 'cache failure must not prevent network attempts');
+});
+
+test('install and activation proceed when optional CacheStorage is unavailable', async () => {
+  const w = worker();
+  w.setStorageFailure();
+  await w.lifecycle('install');
+  await w.lifecycle('activate');
+  assert.deepEqual(w.lifecycleCalls, ['skipWaiting', 'claim']);
+});
+
+test('offline with inaccessible storage fails safely instead of returning another release', async () => {
+  for (const fault of ['setStorageFailure', 'setReadFailure']) {
+    const w = worker(async () => { throw new Error('network offline'); });
+    const assetUrl = `/static/app.js?v=${RELEASE}`;
+    await w.seed('/static/app.js', response('incompatible old release'));
+    await w.seed(assetUrl, response('cached release cannot be read'));
+    w[fault]();
+    await assert.rejects(w.request(assetUrl), /network offline/);
+    assert.equal(w.requests.length, 1);
+    const offline = await w.request('/', { mode: 'navigate' });
+    assert.equal(offline.status, 503);
+    assert.match(await offline.text(), /You are offline/);
+  }
 });
 
 test('API, mutations, and cross-origin requests bypass all worker caches', async () => {

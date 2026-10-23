@@ -48,10 +48,14 @@ const cacheable = (res, request) => {
   return true;
 };
 
+const openCache = async () => {
+  try { return await caches.open(CACHE); } catch { return null; }
+};
+
 self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
-    const cache = await caches.open(CACHE);
-    await Promise.all(SHELL.map(async (path) => {
+    const cache = await openCache();
+    if (cache) await Promise.all(SHELL.map(async (path) => {
       try {
         const res = await fetch(new Request(path, { cache: 'reload', credentials: 'same-origin' }));
         if (cacheable(res, path)) await cache.put(path, res);
@@ -65,19 +69,24 @@ self.addEventListener('install', (event) => {
 
 self.addEventListener('activate', (event) => {
   event.waitUntil((async () => {
-    const names = await caches.keys();
-    await Promise.all(names
-      .filter((name) => name.startsWith('trader-shell-') && name !== CACHE)
-      .map((name) => caches.delete(name)));
+    try {
+      const names = await caches.keys();
+      await Promise.all(names
+        .filter((name) => name.startsWith('trader-shell-') && name !== CACHE)
+        .map((name) => caches.delete(name)));
+    } catch { /* optional storage must not prevent the updated worker taking control */ }
     await self.clients.claim();
   })());
 });
 
 const cacheFirst = async (event) => {
-  const cache = await caches.open(CACHE);
-  const cached = await cache.match(event.request);
+  const cache = await openCache();
+  let cached;
+  try { if (cache) cached = await cache.match(event.request); } catch { /* network still works */ }
   const network = fetch(event.request).then(async (res) => {
-    if (cacheable(res, event.request)) await cache.put(event.request, res.clone());
+    if (cache && cacheable(res, event.request)) {
+      try { await cache.put(event.request, res.clone()); } catch { /* caching is optional */ }
+    }
     return res;
   });
   if (cached) {
@@ -88,18 +97,21 @@ const cacheFirst = async (event) => {
 };
 
 const networkFirstCode = async (request) => {
-  const cache = await caches.open(CACHE);
   let res;
   try {
     // Revalidate the browser's HTTP cache as well as bypassing the worker cache.
     res = await fetch(new Request(request, { cache: 'no-cache' }));
   } catch (err) {
-    const cached = await cache.match(request); // query is part of the release identity
-    if (cached) return cached;
+    const cache = await openCache();
+    try {
+      const cached = cache && await cache.match(request); // exact release query only
+      if (cached) return cached;
+    } catch { /* preserve the original network error when offline storage also fails */ }
     throw err;
   }
   if (cacheable(res, request)) {
-    try { await cache.put(request, res.clone()); } catch { /* caching is optional */ }
+    const cache = await openCache();
+    try { if (cache) await cache.put(request, res.clone()); } catch { /* caching is optional */ }
   }
   return res; // authentication/server failures must not silently execute cached code
 };
