@@ -555,3 +555,50 @@ def test_serve_logging_never_writes_the_ntfy_topic(caplog):
     finally:
         for name, level in saved.items():
             logging.getLogger(name).setLevel(level)
+
+
+def test_cli_notify_test(tmp_path, monkeypatch, capsys, caplog):
+    """`notify-test` posts one alert to the configured topic, fails clearly without a topic
+    or when ntfy refuses it, and never prints the secret topic URL."""
+    import logging
+
+    import httpx
+
+    from trader.notify import Notifier
+
+    topic = "https://ntfy.sh/supersecret-topic-abc123"
+    for name in ("TRADER_NTFY_URL", "TRADER_NTFY_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("", encoding="utf-8")
+    saved = {name: logging.getLogger(name).level for name in cli.QUIET_LOGGERS}
+    try:
+        assert cli.main(["notify-test", "--env-file", str(env_file)]) == 1
+        assert "TRADER_NTFY_URL is not set" in capsys.readouterr().err
+
+        env_file.write_text(f"TRADER_NTFY_URL={topic}\n", encoding="utf-8")
+        status = [200]
+        sent: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            sent.append(request)
+            return httpx.Response(status[0])
+
+        monkeypatch.setattr(
+            cli, "Notifier", lambda config: Notifier(config, transport=httpx.MockTransport(handler))
+        )
+        with caplog.at_level(logging.INFO):
+            assert cli.main(["notify-test", "--env-file", str(env_file)]) == 0
+            out = capsys.readouterr()
+            assert "Test alert sent" in out.out
+            assert len(sent) == 1 and str(sent[0].url) == topic
+            assert sent[0].headers["Title"] == "AI Trader test alert"
+
+            status[0] = 403
+            assert cli.main(["notify-test", "--env-file", str(env_file)]) == 1
+            err = capsys.readouterr().err
+            assert "did not accept the test alert" in err
+        assert "supersecret-topic-abc123" not in out.out + out.err + err + caplog.text
+    finally:
+        for name, level in saved.items():
+            logging.getLogger(name).setLevel(level)

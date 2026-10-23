@@ -1,6 +1,7 @@
 """Command line interface: `python -m trader <command>`.
 
-Commands: serve, setup, reset-password, reset-2fa, logout-all, disarm, status, backtest.
+Commands: serve, setup, reset-password, reset-2fa, logout-all, disarm, status, notify-test,
+backtest.
 reset-password, reset-2fa, logout-all and disarm also clear the live-trading arm (the
 compromise response): real-money orders then need a fresh Arm with a 2FA code.
 
@@ -17,6 +18,7 @@ the new key from the environment.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import getpass
 import logging
 import os
@@ -29,6 +31,7 @@ from pydantic import SecretStr, ValidationError
 from trader.config import AppConfig
 from trader.db import Database
 from trader.models import utcnow
+from trader.notify import Notifier
 from trader.security import crypto
 from trader.security.auth import (
     MIN_PASSWORD_LENGTH,
@@ -413,6 +416,32 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_notify_test(args: argparse.Namespace) -> int:
+    """Send one alert through the configured ntfy topic, to check the phone receives it."""
+    config = _config(args)
+    configure_logging(config.log_level)  # shows the notifier's warning; never the topic URL
+    notifier = Notifier(config)
+    if not notifier.enabled:
+        raise CLIError(
+            "TRADER_NTFY_URL is not set: add it to .env, then run `docker compose up -d`"
+        )
+    sent = asyncio.run(
+        notifier.send(
+            "AI Trader test alert",
+            "Phone alerts work. You will get one when the bot buys, closes a trade, halts or "
+            "loses the broker connection.",
+            tags=["white_check_mark"],
+        )
+    )
+    if not sent:
+        raise CLIError(
+            "ntfy did not accept the test alert (see the warning above). Check that "
+            "TRADER_NTFY_URL looks like https://ntfy.sh/<your-topic>"
+        )
+    print("Test alert sent. It should show on your phone within a few seconds.")
+    return 0
+
+
 # ---------------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
@@ -464,6 +493,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", parents=[common], help="show configuration (no secrets)").set_defaults(
         func=cmd_status
     )
+    sub.add_parser(
+        "notify-test", parents=[common], help="send a test alert to your phone (ntfy)"
+    ).set_defaults(func=cmd_notify_test)
     sub.add_parser(
         "backtest", add_help=False, help="run the backtester (python -m trader backtest --help)"
     )

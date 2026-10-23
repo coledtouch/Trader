@@ -77,7 +77,7 @@ runtime dependencies without a strong reason.
 trader/
   __init__.py
   __main__.py          # `python -m trader [serve|setup|reset-password|backtest|...]` -> cli.main
-  cli.py               # argparse CLI (setup wizard, password/TOTP reset, backtest, status)
+  cli.py               # argparse CLI (setup wizard, password/TOTP reset, backtest, status, ntfy test alert)
   config.py            # AppConfig (env, secrets)                       [DONE - shared]
   models.py            # shared pydantic types                         [DONE - shared]
   db.py                # SQLite Database class                          [DONE - shared]

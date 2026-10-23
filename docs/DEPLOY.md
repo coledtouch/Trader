@@ -357,6 +357,7 @@ All of these start with `cd ~/Trader`.
 | App log, last 100 lines | `docker compose logs --tail 100 trader` |
 | Follow a log live (`Ctrl+C` to stop) | `docker compose logs -f trader` (or `ib-gateway`, `cloudflared`) |
 | Settings check (no secrets shown) | `docker compose exec trader python -m trader status` |
+| Send a test phone alert (ntfy) | `docker compose exec trader python -m trader notify-test` |
 | Restart only the app (gateway stays logged in) | `docker compose restart trader` (keeps the old `.env` values) |
 | Apply `.env` changes | `docker compose up -d` (`docker compose restart` does **not** reload `.env`) |
 | Disarm live trading from the server | `docker compose exec trader python -m trader disarm` |

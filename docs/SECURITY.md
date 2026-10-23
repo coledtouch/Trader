@@ -153,7 +153,8 @@ e-mail, and possibly a logged-in AI Trader app. Work through this list from your
    - **IBKR password**: change it in the Client Portal, update `TWS_PASSWORD`, then
      `docker compose up -d` (the gateway logs in again).
    - **ntfy**: make a new topic (`openssl rand -hex 16`), update `TRADER_NTFY_URL`,
-     `docker compose up -d`, subscribe on the new phone.
+     `docker compose up -d`, subscribe on the new phone, and check it with
+     `docker compose exec trader python -m trader notify-test`.
 7. **Check what happened**: the app's audit log, and trades and account activity in the
    IBKR Client Portal.
 

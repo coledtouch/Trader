@@ -126,8 +126,9 @@ Two posts on Reddit's r/ai_trading shaped the design.
   breach shows on two checks in a row (IBKR's own stop orders are not affected).
 - Account switch guard: when the broker account changes (simulator, paper, live), the bot
   starts a fresh journal and never manages positions it did not open on that account.
-- Phone alerts through [ntfy](https://ntfy.sh) (optional): disconnects, halts, orders
-  waiting for approval.
+- Phone alerts through [ntfy](https://ntfy.sh) (optional): buys, closed trades with P&L,
+  disconnects, halts, orders waiting for approval. `python -m trader notify-test` sends a
+  test alert.
 - Security: Cloudflare Access + the app's own password and 2FA code, step-up 2FA for
   risky actions, audit log of every owner action. See [docs/SECURITY.md](docs/SECURITY.md).
 
@@ -196,7 +197,7 @@ This takes about 10 minutes and needs no IBKR account. Commands are for PowerShe
    ```
 
 Other commands: `python -m trader status` (settings check, never prints secrets),
-`reset-password`, `reset-2fa`, `logout-all`, `disarm` (the last four also disarm live
+`notify-test` (sends a test phone alert), `reset-password`, `reset-2fa`, `logout-all`, `disarm` (the last four also disarm live
 trading).
 
 ## Documentation

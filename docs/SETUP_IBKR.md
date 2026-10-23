@@ -175,10 +175,14 @@ decisions. Nothing pretends to be a consensus that is not one.
 - [ ] In the ntfy app tap **+**, enter the topic, keep the server `ntfy.sh`, and subscribe.
 - [ ] In `.env` on the droplet: `TRADER_NTFY_URL=https://ntfy.sh/<your-topic>`, then
   `docker compose up -d`.
+- [ ] Send a test alert: `docker compose exec trader python -m trader notify-test`. It
+  should show on the phone within a few seconds.
 
 The Google Play version delivers ntfy.sh messages instantly through Google's push service
-([ntfy docs: phone app](https://docs.ntfy.sh/subscribe/phone)). Alerts cover broker
-disconnects longer than a minute, halts, and orders waiting for your approval.
+([ntfy docs: phone app](https://docs.ntfy.sh/subscribe/phone)). Alerts cover each buy and
+each closed trade (with its P&L), halts and the kill switch, broker disconnects longer than
+a minute, positions left without a working stop, balance changes, and orders waiting for
+your approval.
 
 ### 9. An authenticator app for the AI Trader login
 
