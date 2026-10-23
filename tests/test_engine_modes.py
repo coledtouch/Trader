@@ -39,6 +39,7 @@ from trader.models import (
 )
 from trader.strategy.consensus import ConsensusDecisionMaker
 from trader.strategy.decide import RuleBasedDecisionMaker
+from trader.timeutil import trading_day, trading_day_start
 
 
 # =========================================================================== wiring
@@ -455,3 +456,34 @@ async def test_equity_curve_backfills_from_an_earlier_account_change(
     db.add_equity_point(1_000_000.0, ts=real_now + timedelta(minutes=5))
     await harness(db, config)
     assert [p["equity"] for p in db.list_equity()] == [1_000_000.0]
+
+
+def _points_before_now(db: Database, values: list[float]) -> None:
+    """Equity points spread over the minutes before the real clock, within today's trading
+    day (the audit log is stamped with the real clock)."""
+    real_now = datetime.now(UTC)
+    first = max(trading_day_start(trading_day(real_now)), real_now - timedelta(minutes=20))
+    step = (real_now - first) / (len(values) + 1)
+    for i, value in enumerate(values):
+        db.add_equity_point(value, ts=first + step * i)
+
+
+async def test_equity_curve_backfill_hides_a_reset_cliff(db: Database, config: AppConfig) -> None:
+    """A paper reset recognised only later (untraded-day rebase) left a $1M -> $600 cliff:
+    the curve starts at the first point after it."""
+    _points_before_now(db, [1_000_000.0, 1_000_000.0, 600.0, 600.0])
+    db.audit("cash_flow", {"amount": -999_400.0, "equity": 600.0}, actor="engine")
+    await harness(db, config)
+    curve = [p["equity"] for p in db.list_equity()]
+    assert curve[:2] == [600.0, 600.0] and 1_000_000.0 not in curve
+
+
+async def test_equity_curve_backfill_keeps_a_gradual_decline(
+    db: Database, config: AppConfig
+) -> None:
+    """Large moves made of small steps are trading, not a balance change: nothing is hidden
+    when a later deposit is recorded."""
+    _points_before_now(db, [1_200.0, 1_000.0, 800.0, 650.0, 600.0])
+    db.audit("cash_flow", {"amount": 50.0, "equity": 650.0}, actor="engine")
+    await harness(db, config)
+    assert [p["equity"] for p in db.list_equity()][:5] == [1_200.0, 1_000.0, 800.0, 650.0, 600.0]

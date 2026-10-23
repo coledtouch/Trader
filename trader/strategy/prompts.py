@@ -11,7 +11,17 @@ import math
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from trader.models import Candidate, DecisionContext, Mode, Position, RiskLimits, TradeRecord
+from trader.fees import estimate_commission
+from trader.models import (
+    AssetClass,
+    Candidate,
+    DecisionContext,
+    Mode,
+    Position,
+    RiskLimits,
+    Side,
+    TradeRecord,
+)
 from trader.strategy.decide import reward_risk
 
 MAX_CANDIDATES = 15  # highest scores first; the rest are summarised as a count
@@ -84,9 +94,9 @@ Weigh this context:
 - Delayed data: when the context says data is DELAYED, prices are about 15 minutes \
 old. Treat every level as stale, demand a wider margin and lean towards HOLD. In LIVE \
 mode the risk manager blocks stock entries on delayed data anyway.
-- Fees: stock commissions are at least $1 per order and crypto costs about 0.18% (at \
-least $1.75). On a small account a trade that can only make a few dollars is often not \
-worth its round-trip fees.
+- Fees: each candidate shows its estimated round-trip fees at the largest size the risk \
+limits allow, as a share of the reward at target. The risk manager rejects entries whose \
+fees exceed the stated limit; below it, fees are a cost to weigh, not a reason to pass.
 - Day-trade limits: when few day trades remain, open stock positions only for the best \
 setups.
 - Scanner fields: score is the scanner's 0 to 1 quality estimate; rel_vol above 1.5 \
@@ -242,7 +252,9 @@ def _candidates(ctx: DecisionContext) -> str:
     ranked = sorted(ctx.candidates, key=lambda c: (-c.score, c.instrument.key, c.setup))
     shown = ranked[:MAX_CANDIDATES]
     lines = [f"## Candidates (BUY only from this list; {len(ranked)})"]
-    lines += [_candidate_line(c, ctx.market.get(c.instrument.key, {})) for c in shown]
+    lines += [
+        _candidate_line(c, ctx.market.get(c.instrument.key, {})) + _fee_note(c, ctx) for c in shown
+    ]
     if len(ranked) > len(shown):
         lines.append(f"(+{len(ranked) - len(shown)} lower-scored candidates omitted)")
     return "\n".join(lines)
@@ -262,6 +274,39 @@ def _candidate_line(cand: Candidate, snap: dict[str, float]) -> str:
     if cand.note:
         line += f" | note: {_clip(cand.note, 160)}"
     return line
+
+
+def _fee_note(cand: Candidate, ctx: DecisionContext) -> str:
+    """Round-trip fees at the largest size the notional, position and risk limits allow
+    (the same fee model as the risk check), as a share of the reward at target."""
+    lim, price, stop, target = ctx.limits, cand.price, cand.suggested_stop, cand.suggested_target
+    if not all(math.isfinite(v) and v > 0 for v in (price, stop, target)) or not (
+        stop < price < target
+    ):
+        return ""
+    equity = ctx.account.equity
+    base = ctx.day.start_equity or equity
+    if not (math.isfinite(equity) and equity > 0 and base > 0):
+        return ""
+    budget = min(lim.max_order_notional_usd, lim.max_position_pct / 100 * equity)
+    risk_usd = base * lim.max_risk_per_trade_pct / 100
+    qty = min(budget / price, risk_usd / (price - stop))
+    stock = cand.instrument.asset_class == AssetClass.STOCK
+    if stock:
+        qty = math.floor(qty)
+    if qty <= 0:
+        return ""
+    plan = ctx.commission_plan
+    fees = estimate_commission(cand.instrument, qty, price, Side.BUY, plan) + estimate_commission(
+        cand.instrument, qty, target, Side.SELL, plan
+    )
+    reward = (target - price) * qty
+    size = f"{qty:g} sh" if stock else f"{qty:.6g} units"
+    return (
+        f" | at most {size} (~{_usd(qty * price)}): round-trip fees ~{_usd(fees)} = "
+        f"{fees / reward * 100:.0f}% of the {_usd(reward)} reward (limit "
+        f"{_num(lim.max_fee_to_reward_pct)}%)"
+    )
 
 
 def _market(ctx: DecisionContext) -> str:

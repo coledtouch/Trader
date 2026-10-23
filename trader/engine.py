@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import json
 import logging
 import math
@@ -422,6 +423,7 @@ class Engine:
         self._busy_at = self._now()  # last time the account held a position or order
         self._enforce_live_gate()
         self._backfill_equity_floor()
+        self._backfill_curve_after_cash_flow()
 
     def _backfill_equity_floor(self) -> None:
         """Journals from before equity-curve restarts existed: start the curve at the last
@@ -644,13 +646,7 @@ class Engine:
         day.start_equity = account.equity
         if self.db.get_kv(BASELINE_PREFIX + day.day):
             self.db.set_kv(BASELINE_PREFIX + day.day, repr(account.equity))
-        # Restart the equity curve only when the jump is on it (it may already have been
-        # recorded after the change, e.g. by a version without this check).
-        points = self.db.list_equity(limit=1)
-        last = points[-1]["equity"] if points else None
-        if last and abs(account.equity - last) / last >= CURVE_RESTART_FRACTION:
-            self.db.start_equity_history(now)
-            self._last_equity_at = None
+        self._restart_curve_after_jump(account.equity, trading_day_start(day.day), now, now)
         log.warning(
             "no trading today but equity moved %+.2f from the day's start: treated as a "
             "balance change",
@@ -666,6 +662,44 @@ class Engine:
             f"Today started at ${old:,.2f} and there were no trades, so the "
             f"{'+' if gap > 0 else '-'}${abs(gap):,.2f} difference is a deposit, withdrawal "
             f"or reset. Today's P&L and limits now start from ${account.equity:,.2f}.",
+        )
+
+    def _restart_curve_after_jump(
+        self, equity: float, since: datetime, before: datetime, now: datetime
+    ) -> None:
+        """Start the equity curve right after the newest jump of CURVE_RESTART_FRACTION or
+        more between two consecutive points from `since` up to (`before`, `equity`), so a
+        balance change that reached the curve before it was recognised does not show as a
+        cliff. Gradual moves, however large in total, are never hidden (the risk limits keep
+        trading far from a 50% move between two points), nor are points from `before` on."""
+        series = [
+            (_aware(datetime.fromisoformat(p["ts"])), float(p["equity"]))
+            for p in self.db.list_equity(since=since)
+        ]
+        series = [(ts, value) for ts, value in series if ts < before] + [(before, equity)]
+        cut: datetime | None = None
+        for (_, old), (ts, new) in itertools.pairwise(series):
+            if old > 0 and abs(new - old) / old >= CURVE_RESTART_FRACTION:
+                cut = ts
+        if cut is None:
+            return
+        self.db.start_equity_history(cut)
+        if cut >= before:
+            self._last_equity_at = None  # the next tick records the first point
+
+    def _backfill_curve_after_cash_flow(self) -> None:
+        """Journals from before the check above: a paper reset recognised only later (the
+        untraded-day rebase) left a cliff on the curve. Start the curve after it. Idempotent."""
+        flows = [a for a in self.db.list_audit(limit=1000) if a["action"] == "cash_flow"]
+        if not flows:
+            return
+        latest = flows[0]  # newest first
+        equity = latest["detail"].get("equity")
+        if isinstance(equity, bool) or not isinstance(equity, int | float) or not equity > 0:
+            return
+        at = _aware(datetime.fromisoformat(latest["ts"]))
+        self._restart_curve_after_jump(
+            float(equity), trading_day_start(trading_day(at)), at, self._now()
         )
 
     def _halt_eval_day(self, day: DayStats) -> DayStats:
@@ -2345,6 +2379,7 @@ class Engine:
             candidates=actionable,
             day=day.model_copy(),
             loss_baseline=self._halt_eval_day(day).start_equity,
+            commission_plan=self.config.commission_plan,
             limits=self.risk.effective_limits(),
             recent_trades=self.db.list_trades(limit=10),
             market=market,

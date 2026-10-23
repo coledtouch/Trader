@@ -838,10 +838,16 @@ Contracts changed by the confirmed review findings (each has a regression test).
   stopped, or before this check existed) is caught too: with no trades, wins, losses,
   realized P&L or fills since the trading day began, and the account flat for 10 minutes,
   `start_equity` (and any resume baseline) is set to the current equity (audit `cash_flow`
-  with `source: "untraded day"`); the curve restarts only if its last point shows the jump.
-  A halt stays until the owner resumes.
+  with `source: "untraded day"`); the curve restarts after the newest jump of 50%+ between
+  two consecutive points that day (gradual moves are never hidden), also backfilled at
+  startup from the newest `cash_flow` audit. A halt stays until the owner resumes.
 - **Loss limit after a resume**: `DecisionContext.loss_baseline` carries the resume baseline
   so the prompt's "left before the halt" matches the engine's halt check instead of showing
   $0 for the rest of the day.
+- **Fees in the prompt**: each candidate line carries the round-trip fee estimate (same fee
+  model and `DecisionContext.commission_plan` as the risk check) at the largest size the
+  notional, position and risk limits allow, as a % of the reward at target with the
+  `max_fee_to_reward_pct` limit. The system prompt no longer states a $1 minimum (that is
+  the Fixed plan; Tiered is about $0.38 per small order).
 - **IBKR password**: letters and digits only (a `$` was cut off on the way to the
   gateway); `.env.example` and DEPLOY show a length check that prints no secret.

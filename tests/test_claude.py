@@ -835,3 +835,16 @@ async def test_real_sdk_one_hour_cache_usage_is_priced() -> None:
     batch = await sdk_maker(body, {}).decide(base_ctx())
     assert batch.input_tokens == 2000 + 2500
     assert batch.cost_usd == pytest.approx((2000 * 4 + 900 * 20 + 2500 * 8) / 1e6)
+
+
+def test_candidates_show_fee_estimates_for_the_pricing_plan():
+    """The fee note uses the owner's IBKR plan and the largest size the limits allow (the
+    $250 order cap here), so the models weigh real fees instead of a guessed $1 minimum."""
+    pfe = cand("PFE", price=30.02, stop=29.90, target=30.16)
+    ctx = make_ctx(candidates=[pfe], equity=600.0, day=DayStats(day="2026-10-23", start_equity=600))
+    text = render_context(ctx)
+    assert "at most 8 sh (~$240.16): round-trip fees ~$0.76 = 68% of the $1.12 reward" in text
+    assert "(limit 25%)" in text
+    fixed = render_context(ctx.model_copy(update={"commission_plan": "fixed"}))
+    assert "round-trip fees ~$2.0" in fixed
+    assert "at least $1 per order" not in SYSTEM_PROMPT
