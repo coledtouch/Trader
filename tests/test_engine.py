@@ -43,6 +43,7 @@ from trader.models import (
 )
 from trader.notify import Notifier
 from trader.strategy.decide import RuleBasedDecisionMaker
+from trader.watchdog import HEARTBEAT_KEY
 
 NOW = datetime(2026, 10, 21, 15, 0, tzinfo=UTC)  # Wednesday 11:00 New York (EDT)
 F = Instrument(symbol="F")
@@ -2141,6 +2142,63 @@ async def test_start_stop_persist_running_flag(db, config) -> None:
     await h.engine.shutdown()
     assert db.get_flag("engine_running")  # a restart resumes the previous state
     assert h.engine._monitor_task is None and not h.broker.connected
+
+
+async def test_monitor_tick_writes_a_heartbeat_after_checking_exits(db, config) -> None:
+    h = await harness(db, config)
+    assert db.get_kv(HEARTBEAT_KEY) is None
+    await h.engine.monitor_tick()
+    assert db.get_kv(HEARTBEAT_KEY) == h.clock().isoformat()
+
+
+async def test_a_failed_exit_check_does_not_refresh_the_heartbeat(db, config) -> None:
+    h = await harness(db, config)
+    await h.engine.monitor_tick()
+    first = db.get_kv(HEARTBEAT_KEY)
+    h.clock.advance(seconds=30)
+
+    async def boom(*_args: object, **_kwargs: object) -> None:
+        raise BrokerError("exits down")
+
+    h.engine._manage_positions = boom  # type: ignore[method-assign]
+    await h.engine.monitor_tick()  # the monitor records the failure and continues
+    assert db.get_kv(HEARTBEAT_KEY) == first
+
+
+async def test_watchdog_sell_from_another_client_is_in_the_trade_history(db, config) -> None:
+    """The watchdog sells with its own IB client (id 18). That order is not in this
+    process's journal. IBKR's execution list is for the whole account, so the fill
+    comes back with the other client's perm id and the round trip is still recorded.
+    """
+    h = await harness(db, config)
+    await enter_f(h)
+    [buy_fill] = [f for f in h.broker.fills if f.side == Side.BUY]
+    qty = buy_fill.qty
+    sell_price = 9.7
+    h.clock.advance(seconds=30)
+    # Client 18 already sold. This process only sees the execution and a flat position.
+    h.broker.cash += qty * sell_price
+    h.broker.pos.clear()
+    h.broker.fills.append(
+        Fill(
+            exec_id="wd-client-18",
+            broker_order_id="perm:90018",
+            instrument=buy_fill.instrument,
+            side=Side.SELL,
+            qty=qty,
+            price=sell_price,
+            commission=h.broker.fee,
+            ts=h.clock(),
+        )
+    )
+    await h.engine.monitor_tick()
+    [trade] = db.list_trades()
+    expected = (sell_price - buy_fill.price) * qty - buy_fill.commission - h.broker.fee
+    assert trade.qty == pytest.approx(qty)
+    assert trade.exit_price == pytest.approx(sell_price)
+    assert trade.pnl == pytest.approx(round(expected, 4), abs=0.001)
+    assert db.get_order_by_broker_id("perm:90018") is None
+    assert any(f.exec_id == "wd-client-18" and f.side == Side.SELL for f in db.list_fills())
 
 
 async def test_start_monitor_protects_without_deciding(db, config) -> None:

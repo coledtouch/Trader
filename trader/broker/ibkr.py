@@ -956,8 +956,8 @@ class IBKRBroker(Broker):
             raise _Reject("entry rejected: take_profit must be above stop_loss")
 
     def _base_kwargs(self, acct: str, req: OrderRequest) -> dict[str, object]:
-        # One tag per order (the journal id when the engine stamped it). The same tag on
-        # every order made them impossible to tell apart after a restart.
+        # One tag per order (the journal id when the engine stamped it, or the watchdog's
+        # own tag). The same tag on every order made them impossible to tell apart.
         return {"account": acct, "orderRef": order_trace_id(existing=req.trace_id)}
 
     def _stock_orders(self, req: OrderRequest, info: _ContractInfo, acct: str) -> list[Order]:

@@ -129,6 +129,10 @@ Two posts on Reddit's r/ai_trading shaped the design.
 - Phone alerts through [ntfy](https://ntfy.sh) (optional): buys, closed trades with P&L,
   disconnects, halts, orders waiting for approval. `python -m trader notify-test` sends a
   test alert.
+- Crypto stop watchdog: IBKR cannot hold a crypto stop, so a separate container (started
+  with the IB Gateway profile, not reachable through the tunnel) sells crypto the bot
+  opened if the app's heartbeat goes stale, and also when the kill switch is on. It never
+  buys. It cannot sell if the gateway itself is down.
 - Security: Cloudflare Access + the app's own password and 2FA code, step-up 2FA for
   risky actions, audit log of every owner action. See [docs/SECURITY.md](docs/SECURITY.md).
 
@@ -155,6 +159,16 @@ turn it on in Settings. Climb one step at a time:
 | 4. **Armed live** | Live orders, small limits, autopilot off at first (you approve each order) | Real | Only increase limits after weeks of results that match paper |
 
 Paper fills are kinder than real fills, so expect live results to be worse than paper.
+With the IB Gateway profile on, the crypto watchdog container is a second process on the
+broker network. It sells only crypto the bot opened, and only when the app has stopped
+heartbeating, the kill switch is on, or a stop is hit while the app is unhealthy. Paper
+mode is allowed to sell. A live account sells only while `TRADER_ALLOW_LIVE=true`; with
+that switch off, the watchdog alerts and does not sell, so a live account in that
+configuration has no watchdog backup. Start with `TRADER_WATCHDOG_ORDERS=off` for a few
+days (alerts only) before letting it send. Stopping the app container for longer than
+the flatten timeout (180 seconds at the default monitor interval) sells all crypto the
+bot opened. A normal redeploy that is back within 45 seconds does not. See `.env.example`.
+
 You can disarm, stop or kill at any time from the app. Know the difference: **Stop** ends new
 decisions while the bot keeps protecting open positions; **Disarm** blocks new real-money
 entries while the bot keeps closing the positions it opened (stops, targets, time stops,

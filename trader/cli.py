@@ -1,7 +1,7 @@
 """Command line interface: `python -m trader <command>`.
 
 Commands: serve, setup, reset-password, reset-2fa, logout-all, disarm, status, notify-test,
-backtest.
+watchdog, backtest.
 reset-password, reset-2fa, logout-all and disarm also clear the live-trading arm (the
 compromise response): real-money orders then need a fresh Arm with a 2FA code.
 
@@ -378,6 +378,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         ("trust proxy headers", _yes(config.trust_proxy_headers)),
         ("Cloudflare Access", "enabled" if config.cf_access_enabled else "disabled"),
         ("live trading allowed", _yes(config.allow_live)),
+        (
+            "crypto watchdog",
+            "disabled"
+            if not config.watchdog_enabled
+            else (
+                f"enabled, client id {config.watchdog_client_id}, "
+                f"stale {config.watchdog_stale_seconds:g}s, "
+                f"flatten {config.watchdog_flatten_seconds:g}s, orders {config.watchdog_orders}"
+            ),
+        ),
         ("Anthropic API key", "set" if api_key and api_key.get_secret_value() else "not set"),
         ("xAI API key", "set" if xai_key and xai_key.get_secret_value() else "not set"),
         ("Grok model", config.xai_model),
@@ -397,6 +407,8 @@ def cmd_status(args: argparse.Namespace) -> int:
                 except crypto.SecretKeyError:
                     decrypts = "no (wrong or missing key)"
             settings = db.get_settings()
+            from trader.watchdog import HEARTBEAT_KEY
+
             rows += [
                 ("owner credentials", "configured" if owner else "not configured (run setup)"),
                 ("2FA secret decrypts", decrypts),
@@ -405,6 +417,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 ("autopilot", _yes(settings.autopilot)),
                 ("LLM enabled", _yes(settings.llm_enabled)),
                 ("decision mode", settings.decision_mode),
+                ("engine heartbeat", db.get_kv(HEARTBEAT_KEY) or "none"),
             ]
         finally:
             db.close()
@@ -440,6 +453,43 @@ def cmd_notify_test(args: argparse.Namespace) -> int:
         )
     print("Test alert sent. It should show on your phone within a few seconds.")
     return 0
+
+
+def cmd_watchdog(args: argparse.Namespace) -> int:
+    """Watch crypto stops from a separate process. Never buys. Does not return until stopped."""
+    from trader.watchdog import HEARTBEAT_KEY, idle_forever, run_watchdog
+
+    config = _config(args)
+    configure_logging(config.log_level)
+    if not config.watchdog_enabled:
+        log_idle("crypto watchdog is disabled (TRADER_WATCHDOG_ENABLED=false); not connecting")
+        asyncio.run(idle_forever())
+        return 0
+    if config.broker != "ibkr":
+        log_idle(
+            "crypto watchdog is idle: TRADER_BROKER is not ibkr, so there is no gateway "
+            "connection to take over (crypto stops in the simulator live in the app process)"
+        )
+        asyncio.run(idle_forever())
+        return 0
+    from trader.broker.ibkr import IBKRBroker
+
+    db = Database(config.db_path)
+    broker = IBKRBroker(config.model_copy(update={"ib_client_id": config.watchdog_client_id}))
+    logging.getLogger(__name__).info(
+        "crypto watchdog starting (client id %s, heartbeat key %s)",
+        config.watchdog_client_id,
+        HEARTBEAT_KEY,
+    )
+    try:
+        asyncio.run(run_watchdog(config, db, broker, Notifier(config)))
+    finally:
+        db.close()
+    return 0
+
+
+def log_idle(message: str) -> None:
+    logging.getLogger("trader.watchdog").warning("%s", message)
 
 
 # ---------------------------------------------------------------------- parser
@@ -496,6 +546,11 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "notify-test", parents=[common], help="send a test alert to your phone (ntfy)"
     ).set_defaults(func=cmd_notify_test)
+    sub.add_parser(
+        "watchdog",
+        parents=[common],
+        help="crypto stop watchdog (separate process; sells only, never buys)",
+    ).set_defaults(func=cmd_watchdog)
     sub.add_parser(
         "backtest", add_help=False, help="run the backtester (python -m trader backtest --help)"
     )

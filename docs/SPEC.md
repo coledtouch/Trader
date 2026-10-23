@@ -875,7 +875,8 @@ Contracts changed by the confirmed review findings (each has a regression test).
 - **IBKR `orderRef`** is `OrderRequest.trace_id` (`ai-trader-<journal id>` when the id is
   known, otherwise a unique `ai-trader-<random>`). The tag is stored on the order and
   copied back from a working order after restart so `_sync_orders` can reattach the
-  broker id.
+  broker id. Tags starting with `ai-trader-wd-` belong to the crypto watchdog and are
+  not adopted as this process's orders.
 - **Broker errors** returned by the web API are generic (`"<action> failed"`). The
   exception text is logged and audited, not sent to the browser.
 - **Client IP** for rate limits is `CF-Connecting-IP` only when `trust_proxy_headers` is
@@ -883,3 +884,47 @@ Contracts changed by the confirmed review findings (each has a regression test).
 - **Live start**: `TRADER_ALLOW_LIVE=true` with either `TRADER_CF_ACCESS_*` value empty
   is a configuration error (the process refuses to start). Paper and sim
   (`TRADER_ALLOW_LIVE=false`) may leave both empty.
+
+### 7.8 Crypto stop watchdog
+
+IBKR crypto has no native stop (`supports_native_stops` is false). `Engine.monitor_tick`
+writes kv `engine_heartbeat` (UTC ISO timestamp) only after the exits step succeeds. A
+failed broker read leaves the previous stamp in place.
+
+`python -m trader watchdog` (the `crypto-watchdog` Compose service, profile `ibkr`, image
+user `trader`, network `broker` only, no published ports) polls that stamp with its own
+IB client id (`TRADER_WATCHDOG_CLIENT_ID`, required to differ from `TRADER_IB_CLIENT_ID`):
+
+- Heartbeat younger than the effective stale timeout: do nothing. The app is enforcing
+  stops. The effective stale timeout is `max(TRADER_WATCHDOG_STALE_SECONDS, 3 ×
+  monitor_seconds)` read from saved settings each tick (default monitor 15s keeps the
+  45s stale timeout). A longer dashboard monitor interval would otherwise look like a
+  dead app. The watchdog logs a warning when it raises the configured values.
+- Older than that, and a managed crypto position's bid is at or below its `positions_meta`
+  stop on two polls: market-sell the uncovered quantity.
+- Older than the effective flatten timeout (`max(TRADER_WATCHDOG_FLATTEN_SECONDS,
+  effective stale + 60s)`; the configured value must still be >= the configured stale
+  timeout): market-sell every crypto position the bot opened, even above the stop.
+- A stale heartbeat with nothing to sell still alerts once per outage
+  (`Crypto watchdog: app heartbeat stale`), not on every poll.
+- Kill switch persisted on today's daily stats (or the previous day, if today has no row):
+  flatten those positions even when the heartbeat is fresh.
+- No heartbeat yet counts from when the watchdog process started, so a deploy does not
+  immediately flatten.
+
+Only `positions_meta` rows are managed (the bot opened them). Stocks and the owner's own
+crypto are left alone. Orders are SELL exits whose `trace_id` (IBKR `orderRef`) is
+`ai-trader-wd-<symbol>-<kind>-<id>`.
+A working sell, or a send newer than `TRADER_WATCHDOG_RETRY_SECONDS`, suppresses a duplicate.
+`TRADER_WATCHDOG_ORDERS=off` and simulator mode alert only. Paper may sell with the live
+gate closed; live sells only when `TRADER_ALLOW_LIVE=true` (shadow mode included, because
+the app still exits then). A live account with `TRADER_ALLOW_LIVE=false` therefore gets
+no watchdog sells, only the alerts. A down gateway is logged and retried: there is no
+broker-side crypto stop to fall back on. The second client id is what survives an app
+crash.
+
+Those sells are not rows in this process's order journal. `IBKRBroker.fills_since` returns
+every execution on the account (another client's order id is stored as `perm:<permId>`),
+and `_sync_fills` / `replay_fills` match them to the bot's buys by instrument. The round
+trip, including P&L, is journaled when the app next syncs. The exit reason is inferred
+from the stop or target when this client has no order row for that perm id.
