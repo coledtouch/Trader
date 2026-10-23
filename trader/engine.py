@@ -93,6 +93,18 @@ from trader.timeutil import (
 log = logging.getLogger(__name__)
 
 KILL_REASON = "kill switch"
+# The crypto watchdog's broker tags. They share the ai-trader- prefix with this app's
+# order ids, but they are not rows this process should adopt after a restart.
+WATCHDOG_TRACE_PREFIX = "ai-trader-wd-"
+
+
+def _app_order_trace(trace: str | None) -> str | None:
+    """An order tag this process may reconcile. Watchdog tags are skipped."""
+    if not trace or trace.startswith(WATCHDOG_TRACE_PREFIX):
+        return None
+    return trace
+
+
 APPROVAL_TTL = timedelta(minutes=10)
 ENTRY_ORDER_TTL = timedelta(minutes=10)  # unfilled entry orders are cancelled after this
 EQUITY_POINT_EVERY = timedelta(minutes=5)
@@ -1893,15 +1905,22 @@ class Engine:
         traced: dict[str, OrderRecord] | None = None
 
         async def by_trace(trace: str | None) -> OrderRecord | None:
-            """Working broker order whose tag matches, fetched once per sync."""
+            """Working broker order whose tag matches, fetched once per sync.
+
+            Watchdog closes use ai-trader-wd-... and belong to the other process.
+            Adopting one of those onto an app order would point the journal at the
+            wrong broker id.
+            """
             nonlocal traced
+            trace = _app_order_trace(trace)
             if not trace:
                 return None
             if traced is None:
                 traced = {}
                 for live in await self.broker.open_orders():
-                    if live.request.trace_id and live.broker_order_id:
-                        traced.setdefault(live.request.trace_id, live)
+                    live_trace = _app_order_trace(live.request.trace_id)
+                    if live_trace and live.broker_order_id:
+                        traced.setdefault(live_trace, live)
             return traced.get(trace)
 
         for rec in self.db.list_orders(limit=200, statuses=OPEN_ORDER_STATUSES):

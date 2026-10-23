@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -21,6 +22,7 @@ from trader.models import (
     RiskLimits,
     Side,
     TradeAction,
+    migrate_legacy_profit_target,
 )
 from trader.risk import (
     HALT_DAILY_LOSS,
@@ -586,6 +588,55 @@ def test_profit_target_defaults_to_a_percent_of_start_equity() -> None:
     again = RiskLimits.model_validate_json(fresh.model_dump_json())
     assert again.daily_profit_target_pct == 1.5
     assert again.profit_target_usd(600) == pytest.approx(9.0)
+
+
+def _legacy_settings_json(*, usd: object, pct_key: bool = False, pct: object = None) -> str:
+    """A saved settings blob from before the percent field existed."""
+    blob = BotSettings().model_dump(mode="json")
+    del blob["risk"]["daily_profit_target_pct"]
+    blob["risk"]["daily_profit_target_usd"] = usd
+    if pct_key:
+        blob["risk"]["daily_profit_target_pct"] = pct
+    return json.dumps(blob)
+
+
+def test_untouched_100_dollar_target_migrates_once(db) -> None:
+    """Exactly $100 with no percent key was the old default, not a choice."""
+    db.set_kv("settings", _legacy_settings_json(usd=100))
+    loaded = db.get_settings()
+    assert loaded.risk.daily_profit_target_pct == 1.5
+    assert loaded.risk.daily_profit_target_usd is None
+    assert loaded.risk.profit_target_usd(600) == pytest.approx(9.0)
+    stored = db.get_kv("settings")
+    assert stored is not None
+    saved = json.loads(stored)["risk"]
+    assert saved["daily_profit_target_pct"] == 1.5
+    assert saved["daily_profit_target_usd"] is None
+    assert db.get_settings().risk.daily_profit_target_pct == 1.5
+    assert db.get_kv("settings") == stored  # one write, then stable
+
+    db.set_kv("settings", _legacy_settings_json(usd=100.0))
+    assert db.get_settings().risk.daily_profit_target_pct == 1.5
+
+
+def test_other_dollar_targets_and_explicit_100_are_not_migrated(db) -> None:
+    db.set_kv("settings", _legacy_settings_json(usd=80))
+    loaded = db.get_settings()
+    assert loaded.risk.daily_profit_target_pct is None
+    assert loaded.risk.daily_profit_target_usd == 80
+    assert loaded.risk.profit_target_usd(600) == 80
+    assert "daily_profit_target_pct" not in json.loads(db.get_kv("settings"))["risk"]
+
+    chosen = _legacy_settings_json(usd=100, pct_key=True, pct=None)
+    db.set_kv("settings", chosen)
+    kept = db.get_settings()
+    assert kept.risk.daily_profit_target_pct is None
+    assert kept.risk.daily_profit_target_usd == 100
+    assert db.get_kv("settings") == chosen
+
+    assert migrate_legacy_profit_target("not json") is None
+    assert migrate_legacy_profit_target(_legacy_settings_json(usd=True)) is None
+    assert migrate_legacy_profit_target(_legacy_settings_json(usd="100")) is None
 
 
 def test_no_target_halt_when_disabled() -> None:

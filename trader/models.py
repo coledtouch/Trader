@@ -6,6 +6,7 @@ docs/SPEC.md at the same time.
 
 from __future__ import annotations
 
+import json
 import re
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -266,10 +267,11 @@ class DecisionBatch(BaseModel):
     votes: dict[str, list[AIDecision]] = Field(default_factory=dict)
 
 
-# Old built-in dollar target. Saved settings that name a dollar amount and no percent
-# keep that amount; a fresh config uses the percent below (about 1.5% of the ~$600 start,
-# not ~16%).
+# Old built-in dollar target. Saved settings that name some other dollar amount and no
+# percent keep that amount. The untouched default of exactly $100 is migrated to the
+# percent below (about 1.5% of the ~$600 start, not ~16%).
 DEFAULT_DAILY_PROFIT_TARGET_PCT = 1.5
+LEGACY_DEFAULT_PROFIT_TARGET_USD = 100.0
 
 
 class RiskLimits(BaseModel):
@@ -325,6 +327,43 @@ class RiskLimits(BaseModel):
         if not start_equity or start_equity <= 0:
             return 0.0
         return start_equity * self.daily_profit_target_pct / 100.0
+
+
+def migrate_legacy_profit_target(raw: str) -> str | None:
+    """Rewrite a saved settings blob that still has the untouched $100 default.
+
+    Settings saved before the percent target have `daily_profit_target_usd` and no
+    percent key. Exactly 100 was the built-in default, not a choice, so it becomes
+    1.5% of start equity. Any other dollar amount is left alone, and a blob that
+    already has the percent key (including an explicit null) is left alone so a
+    later choice of $100 stays a dollar target. Returns the new JSON, or None when
+    nothing changes.
+    """
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    risk = data.get("risk")
+    if not isinstance(risk, dict) or "daily_profit_target_pct" in risk:
+        return None
+    usd = risk.get("daily_profit_target_usd")
+    if (
+        isinstance(usd, bool)
+        or not isinstance(usd, int | float)
+        or float(usd) != (LEGACY_DEFAULT_PROFIT_TARGET_USD)
+    ):
+        return None
+    updated = {
+        **data,
+        "risk": {
+            **risk,
+            "daily_profit_target_pct": DEFAULT_DAILY_PROFIT_TARGET_PCT,
+            "daily_profit_target_usd": None,
+        },
+    }
+    return BotSettings.model_validate(updated).model_dump_json()
 
 
 # Absolute ceilings enforced in code no matter what the settings say. They exist so

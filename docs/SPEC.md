@@ -866,8 +866,12 @@ Contracts changed by the confirmed review findings (each has a regression test).
 - **Autopilot** defaults to off (`BotSettings.autopilot`).
 - **`HARD_CAPS["max_order_notional_usd"] = 5000`**.
 - **Daily profit target** is `daily_profit_target_pct` (default 1.5% of start-of-day
-  equity). A saved config that has `daily_profit_target_usd` and no percent keeps that
-  dollar amount (`RiskLimits.profit_target_usd`).
+  equity). `Database.get_settings` rewrites a saved blob whose dollar target is the
+  untouched old default of exactly $100 and which has no percent key, to 1.5% (once).
+  Any other dollar amount, or a blob that already names the percent (even as null),
+  keeps that choice, and `RiskLimits.profit_target_usd` still uses the saved dollars
+  when the percent is empty. The settings form shows an empty percent or dollar field
+  so either can be edited.
 - **IBKR `orderRef`** is `OrderRequest.trace_id` (`ai-trader-<journal id>` when the id is
   known, otherwise a unique `ai-trader-<random>`). The tag is stored on the order and
   copied back from a working order after restart so `_sync_orders` can reattach the

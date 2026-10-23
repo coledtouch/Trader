@@ -1536,6 +1536,39 @@ async def test_restarted_order_is_reconciled_by_its_trace_id(db, config) -> None
     assert saved.status == OrderStatus.SUBMITTED
 
 
+async def test_watchdog_tag_is_not_adopted_as_an_app_order(db, config) -> None:
+    """ai-trader-wd-... belongs to the crypto watchdog, not this process."""
+    h = await harness(db, config)
+    h.decider.decisions = [buy(limit_price=9.99)]
+    await h.engine.run_cycle()
+    [rec] = h.orders(OrderStatus.SUBMITTED)
+    assert rec.id is not None
+    db.update_order(rec.id, broker_order_id="GONE")
+    tagged = rec.request.model_copy(update={"trace_id": "ai-trader-wd-BTC-stop-abc"})
+    db.update_order(rec.id, request=tagged)
+    revived = rec.model_copy(
+        update={
+            "request": tagged,
+            "broker_order_id": "WD-1",
+            "status": OrderStatus.SUBMITTED,
+        }
+    )
+
+    async def order_status(broker_order_id: str) -> OrderRecord | None:
+        return None
+
+    async def open_orders() -> list[OrderRecord]:
+        return [revived]
+
+    h.broker.order_status = order_status  # type: ignore[method-assign]
+    h.broker.open_orders = open_orders  # type: ignore[method-assign]
+    await h.engine._sync_orders(h.clock())
+    saved = db.get_order(rec.id)
+    assert saved is not None
+    assert saved.broker_order_id == "GONE"
+    assert saved.status == OrderStatus.SUBMITTED
+
+
 async def test_reject_and_unknown_order(db, config) -> None:
     h = await harness(db, config, autopilot=False)
     await h.engine.run_cycle()
