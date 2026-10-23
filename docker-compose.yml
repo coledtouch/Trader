@@ -71,6 +71,10 @@ services:
       TRADER_DATA_DIR: /data
       TRADER_IB_HOST: ib-gateway
     command: ["python", "-m", "trader", "watchdog"]
+    # The image's health check probes the web app on :8000, which this process does not
+    # run, so it would always report "unhealthy". There is no other health signal: off.
+    healthcheck:
+      disable: true
     # Start order only. The watchdog keeps running if the app container is down, and it
     # retries the gateway on its own if this dependency is already up.
     depends_on:
