@@ -1,7 +1,7 @@
 """Command line interface: `python -m trader <command>`.
 
 Commands: serve, setup, reset-password, reset-2fa, logout-all, disarm, status, notify-test,
-watchdog, backtest.
+paper-test, backup, watchdog, backtest, research.
 reset-password, reset-2fa, logout-all and disarm also clear the live-trading arm (the
 compromise response): real-money orders then need a fresh Arm with a 2FA code.
 
@@ -392,6 +392,16 @@ def cmd_status(args: argparse.Namespace) -> int:
         ("xAI API key", "set" if xai_key and xai_key.get_secret_value() else "not set"),
         ("Grok model", config.xai_model),
         ("ntfy notifications", "set" if config.ntfy_url else "not set"),
+        (
+            "dead-man's switch",
+            f"set, every {config.healthcheck_every_seconds:g}s"
+            if config.healthcheck_url and config.healthcheck_url.get_secret_value().strip()
+            else "not set",
+        ),
+        (
+            "nightly backups",
+            f"on, keeping {config.backup_keep}" if config.backup_enabled else "off",
+        ),
         (SECRET_KEY_VAR, key_state),
     ]
     if config.db_path.exists():
@@ -488,6 +498,45 @@ def cmd_watchdog(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_paper_test(args: argparse.Namespace) -> int:
+    """Check the order plumbing on the paper account with an order that cannot fill."""
+    from trader.papertest import paper_test_client_id, run_paper_test
+
+    config = _config(args)
+    configure_logging("WARNING")
+    if config.broker != "ibkr":
+        raise CLIError("paper-test needs TRADER_BROKER=ibkr (it talks to IB Gateway)")
+    if args.price is not None and not args.price > 0:
+        raise CLIError("--price must be a positive number")
+    from trader.broker.ibkr import IBKRBroker
+
+    client_id = paper_test_client_id(config)
+    broker = IBKRBroker(config.model_copy(update={"ib_client_id": client_id}))
+    print(f"Paper test on {args.symbol.upper()} (API client id {client_id}). Nothing can fill.")
+    checks = asyncio.run(run_paper_test(broker, symbol=args.symbol, ref_price=args.price))
+    for check in checks:
+        print(f"{'PASS' if check.ok else 'FAIL'}  {check.name}: {check.detail}")
+    if checks and all(check.ok for check in checks):
+        print("All checks passed: entries go out with their stop-loss and target at IBKR.")
+        return 0
+    return 1
+
+
+def cmd_backup(args: argparse.Namespace) -> int:
+    """Back up the database now (the app also does this once a day)."""
+    from trader.maintenance import backup_database, backup_dir
+    from trader.timeutil import trading_day
+
+    config = _config(args)
+    if not config.db_path.exists():
+        raise CLIError(f"{config.db_path} does not exist yet (run setup)")
+    path = backup_database(
+        config.db_path, backup_dir(config), trading_day(utcnow()), config.backup_keep
+    )
+    print(f"Backed up to {path} (keeping the newest {config.backup_keep}).")
+    return 0
+
+
 def log_idle(message: str) -> None:
     logging.getLogger("trader.watchdog").warning("%s", message)
 
@@ -546,6 +595,19 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "notify-test", parents=[common], help="send a test alert to your phone (ntfy)"
     ).set_defaults(func=cmd_notify_test)
+    paper_test = sub.add_parser(
+        "paper-test",
+        parents=[common],
+        help="check that IBKR accepts the bot's orders with stop-loss and target (paper only)",
+    )
+    paper_test.add_argument("--symbol", default="F", help="stock to use (default F)")
+    paper_test.add_argument(
+        "--price", type=float, default=None, help="reference price when no quote is available"
+    )
+    paper_test.set_defaults(func=cmd_paper_test)
+    sub.add_parser(
+        "backup", parents=[common], help="back up the database now (also done nightly)"
+    ).set_defaults(func=cmd_backup)
     sub.add_parser(
         "watchdog",
         parents=[common],

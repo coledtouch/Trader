@@ -459,9 +459,18 @@ def create_app(
                 started = True
             except Exception:
                 log.exception("could not start the trading engine; start it from the UI")
+        upkeep = None
+        if start_engine:
+            from trader.maintenance import start_background  # dead-man's switch, backups
+
+            upkeep = start_background(config, database)
         try:
             yield
         finally:
+            if upkeep is not None:
+                from trader.maintenance import stop_background
+
+                await stop_background(*upkeep)
             if engine is None or started:
                 try:
                     await the_engine.shutdown()

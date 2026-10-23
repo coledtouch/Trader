@@ -111,6 +111,16 @@ class AppConfig(BaseSettings):
     # Optional ntfy topic URL, e.g. "https://ntfy.sh/<long-random-topic>"
     ntfy_url: str | None = None
     ntfy_token: SecretStr | None = None
+    # Optional dead-man's switch: a ping URL (e.g. https://hc-ping.com/<uuid> from
+    # healthchecks.io) that the app calls every healthcheck_every_seconds while the
+    # engine's heartbeat is fresh. The service alerts when the pings stop. A secret.
+    healthcheck_url: SecretStr | None = None
+    healthcheck_every_seconds: float = Field(default=60, ge=30, le=3600)
+
+    # --- backups -----------------------------------------------------------------------
+    # Nightly copy of the database to <data dir>/backups, keeping the newest backup_keep.
+    backup_enabled: bool = True
+    backup_keep: int = Field(default=14, ge=1, le=365)
 
     # --- misc ------------------------------------------------------------------------
     market_timezone: str = "America/New_York"

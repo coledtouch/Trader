@@ -381,6 +381,8 @@ All of these start with `cd ~/Trader`.
 | Follow a log live (`Ctrl+C` to stop) | `docker compose logs -f trader` (or `ib-gateway`, `cloudflared`) |
 | Settings check (no secrets shown) | `docker compose exec trader python -m trader status` |
 | Send a test phone alert (ntfy) | `docker compose exec trader python -m trader notify-test` |
+| Check the bot's orders reach IBKR with their stop-loss (paper only, cannot fill) | `docker compose exec trader python -m trader paper-test` |
+| Back up the database now (also done every night) | `docker compose exec trader python -m trader backup` |
 | Restart only the app (gateway stays logged in) | `docker compose restart trader` (keeps the old `.env` values) |
 | Apply `.env` changes | `docker compose up -d` (`docker compose restart` does **not** reload `.env`) |
 | Disarm live trading from the server | `docker compose exec trader python -m trader disarm` |
@@ -474,31 +476,65 @@ backtest is only a mechanics check.
 
 ### Backups
 
-Everything the app knows (journal, settings, login) is in `data/trader.db`. Make a
-consistent copy while it runs:
+Everything the app knows (journal, settings, login) is in `data/trader.db`. The app copies
+it every night (New York date) to `data/backups/trader-YYYY-MM-DD.db` and keeps the newest
+14 (`TRADER_BACKUP_KEEP`). Each copy is checked with SQLite's integrity check and readable
+only by you. Make one right now with:
 
 ```bash
-cd ~/Trader
-docker compose exec trader python -c "import sqlite3; s = sqlite3.connect('/data/trader.db'); d = sqlite3.connect('/data/backup.db'); s.backup(d); d.close(); s.close()"
+cd ~/Trader && docker compose exec trader python -m trader backup
 ```
 
-Copy it to your laptop (**PowerShell on your laptop**):
+Those copies are on the droplet, so they do not survive losing it. Copy the newest to your
+laptop now and then (**PowerShell on your laptop**):
 
 ```powershell
-scp trader@DROPLET_IP:Trader/data/backup.db "$HOME\Documents\trader-backup-$(Get-Date -Format yyyy-MM-dd).db"
+scp "trader@DROPLET_IP:Trader/data/backups/trader-*.db" "$HOME\Documents\"
 ```
 
-Do this weekly, and keep the copy of `.env` in your password manager current (the backup
-is useless without `TRADER_SECRET_KEY`). To restore a backup on the droplet:
+For the whole server, DigitalOcean's own backups (Droplet > Backups, about 20% of the
+droplet price) restore everything, including `.env`.
+
+Keep the copy of `.env` in your password manager current: a backup is useless without
+`TRADER_SECRET_KEY`. To restore a backup on the droplet (use the file name of the day):
 
 ```bash
 cd ~/Trader
-docker compose stop trader
+docker compose stop trader crypto-watchdog
 cp data/trader.db data/trader.db.old
-cp data/backup.db data/trader.db
+cp data/backups/trader-2026-10-23.db data/trader.db
 rm -f data/trader.db-wal data/trader.db-shm
-docker compose start trader
+docker compose start trader crypto-watchdog
 ```
+
+### Dead-man's switch (alert when the bot goes silent)
+
+Phone alerts come from the app itself, so they stop if the droplet or the app dies. A free
+[healthchecks.io](https://healthchecks.io) check covers that:
+
+1. Sign up, then **Add Check**. Set **Period** 5 minutes and **Grace** 15 minutes (IB
+   Gateway restarts every night for a minute or two).
+2. **Integrations > ntfy**: enter your ntfy topic URL (the value of `TRADER_NTFY_URL`), so
+   the alert arrives in the same ntfy app.
+3. Copy the check's **ping URL** (`https://hc-ping.com/...`). It is a secret: anyone with
+   it can fake pings. On the droplet:
+
+   ```bash
+   cd ~/Trader && echo "TRADER_HEALTHCHECK_URL=https://hc-ping.com/YOUR-UUID" >> .env
+   docker compose up -d
+   ```
+
+Within a minute the check turns green. The app pings every 60 s while its engine
+heartbeat is fresh; when the droplet is down, the app has crashed or hung, or IBKR has been
+unreachable for longer than the grace time, the pings stop and healthchecks.io alerts you.
+
+### Checking the order plumbing (paper)
+
+`docker compose exec trader python -m trader paper-test` sends one entry the way the bot
+does (a limit buy 20% below the market with a GTC stop-loss and take-profit attached),
+checks that IBKR accepted all three, and cancels them. Nothing can fill, it works outside
+market hours, and it refuses a live account. If no price is available, add
+`--price 12.30` (a recent price of `F`), or pick another stock with `--symbol`.
 
 ### Weekly IBKR re-login
 

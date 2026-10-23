@@ -1160,6 +1160,32 @@ class IBKRBroker(Broker):
             message=message,
         )
 
+    def orders_tagged(self, trace_id: str) -> list[dict[str, object]]:
+        """Every order this client placed in this session whose orderRef is `trace_id`,
+        working or done, as plain fields (the paper test checks the bracket with it)."""
+        out: list[dict[str, object]] = []
+        for trade in self._ib.trades():
+            order = trade.order
+            if not self._is_own(order) or (getattr(order, "orderRef", "") or "") != trace_id:
+                continue
+            out.append(
+                {
+                    "broker_id": self._broker_id(trade),
+                    "order_id": order.orderId,
+                    "parent_id": order.parentId,
+                    "action": order.action,
+                    "type": order.orderType,
+                    "tif": order.tif,
+                    "qty": _to_float(order.totalQuantity),
+                    "limit": _price(order.lmtPrice),
+                    "stop": _price(order.auxPrice),
+                    "oca": order.ocaGroup or "",
+                    "status": trade.orderStatus.status,
+                    "done": trade.isDone(),
+                }
+            )
+        return out
+
     async def order_status(self, broker_order_id: str) -> OrderRecord | None:
         self._require_connected()
         trade = self._find_trade(broker_order_id)

@@ -1036,3 +1036,23 @@ from the stop or target when this client has no order row for that perm id.
   because the app's reconnect backoff (up to `MAX_BACKOFF` 120s) can lag the watchdog's
   10s polls and leave the heartbeat stale through no fault of the app. Selling at or
   below the stop and the kill switch are not delayed.
+
+### 7.11 Upkeep: paper order test, dead-man's switch, nightly backup (2026-10-23)
+
+- **`python -m trader paper-test [--symbol F] [--price P]`** (`trader/papertest.py`): its
+  own API client id (`max(ib_client_id, watchdog_client_id) + 1`), refuses unless the
+  connected account is PAPER. Sends a 1-share bracket through `IBKRBroker.place_order` with
+  entry/stop/target at 80/75/85% of the reference price and orderRef `paper-test-<hex>`
+  (never adopted by the engine, which adopts `ai-trader-` tags only). Checks with
+  `IBKRBroker.orders_tagged` that there is one BUY LMT DAY parent with one SELL STP GTC and
+  one SELL LMT GTC child in one OCA group, all working; that `open_orders()` lists the
+  entry; then cancels the parent and anything left. Prints PASS/FAIL per check; exit 1 on
+  any failure. Cleanup always runs.
+- **Dead-man's switch** (`trader/maintenance.py`, started in the web app lifespan): with
+  `TRADER_HEALTHCHECK_URL` set, GET it every `healthcheck_every_seconds` (default 60) while
+  kv `engine_heartbeat` is younger than max(3 x monitor_seconds, 60 s). Never raises; the
+  URL is never logged (httpx request logging stays at WARNING).
+- **Nightly backup**: hourly check; when `data/backups/trader-<NY date>.db` is missing and
+  the database exists, copy it with the SQLite backup API from a read-only connection in a
+  worker thread, `PRAGMA integrity_check` the copy, write mode 600 in a 700 directory, keep
+  the newest `backup_keep` (default 14). `python -m trader backup` does the same on demand.

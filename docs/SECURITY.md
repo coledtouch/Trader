@@ -70,6 +70,8 @@ Anthropic (Claude Console), xAI (console.x.ai) and your e-mail.
 | App 2FA secret | `data/trader.db` | Encrypted with `TRADER_SECRET_KEY`. |
 | Login sessions | `data/trader.db` | Only a SHA-256 hash of each session token is stored. |
 | ntfy topic | `.env` | Mode 600. Alerts contain trading events, not secrets. |
+| Dead-man's switch ping URL | `.env` (`TRADER_HEALTHCHECK_URL`) | Mode 600, never logged. Whoever has it can fake pings (hide an outage), not read anything. |
+| Database backups | `data/backups/` | Directory 700, files 600. Same contents as `data/trader.db` (journal, password hash, the 2FA secret encrypted with `TRADER_SECRET_KEY`). Keep laptop copies private too. |
 
 The mode-600 statements above describe the Linux droplet. On Windows, protect the
 project directory, `.env`, journal and backups with Windows ACLs, including inherited
