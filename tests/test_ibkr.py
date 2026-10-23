@@ -670,6 +670,27 @@ async def test_stock_entry_is_a_protected_bracket() -> None:
     assert broker.supports_native_stops(AAPL)
 
 
+async def test_each_submission_gets_its_own_order_ref() -> None:
+    """orderRef used to be the same string on every order, so a restart could not
+    tell them apart. The journal id is the tag when the engine has one."""
+    broker, fake = await connected_broker()
+    first = await broker.place_order(entry(trace_id="ai-trader-41"))
+    second = await broker.place_order(entry())
+    assert first.request.trace_id == "ai-trader-41"
+    assert second.request.trace_id and second.request.trace_id.startswith("ai-trader-")
+    assert second.request.trace_id != "ai-trader-41"
+    first_refs = {order.orderRef for _, order in fake.placed[:3]}
+    second_refs = {order.orderRef for _, order in fake.placed[3:]}
+    assert first_refs == {"ai-trader-41"}
+    assert second_refs == {second.request.trace_id}
+    assert "ai-trader" not in first_refs | second_refs
+
+    broker._requests.clear()  # the in-memory map does not survive a restart
+    opened = await broker.open_orders()
+    assert opened
+    assert {order.request.trace_id for order in opened} >= {"ai-trader-41", second.request.trace_id}
+
+
 async def test_stock_entry_without_target_transmits_with_the_stop() -> None:
     broker, fake = await connected_broker()
     rec = await broker.place_order(

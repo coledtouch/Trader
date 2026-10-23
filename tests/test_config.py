@@ -99,6 +99,37 @@ def test_half_configured_cloudflare_access_is_refused(
     assert not AppConfig(_env_file=None).cf_access_enabled  # neither set: allowed, off
 
 
+def test_live_trading_requires_cloudflare_access(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Live trading with the in-app Access check off must not start. Paper/sim may."""
+    for name in ("TRADER_CF_ACCESS_TEAM_DOMAIN", "TRADER_CF_ACCESS_AUD", "TRADER_ALLOW_LIVE"):
+        monkeypatch.delenv(name, raising=False)
+    with pytest.raises(ValidationError, match="Cloudflare Access is not configured"):
+        AppConfig(_env_file=None, allow_live=True)
+    paper = AppConfig(_env_file=None, allow_live=False)
+    assert not paper.cf_access_enabled
+    live = AppConfig(
+        _env_file=None,
+        allow_live=True,
+        cf_access_team_domain="team.cloudflareaccess.com",
+        cf_access_aud="abc",
+    )
+    assert live.allow_live and live.cf_access_enabled
+
+
+def test_cli_reports_live_trading_without_cloudflare_access(
+    tmp_path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from trader import cli
+
+    for name in ("TRADER_CF_ACCESS_TEAM_DOMAIN", "TRADER_CF_ACCESS_AUD", "TRADER_ALLOW_LIVE"):
+        monkeypatch.delenv(name, raising=False)
+    env = tmp_path / ".env"
+    env.write_text("TRADER_ALLOW_LIVE=true\n", encoding="utf-8")
+    assert cli.main(["status", "--env-file", str(env)]) == 1
+    err = capsys.readouterr().err
+    assert "invalid configuration" in err and "Cloudflare Access is not configured" in err
+
+
 def test_cli_reports_a_half_configured_access_check(
     tmp_path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

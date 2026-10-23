@@ -38,10 +38,13 @@ class AppConfig(BaseSettings):
     login_max_attempts_per_ip: int = 5  # per 15 minutes
     login_lockout_failures: int = 10  # global failures in 15 minutes -> lock all logins
     # True only behind a proxy you control (cloudflared): the client IP is then taken from
-    # CF-Connecting-IP, else the first X-Forwarded-For entry.
+    # CF-Connecting-IP only. A missing header falls back to the socket peer, never to
+    # X-Forwarded-For (a client can spoof that).
     trust_proxy_headers: bool = False
-    # Cloudflare Access (optional defense in depth). When BOTH are set, every request except
-    # /healthz must carry a valid Cf-Access-Jwt-Assertion for this team and application.
+    # Cloudflare Access. When BOTH are set, every request except /healthz must carry a valid
+    # Cf-Access-Jwt-Assertion for this team and application. Both are required when
+    # allow_live is true (the app refuses to start otherwise). Simulator and paper mode
+    # (allow_live false) may leave both empty.
     cf_access_team_domain: str = ""  # e.g. "yourteam.cloudflareaccess.com"
     cf_access_aud: str = ""  # the Access application's Audience (AUD) tag
 
@@ -106,6 +109,21 @@ class AppConfig(BaseSettings):
                 f"Cloudflare Access is half configured: {missing} is empty. Set both "
                 "TRADER_CF_ACCESS_TEAM_DOMAIN and TRADER_CF_ACCESS_AUD (check the spelling of "
                 "the variable names) or neither"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _live_trading_requires_cloudflare_access(self) -> AppConfig:
+        """Live trading with the in-app Access check off would expose the account if the
+        tunnel or a Cloudflare setting were wrong. Refuse to start. Paper and sim
+        (TRADER_ALLOW_LIVE false) stay usable with the values empty."""
+        team, aud = self.cf_access_team_domain.strip(), self.cf_access_aud.strip()
+        if self.allow_live and not (team and aud):
+            raise ValueError(
+                "live trading is allowed (TRADER_ALLOW_LIVE=true) but Cloudflare Access is "
+                "not configured. Set both TRADER_CF_ACCESS_TEAM_DOMAIN and "
+                "TRADER_CF_ACCESS_AUD before starting. Simulator and paper mode "
+                "(TRADER_ALLOW_LIVE=false) can leave both empty"
             )
         return self
 

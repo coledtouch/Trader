@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -21,6 +22,7 @@ from trader.models import (
     RiskLimits,
     Side,
     TradeAction,
+    migrate_legacy_profit_target,
 )
 from trader.risk import (
     HALT_DAILY_LOSS,
@@ -236,6 +238,24 @@ def test_loss_streak_halving_cannot_be_switched_off() -> None:
     assert RiskManager(never).effective_limits().loss_streak_halve_after == 10
     qty, notes = size(stats=day(loss_streak=10), limits=never)
     assert qty == 5 and any("halved" in n for n in notes)
+
+
+def test_max_order_notional_is_hard_capped() -> None:
+    """A single order cannot be raised past $5,000, whatever the settings say."""
+    huge = RiskLimits(
+        max_order_notional_usd=50_000, max_position_pct=100, max_risk_per_trade_pct=10
+    )
+    assert RiskManager(huge).effective_limits().max_order_notional_usd == 5_000
+    assert HARD_CAPS["max_order_notional_usd"] == 5_000
+    qty, notes = size(
+        entry_px=100.0,
+        stop=99.0,
+        acct=account(equity=100_000, cash=100_000),
+        stats=day(start_equity=100_000),
+        limits=huge,
+    )
+    assert qty == 50  # $5,000 cap / $100, not the $50,000 the settings asked for
+    assert "max order" in notes[-1]
 
 
 def test_sizing_hard_cap_on_risk_per_trade() -> None:
@@ -547,6 +567,76 @@ def test_soft_halt_at_target() -> None:
     reason = rm.halt_reason(account=account(equity=600), day=day())
     assert reason is not None and reason.startswith(HALT_TARGET) and is_soft_halt(reason)
     assert rm.halt_reason(account=account(equity=599), day=day()) is None
+
+
+def test_profit_target_defaults_to_a_percent_of_start_equity() -> None:
+    """1.5% of start equity, not a fixed $100 (~16% of a $600 account)."""
+    fresh = RiskLimits()
+    assert fresh.daily_profit_target_pct == 1.5
+    assert fresh.daily_profit_target_usd is None
+    assert fresh.profit_target_usd(600) == pytest.approx(9.0)
+    assert fresh.profit_target_usd(None) == 0.0
+    rm = RiskManager(fresh)
+    # 1.5% of the $500 start is $7.50.
+    reason = rm.halt_reason(account=account(equity=507.5), day=day())
+    assert reason is not None and reason.startswith(HALT_TARGET) and "1.5%" in reason
+    assert rm.halt_reason(account=account(equity=507.49), day=day()) is None
+    # A config saved with only a dollar target keeps that amount.
+    legacy = RiskLimits.model_validate({"daily_profit_target_usd": 80, "max_daily_loss_pct": 6})
+    assert legacy.daily_profit_target_pct is None
+    assert legacy.profit_target_usd(600) == 80
+    again = RiskLimits.model_validate_json(fresh.model_dump_json())
+    assert again.daily_profit_target_pct == 1.5
+    assert again.profit_target_usd(600) == pytest.approx(9.0)
+
+
+def _legacy_settings_json(*, usd: object, pct_key: bool = False, pct: object = None) -> str:
+    """A saved settings blob from before the percent field existed."""
+    blob = BotSettings().model_dump(mode="json")
+    del blob["risk"]["daily_profit_target_pct"]
+    blob["risk"]["daily_profit_target_usd"] = usd
+    if pct_key:
+        blob["risk"]["daily_profit_target_pct"] = pct
+    return json.dumps(blob)
+
+
+def test_untouched_100_dollar_target_migrates_once(db) -> None:
+    """Exactly $100 with no percent key was the old default, not a choice."""
+    db.set_kv("settings", _legacy_settings_json(usd=100))
+    loaded = db.get_settings()
+    assert loaded.risk.daily_profit_target_pct == 1.5
+    assert loaded.risk.daily_profit_target_usd is None
+    assert loaded.risk.profit_target_usd(600) == pytest.approx(9.0)
+    stored = db.get_kv("settings")
+    assert stored is not None
+    saved = json.loads(stored)["risk"]
+    assert saved["daily_profit_target_pct"] == 1.5
+    assert saved["daily_profit_target_usd"] is None
+    assert db.get_settings().risk.daily_profit_target_pct == 1.5
+    assert db.get_kv("settings") == stored  # one write, then stable
+
+    db.set_kv("settings", _legacy_settings_json(usd=100.0))
+    assert db.get_settings().risk.daily_profit_target_pct == 1.5
+
+
+def test_other_dollar_targets_and_explicit_100_are_not_migrated(db) -> None:
+    db.set_kv("settings", _legacy_settings_json(usd=80))
+    loaded = db.get_settings()
+    assert loaded.risk.daily_profit_target_pct is None
+    assert loaded.risk.daily_profit_target_usd == 80
+    assert loaded.risk.profit_target_usd(600) == 80
+    assert "daily_profit_target_pct" not in json.loads(db.get_kv("settings"))["risk"]
+
+    chosen = _legacy_settings_json(usd=100, pct_key=True, pct=None)
+    db.set_kv("settings", chosen)
+    kept = db.get_settings()
+    assert kept.risk.daily_profit_target_pct is None
+    assert kept.risk.daily_profit_target_usd == 100
+    assert db.get_kv("settings") == chosen
+
+    assert migrate_legacy_profit_target("not json") is None
+    assert migrate_legacy_profit_target(_legacy_settings_json(usd=True)) is None
+    assert migrate_legacy_profit_target(_legacy_settings_json(usd="100")) is None
 
 
 def test_no_target_halt_when_disabled() -> None:

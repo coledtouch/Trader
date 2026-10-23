@@ -521,7 +521,8 @@ class _Backtest:
         if equity <= self.day_start_equity * (1 - loss_pct / 100):
             return "daily loss limit"
         gain = equity - self.day_start_equity
-        if lim.stop_trading_at_target and gain >= lim.daily_profit_target_usd:
+        target = lim.profit_target_usd(self.day_start_equity)
+        if lim.stop_trading_at_target and target > 0 and gain >= target:
             return "daily target reached"  # soft: open positions keep their exits
         return None
 
@@ -736,7 +737,10 @@ def _parser() -> argparse.ArgumentParser:
         "--slippage-bps", type=_non_negative, default=5.0, help="per market fill (default 5)"
     )
     p.add_argument(
-        "--target", type=_non_negative, default=100.0, help="daily target USD (default 100)"
+        "--target",
+        type=_non_negative,
+        default=None,
+        help="fixed daily profit target in USD (default: the settings' percent of start equity)",
     )
     p.add_argument(
         "--max-notional", type=_positive, help="max order notional USD (default: settings)"
@@ -762,12 +766,17 @@ def main(argv: list[str] | None = None) -> int:
             if args.settings
             else BotSettings()
         )
-        risk_update: dict[str, float] = {"daily_profit_target_usd": args.target}
+        risk_update: dict[str, float | None] = {}
+        if args.target is not None:
+            # Explicit dollar target: the percent target would otherwise win.
+            risk_update["daily_profit_target_usd"] = args.target
+            risk_update["daily_profit_target_pct"] = None
         if args.max_notional:
             risk_update["max_order_notional_usd"] = args.max_notional
-        settings = settings.model_copy(
-            update={"risk": settings.risk.model_copy(update=risk_update)}
-        )
+        if risk_update:
+            settings = settings.model_copy(
+                update={"risk": settings.risk.model_copy(update=risk_update)}
+            )
         asset = AssetClass.CRYPTO if args.crypto else AssetClass.STOCK
         if args.csv:
             inst = Instrument(symbol=(args.symbol or args.csv.stem).upper(), asset_class=asset)
@@ -792,7 +801,7 @@ def main(argv: list[str] | None = None) -> int:
         risk_pct=args.risk_pct,
         threshold=settings.llm_min_candidate_score if args.threshold is None else args.threshold,
         slippage_bps=args.slippage_bps,
-        target_usd=args.target,
+        target_usd=100.0 if args.target is None else args.target,
         allow_fractional=args.fractional,
         commission_plan=args.plan,
     )

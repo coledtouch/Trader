@@ -258,9 +258,11 @@ def loosened_fields(old: BotSettings, new: BotSettings, live: bool) -> list[str]
                 changed = before != after
         else:
             cap = HARD_CAPS.get(name)
+            before_n = float(before) if isinstance(before, int | float) else 0.0
+            after_n = float(after) if isinstance(after, int | float) else 0.0
             if cap is not None:
-                before, after = min(before, cap), min(after, cap)
-            changed = after < before if name in LOWER_IS_LOOSER else after > before
+                before_n, after_n = min(before_n, cap), min(after_n, cap)
+            changed = after_n < before_n if name in LOWER_IS_LOOSER else after_n > before_n
         if changed:
             loosened.append(f"risk.{name}")
     if live and new.autopilot and not old.autopilot:
@@ -466,7 +468,9 @@ def create_app(
         except Exception as exc:
             log.exception("%s failed", action)
             audit(request, f"{action}_failed", {**(detail or {}), "error": str(exc)[:200]})
-            raise HTTPException(status_code=503, detail=f"{action} failed: {exc}"[:300]) from None
+            # The browser gets a generic message. Broker and runtime text stays in the log
+            # and the audit row, not in the HTTP body.
+            raise HTTPException(status_code=503, detail=f"{action} failed") from None
         audit(request, action, detail)
         return result
 

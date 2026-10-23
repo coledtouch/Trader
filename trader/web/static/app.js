@@ -1522,8 +1522,13 @@
       label: 'Minimum candidate score', min: 0, max: 1, step: 0.05,
       help: 'The AI is only asked when a setup scores at least this (0 to 1).',
     },
+    'risk.daily_profit_target_pct': {
+      label: 'Daily profit target', unit: '% of start equity', min: 0, optional: true,
+      help: 'New entries stop for the day (when that option is on) once the gain reaches this percent of start-of-day equity. Default 1.5%. Leave empty to use the fixed dollar amount instead. It never increases size.',
+    },
     'risk.daily_profit_target_usd': {
-      label: 'Daily profit target', unit: '$', min: 0, help: 'Shown as progress only. It never increases risk.',
+      label: 'Daily profit target (fixed dollars)', unit: '$', min: 0, optional: true,
+      help: 'Used only when the percent above is empty. Leave empty to use the percent.',
     },
     'risk.stop_trading_at_target': { label: 'Stop new entries at the target' },
     'risk.max_daily_loss_pct': {
@@ -1599,7 +1604,8 @@
 
     let control;
     const extra = [];
-    if (typeof value === 'number') {
+    const optionalNumber = (value === null || value === undefined) && meta.optional;
+    if (typeof value === 'number' || optionalNumber) {
       const cap = path.startsWith('risk.') ? caps[path.slice(5)] : undefined;
       const max = Math.min(isNum(meta.max) ? meta.max : Infinity, isNum(cap) ? cap : Infinity);
       const unitId = `${id}-unit`;
@@ -1607,14 +1613,15 @@
       if (meta.unit) described.unshift(unitId);
       if (isNum(cap)) described.push(capId);
       const input = el('input', {
-        id, type: 'number', required: true,
+        id, type: 'number', required: !meta.optional,
         inputmode: meta.int ? 'numeric' : 'decimal',
         step: meta.step ?? (meta.int ? 1 : 'any'),
         min: isNum(meta.min) ? meta.min : null,
         max: Number.isFinite(max) ? max : null,
-        value: String(value),
+        value: optionalNumber ? '' : String(value),
         'data-path': path, 'data-kind': meta.int ? 'int' : 'number',
         'data-positive': meta.positive ? 'true' : null,
+        'data-optional': meta.optional ? 'true' : null,
         'data-cap': isNum(cap) ? String(cap) : null,
         'aria-describedby': described.filter(Boolean).join(' '),
       });
@@ -1748,6 +1755,7 @@
   function numberError(input, value, raw) {
     const min = input.getAttribute('min');
     const max = input.getAttribute('max');
+    if (input.dataset.optional === 'true' && raw === '') return null;
     if (raw === '' || !Number.isFinite(value)) return 'Enter a number.';
     if (input.dataset.kind === 'int' && !Number.isInteger(value)) return 'Enter a whole number.';
     if (input.dataset.positive && value <= 0) return 'Must be greater than 0.';
@@ -1773,8 +1781,12 @@
         value = input.value.split(/[\s,;]+/).map((s) => s.trim().toUpperCase()).filter(Boolean);
       } else if (kind === 'int' || kind === 'number') {
         const raw = input.value.trim();
-        value = Number(raw);
-        error = numberError(input, value, raw);
+        if (input.dataset.optional === 'true' && raw === '') {
+          value = null;
+        } else {
+          value = Number(raw);
+          error = numberError(input, value, raw);
+        }
       } else if (kind === 'time') {
         value = input.value.slice(0, 5);
         if (!/^\d{2}:\d{2}$/.test(value)) error = 'Enter a time as HH:MM.';

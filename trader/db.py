@@ -29,6 +29,7 @@ from trader.models import (
     SignalRecord,
     TradeRecord,
     exec_revision,
+    migrate_legacy_profit_target,
     utcnow,
 )
 
@@ -243,6 +244,10 @@ class Database:
         raw = self.get_kv("settings")
         if raw is None:
             return BotSettings()
+        migrated = migrate_legacy_profit_target(raw)
+        if migrated is not None:
+            self.set_kv("settings", migrated)
+            raw = migrated
         return BotSettings.model_validate_json(raw)
 
     def save_settings(self, settings: BotSettings) -> None:

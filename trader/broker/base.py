@@ -20,6 +20,7 @@ from trader.models import (
     Position,
     Quote,
     Side,
+    order_trace_id,
 )
 
 
@@ -146,7 +147,12 @@ class Broker(ABC):
 
     # ------------------------------------------------------------------ convenience
     async def close_position(
-        self, instrument: Instrument, reason: str = "", *, restore_stop: float | None = None
+        self,
+        instrument: Instrument,
+        reason: str = "",
+        *,
+        restore_stop: float | None = None,
+        trace_id: str | None = None,
     ) -> OrderRecord | None:
         """Cancel working orders for the instrument, then market-sell the whole long position.
 
@@ -170,6 +176,7 @@ class Broker(ABC):
             order_type=OrderType.MARKET,
             is_exit=True,
             reason=reason or "close position",
+            trace_id=order_trace_id(existing=trace_id),
         )
         record = await self.place_order(req)
         if (

@@ -101,6 +101,9 @@ class FakeBroker(Broker):
         self.movers: list[str] = []
         self.placed: list[OrderRequest] = []
         self.quote_calls: list[str] = []
+        # When set, quote() signals quote_started and waits on quote_release (race tests).
+        self.quote_started: asyncio.Event | None = None
+        self.quote_release: asyncio.Event | None = None
         self.modify_calls: list[tuple[str, float]] = []
         self._ids = itertools.count(1)
         self._execs = itertools.count(1)
@@ -276,6 +279,10 @@ class FakeBroker(Broker):
         self._require()
         self._maybe_fail("quote")
         self.quote_calls.append(instrument.key)
+        if self.quote_started is not None:
+            self.quote_started.set()
+        if self.quote_release is not None:
+            await self.quote_release.wait()
         q = self.quotes.get(instrument.key)
         if q is None:
             raise BrokerError(f"no market data for {instrument.key}")
@@ -537,7 +544,13 @@ async def harness(
     now: datetime = NOW,
     **settings_kw,
 ) -> H:
-    base = {"stock_universe": ["F", "T"], "crypto_universe": ["BTC"], "trade_crypto": False}
+    # Autopilot is off in the product. These tests opt in so an entry is sent on its own.
+    base = {
+        "stock_universe": ["F", "T"],
+        "crypto_universe": ["BTC"],
+        "trade_crypto": False,
+        "autopilot": True,
+    }
     settings = BotSettings(
         risk=RiskLimits(**(risk or {})),
         exits=ExitRules(**(exits or {})),
@@ -564,6 +577,18 @@ async def harness(
         scanner=scanner,  # type: ignore[arg-type]
     )
     return H(engine, broker, clock, scanner, decider, notes, db)
+
+
+def live_config(tmp_path, **kw) -> AppConfig:
+    """allow_live requires Cloudflare Access or AppConfig refuses to build."""
+    return AppConfig(
+        _env_file=None,
+        data_dir=tmp_path,
+        allow_live=True,
+        cf_access_team_domain="team.cloudflareaccess.com",
+        cf_access_aud="test-aud",
+        **kw,
+    )
 
 
 async def enter_f(h: H) -> OrderRecord:
@@ -1266,7 +1291,7 @@ async def test_shadow_mode_blocks_orders_on_live(db, config) -> None:
 
 
 async def test_armed_live_sends_orders(db, tmp_path) -> None:
-    config = AppConfig(_env_file=None, data_dir=tmp_path, allow_live=True)
+    config = live_config(tmp_path)
     h = await harness(db, config, mode=Mode.LIVE)
     assert h.engine.shadow
     await h.engine.arm_live()
@@ -1279,7 +1304,7 @@ async def test_armed_live_sends_orders(db, tmp_path) -> None:
 
 async def disarmed_with_bot_position(db, tmp_path, **kw) -> H:
     """Live account, armed, the bot opens F, then the owner disarms (shadow mode)."""
-    config = AppConfig(_env_file=None, data_dir=tmp_path, allow_live=True)
+    config = live_config(tmp_path)
     h = await harness(db, config, mode=Mode.LIVE, **kw)
     await h.engine.arm_live()
     await enter_f(h)
@@ -1355,7 +1380,7 @@ async def test_disarmed_ai_close_and_approved_close_are_sent(db, tmp_path) -> No
 async def test_closing_the_server_gate_clears_the_arm(db, tmp_path) -> None:
     """TRADER_ALLOW_LIVE true -> false -> true across restarts (the documented lockdown):
     the arm does not survive, so the bot stays in shadow mode until a fresh Arm."""
-    on = AppConfig(_env_file=None, data_dir=tmp_path, allow_live=True)
+    on = live_config(tmp_path)
     off = AppConfig(_env_file=None, data_dir=tmp_path, allow_live=False)
     h = await harness(db, on, mode=Mode.LIVE)
     await h.engine.arm_live()
@@ -1383,7 +1408,7 @@ async def test_closing_the_server_gate_clears_the_arm(db, tmp_path) -> None:
 
 
 async def test_arm_live_refused_for_paper_account(db, tmp_path) -> None:
-    config = AppConfig(_env_file=None, data_dir=tmp_path, allow_live=True)
+    config = live_config(tmp_path)
     h = await harness(db, config, mode=Mode.PAPER)
     with pytest.raises(PermissionError):
         await h.engine.arm_live()
@@ -1444,6 +1469,104 @@ async def test_approval_rechecks_risk_with_fresh_data(db, config) -> None:
     assert not h.broker.placed
     sig = db.list_signals()[0]
     assert not sig.taken and sig.skip_reason.startswith("risk at approval")
+
+
+def test_autopilot_defaults_to_manual_approval() -> None:
+    assert BotSettings().autopilot is False
+
+
+async def test_approved_order_is_tagged_with_its_journal_id(db, config) -> None:
+    h = await harness(db, config, autopilot=False)
+    await h.engine.run_cycle()
+    rec = h.orders(OrderStatus.PENDING_APPROVAL)[0]
+    approved = await h.engine.approve_order(rec.id)
+    assert approved.request.trace_id == f"ai-trader-{rec.id}"
+    assert h.broker.placed[-1].trace_id == f"ai-trader-{rec.id}"
+
+
+async def test_reject_during_approval_price_fetch_does_not_send(db, config) -> None:
+    """Approve then Reject while quotes are loading must not send, and must not
+    overwrite the cancelled status."""
+    h = await harness(db, config, autopilot=False)
+    await h.engine.run_cycle()
+    rec = h.orders(OrderStatus.PENDING_APPROVAL)[0]
+    started = asyncio.Event()
+    release = asyncio.Event()
+    h.broker.quote_started = started
+    h.broker.quote_release = release
+
+    approve_task = asyncio.create_task(h.engine.approve_order(rec.id))
+    await asyncio.wait_for(started.wait(), timeout=2)
+    rejected = await h.engine.reject_order(rec.id)
+    assert rejected.status == OrderStatus.CANCELLED
+    assert rejected.message == "rejected by owner"
+    release.set()
+    with pytest.raises(ValueError, match="not pending"):
+        await approve_task
+    saved = db.get_order(rec.id)
+    assert saved is not None
+    assert saved.status == OrderStatus.CANCELLED
+    assert saved.message == "rejected by owner"
+    assert not h.broker.placed
+
+
+async def test_restarted_order_is_reconciled_by_its_trace_id(db, config) -> None:
+    h = await harness(db, config)
+    h.decider.decisions = [buy(limit_price=9.99)]  # ask is 10.01: the entry rests
+    await h.engine.run_cycle()
+    [rec] = h.orders(OrderStatus.SUBMITTED)
+    assert rec.request.trace_id and rec.id is not None
+    db.update_order(rec.id, broker_order_id="GONE")
+    revived = rec.model_copy(
+        update={"broker_order_id": "RESTARTED-1", "status": OrderStatus.SUBMITTED}
+    )
+
+    async def order_status(broker_order_id: str) -> OrderRecord | None:
+        return None
+
+    async def open_orders() -> list[OrderRecord]:
+        return [revived]
+
+    h.broker.order_status = order_status  # type: ignore[method-assign]
+    h.broker.open_orders = open_orders  # type: ignore[method-assign]
+    await h.engine._sync_orders(h.clock())
+    saved = db.get_order(rec.id)
+    assert saved is not None
+    assert saved.broker_order_id == "RESTARTED-1"
+    assert saved.status == OrderStatus.SUBMITTED
+
+
+async def test_watchdog_tag_is_not_adopted_as_an_app_order(db, config) -> None:
+    """ai-trader-wd-... belongs to the crypto watchdog, not this process."""
+    h = await harness(db, config)
+    h.decider.decisions = [buy(limit_price=9.99)]
+    await h.engine.run_cycle()
+    [rec] = h.orders(OrderStatus.SUBMITTED)
+    assert rec.id is not None
+    db.update_order(rec.id, broker_order_id="GONE")
+    tagged = rec.request.model_copy(update={"trace_id": "ai-trader-wd-BTC-stop-abc"})
+    db.update_order(rec.id, request=tagged)
+    revived = rec.model_copy(
+        update={
+            "request": tagged,
+            "broker_order_id": "WD-1",
+            "status": OrderStatus.SUBMITTED,
+        }
+    )
+
+    async def order_status(broker_order_id: str) -> OrderRecord | None:
+        return None
+
+    async def open_orders() -> list[OrderRecord]:
+        return [revived]
+
+    h.broker.order_status = order_status  # type: ignore[method-assign]
+    h.broker.open_orders = open_orders  # type: ignore[method-assign]
+    await h.engine._sync_orders(h.clock())
+    saved = db.get_order(rec.id)
+    assert saved is not None
+    assert saved.broker_order_id == "GONE"
+    assert saved.status == OrderStatus.SUBMITTED
 
 
 async def test_reject_and_unknown_order(db, config) -> None:
