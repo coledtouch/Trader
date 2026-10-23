@@ -241,7 +241,14 @@ Live market data (SETUP_IBKR steps 5-6) is optional at first.
    TWS_PASSWORD='YOUR-PAPER-PASSWORD'
    TRADING_MODE=paper
    ```
-   If your password contains a single quote (`'`), change the password at IBKR first.
+   **Use a password made of letters and numbers only.** A `$` or other symbol can be cut
+   off on its way to the gateway (`$` followed by letters is read as a variable name), and
+   IBKR then rejects the login. Change the paper password at IBKR first if needed (Client
+   Portal of your real account > Settings > Paper Trading Account). After step 2, check
+   that the whole password arrived; this prints only its length:
+   ```bash
+   docker compose exec ib-gateway sh -c 'printf %s "$TWS_PASSWORD" | wc -c'
+   ```
 2. Start the gateway and watch it log in (1-2 minutes; `Ctrl+C` stops watching, not the
    gateway):
    ```bash
@@ -458,6 +465,7 @@ ntfy, you get an alert when the broker connection has been down for over a minut
 | `env file .../.env not found` | `.env` was never created | Do [step 4](#4-create-the-settings-file-env) |
 | `trader` keeps restarting, log says `ib_market_data_type ... Input should be less than or equal to 4` (or similar) | `TRADER_IB_MARKET_DATA_TYPE` is not 1, 2, 3 or 4 | Set it to `3` (delayed, free) or `1` (live, needs a subscription), then `docker compose up -d` |
 | Dashboard says disconnected after switching to IBKR | Gateway still logging in, or a mismatch | Wait 2 minutes. Check `COMPOSE_PROFILES=ibkr`, `TRADER_BROKER=ibkr`, and that the port matches the mode: paper `4004`, live `4003` |
+| Gateway log stops after `detected dialog entitled: Gateway` (right after `Authenticating...`), then only `socat ... Connection refused` | IBKR rejected the login: usually the password, often cut short at a `$` or other symbol | Run the length check from [Part B](#part-b-paper-trading); if it is shorter than your password, change the password to letters and numbers only, update `TWS_PASSWORD` and `docker compose up -d --force-recreate ib-gateway`. Also test the same username and password on the IBKR website |
 | Gateway log repeats login attempts ("login loop") | Wrong username/password; paper username with `TRADING_MODE=live`; IB Key push not approved; IBKR's nightly maintenance (around midnight ET and weekends) | Log in to the Client Portal in a browser with the same username to rule out a locked account or password problem. Check phone notifications. If it persists, look at the gateway screen (below) |
 | No IB Key notification arrives | Android blocked notifications or put IBKR Mobile to sleep | Phone settings: notifications on, battery Unrestricted. Open IBKR Mobile, then `docker compose restart ib-gateway` |
 | Dashboard shows delayed data | No subscription, not shared with paper, or `TRADER_IB_MARKET_DATA_TYPE` not 1 | See SETUP_IBKR steps 5-6 and [Part B step 5](#part-b-paper-trading). Live accounts refuse stock entries on delayed data |
