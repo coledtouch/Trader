@@ -367,7 +367,12 @@ All of these start with `cd ~/Trader`.
 | Stop everything | `docker compose down` |
 
 `docker compose down` logs the gateway out. Stock positions keep their stop-loss orders at
-IBKR, but **crypto stops are managed by the bot and stop working** while it is down.
+IBKR. Crypto stops are not orders at IBKR. While the gateway profile is on, the
+`crypto-watchdog` container keeps its own connection and sells crypto the bot opened if
+the app stops writing a heartbeat (default: enforce the stop after 45s, sell them all
+after 180s) or the kill switch is on. It publishes no ports and is not on the tunnel
+network. It cannot sell if the gateway itself is down — there is still no broker-side
+crypto stop — and it never buys. Logs: `docker compose logs --tail 100 crypto-watchdog`.
 
 **Stop bot** in the app only stops new decisions. As long as the app runs it keeps watching
 open positions (crypto stops, the daily loss limit, closing stocks before the bell), and

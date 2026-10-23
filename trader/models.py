@@ -162,7 +162,8 @@ class OrderRequest(BaseModel):
     setup: str | None = None  # scanner setup name, if any
     # Broker order tag (IBKR orderRef). "ai-trader-<journal id>" when that id is known
     # before the send, otherwise a unique "ai-trader-<random>" stored with the order so
-    # it can be matched again after a restart. Empty until the engine or broker stamps it.
+    # it can be matched again after a restart. The crypto watchdog sets its own
+    # "ai-trader-wd-..." tag. Empty until the engine, broker, or watchdog stamps it.
     trace_id: str | None = None
 
 

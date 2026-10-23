@@ -43,6 +43,7 @@ from trader.models import (
 )
 from trader.notify import Notifier
 from trader.strategy.decide import RuleBasedDecisionMaker
+from trader.watchdog import HEARTBEAT_KEY
 
 NOW = datetime(2026, 10, 21, 15, 0, tzinfo=UTC)  # Wednesday 11:00 New York (EDT)
 F = Instrument(symbol="F")
@@ -2141,6 +2142,27 @@ async def test_start_stop_persist_running_flag(db, config) -> None:
     await h.engine.shutdown()
     assert db.get_flag("engine_running")  # a restart resumes the previous state
     assert h.engine._monitor_task is None and not h.broker.connected
+
+
+async def test_monitor_tick_writes_a_heartbeat_after_checking_exits(db, config) -> None:
+    h = await harness(db, config)
+    assert db.get_kv(HEARTBEAT_KEY) is None
+    await h.engine.monitor_tick()
+    assert db.get_kv(HEARTBEAT_KEY) == h.clock().isoformat()
+
+
+async def test_a_failed_exit_check_does_not_refresh_the_heartbeat(db, config) -> None:
+    h = await harness(db, config)
+    await h.engine.monitor_tick()
+    first = db.get_kv(HEARTBEAT_KEY)
+    h.clock.advance(seconds=30)
+
+    async def boom(*_args: object, **_kwargs: object) -> None:
+        raise BrokerError("exits down")
+
+    h.engine._manage_positions = boom  # type: ignore[method-assign]
+    await h.engine.monitor_tick()  # the monitor records the failure and continues
+    assert db.get_kv(HEARTBEAT_KEY) == first
 
 
 async def test_start_monitor_protects_without_deciding(db, config) -> None:

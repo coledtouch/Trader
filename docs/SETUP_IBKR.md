@@ -310,8 +310,11 @@ and on every decision in Activity; recheck this table after a week of paper trad
 - **Cash only.** No Borrow Margin never borrows. The bot sizes from the cash IBKR reports
   as available and never uses leverage.
 - **Crypto at IBKR** routes through ZEROHASH and accepts only limit and market orders, so
-  crypto stop-losses are watched by the bot, not held at IBKR. If the server is down, a
-  crypto position has no stop. Stock stops are real orders at IBKR and keep working.
+  crypto stop-losses are watched by the bot, not held at IBKR. Stock stops are real orders
+  at IBKR and keep working. The `crypto-watchdog` container (its own gateway client id)
+  sells crypto the bot opened if the app stops heartbeating or the kill switch is on. If
+  the gateway or IBKR is down, that watchdog cannot sell either: there is no crypto stop
+  resting at the broker.
 - **One trading session per username.** IBKR checks for an existing session whenever you
   log in to trade. The gateway is set to keep its session (`primary`), so logging in to
   IBKR Mobile or the Client Portal with the same username while the bot runs may be

@@ -89,6 +89,7 @@ from trader.timeutil import (
     trading_day,
     trading_day_start,
 )
+from trader.watchdog import write_heartbeat
 
 log = logging.getLogger(__name__)
 
@@ -1259,6 +1260,10 @@ class Engine:
                 self._set_error("monitor:halts", "account equity not available")
             # Also in shadow mode: these only exit or protect positions the engine opened.
             await self._step("exits", self._manage_positions(now, positions, quotes, metas))
+            # Only a pass that actually checked stops refreshes the heartbeat. A broker
+            # failure leaves it stale so the crypto watchdog can sell on its own connection.
+            if "monitor:exits" not in self._errors:
+                write_heartbeat(self.db, now)
             await self._step("flatten", self._flatten_before_close(now, positions, metas))
             await self._step("re-protect", self._reprotect(now, positions, open_orders, metas))
             await self._step("journal", self._sync_journal(now, positions, open_orders))

@@ -66,6 +66,26 @@ class AppConfig(BaseSettings):
     # trading in the UI with a fresh 2FA code.
     allow_live: bool = False
 
+    # --- crypto stop watchdog ---------------------------------------------------
+    # Separate process (see docker-compose crypto-watchdog). It does not open positions.
+    # IBKR has no native crypto stop, so this process sells via its own API client when
+    # the app's heartbeat goes stale or the kill switch is on.
+    watchdog_enabled: bool = True
+    # App heartbeat older than this (seconds): the app is unhealthy, and the watchdog
+    # sells a crypto position the bot opened once its bid is at or below that position's stop.
+    watchdog_stale_seconds: float = Field(default=45, gt=0, le=3600)
+    # Heartbeat older than this: sell every crypto position the bot opened, even above the stop.
+    watchdog_flatten_seconds: float = Field(default=180, gt=0, le=86400)
+    watchdog_poll_seconds: float = Field(default=10, ge=2, le=300)
+    # How long to wait before sending another close for the same symbol (a market sell
+    # that was rejected, or one that has not shown up in open orders yet).
+    watchdog_retry_seconds: float = Field(default=20, ge=0, le=600)
+    # Must differ from ib_client_id. The same id would kick the app off the gateway.
+    watchdog_client_id: int = Field(default=18, ge=1, le=999)
+    # auto: paper orders are allowed; live orders only when allow_live is true (exits only).
+    # off: watch-only, alert and never send.
+    watchdog_orders: Literal["auto", "off"] = "auto"
+
     # --- AI ----------------------------------------------------------------------
     anthropic_api_key: SecretStr | None = Field(
         default=None,
@@ -109,6 +129,17 @@ class AppConfig(BaseSettings):
                 f"Cloudflare Access is half configured: {missing} is empty. Set both "
                 "TRADER_CF_ACCESS_TEAM_DOMAIN and TRADER_CF_ACCESS_AUD (check the spelling of "
                 "the variable names) or neither"
+            )
+        if self.watchdog_flatten_seconds < self.watchdog_stale_seconds:
+            raise ValueError(
+                "TRADER_WATCHDOG_FLATTEN_SECONDS must be at least "
+                "TRADER_WATCHDOG_STALE_SECONDS (flattening is the later step)"
+            )
+        if self.watchdog_client_id == self.ib_client_id:
+            raise ValueError(
+                "TRADER_WATCHDOG_CLIENT_ID must differ from TRADER_IB_CLIENT_ID "
+                f"(both are {self.ib_client_id}). A shared client id would disconnect the app "
+                "from IB Gateway"
             )
         return self
 

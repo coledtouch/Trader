@@ -7,9 +7,10 @@
 # Network exposure: the only published port is 127.0.0.1:8000 (reachable from the server
 # itself, for SSH tunnels and health checks). Docker-published ports bypass ufw, so never
 # publish anything else. IB Gateway's API has no authentication, so it lives on its own
-# private network ("broker") that only the trader joins. cloudflared is on "edge" with the
-# trader only: whatever ingress rules the Cloudflare dashboard holds, the tunnel cannot
-# resolve or reach ib-gateway (API ports 4003/4004, VNC 5900).
+# private network ("broker") that only the trader and the crypto watchdog join. cloudflared
+# is on "edge" with the trader only: whatever ingress rules the Cloudflare dashboard holds,
+# the tunnel cannot resolve or reach ib-gateway (API ports 4003/4004, VNC 5900) or the
+# watchdog.
 
 x-logging: &logging
   driver: json-file
@@ -50,6 +51,42 @@ services:
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 30s
+    logging: *logging
+
+  crypto-watchdog:
+    # Started with the gateway (COMPOSE_PROFILES=ibkr). Same image and user as trader,
+    # own process so an app crash does not take the crypto stops with it. No published
+    # ports and no edge network: nothing routes to it through the tunnel.
+    profiles: ["ibkr"]
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    image: ai-trader:local
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      TRADER_DATA_DIR: /data
+      TRADER_IB_HOST: ib-gateway
+    command: ["python", "-m", "trader", "watchdog"]
+    # Start order only. The watchdog keeps running if the app container is down, and it
+    # retries the gateway on its own if this dependency is already up.
+    depends_on:
+      ib-gateway:
+        condition: service_started
+    networks: [broker]
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
     logging: *logging
 
   ib-gateway:
@@ -101,5 +138,6 @@ services:
 networks:
   # cloudflared <-> trader (the tunnel's only destination is http://trader:8000)
   edge: {}
-  # trader <-> ib-gateway. Not `internal: true`: the gateway must reach IBKR's servers.
+  # trader and crypto-watchdog <-> ib-gateway. Not `internal: true`: the gateway must
+  # reach IBKR's servers. The watchdog is not on edge, so the tunnel cannot reach it.
   broker: {}

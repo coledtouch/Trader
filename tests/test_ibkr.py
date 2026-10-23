@@ -894,6 +894,23 @@ async def test_crypto_orders_follow_ibkr_crypto_rules() -> None:
         "IOC",
         0.01,
     )
+    assert sell.orderRef.startswith("ai-trader-")
+
+    fake.placed.clear()
+    tagged = await broker.place_order(
+        OrderRequest(
+            instrument=BTC,
+            side=Side.SELL,
+            qty=0.01,
+            order_type=OrderType.MARKET,
+            is_exit=True,
+            trace_id="ai-trader-wd-BTC-stop-abc123",
+        )
+    )
+    assert tagged.status is OrderStatus.SUBMITTED
+    [(_, tagged_order)] = fake.placed
+    assert tagged_order.orderRef.startswith("ai-trader-")
+    assert tagged_order.orderRef == "ai-trader-wd-BTC-stop-abc123"
 
 
 async def test_crypto_entry_below_minimum_size_is_rejected() -> None:
