@@ -834,5 +834,14 @@ Contracts changed by the confirmed review findings (each has a regression test).
   baseline) instead of counting as P&L; audit `cash_flow`, notification "Balance change
   detected"; a change of 50%+ restarts the equity curve. Changes while a position is open or
   within 10 minutes of a fill still count (IBKR account values can lag a closed trade).
+  **Untraded days**: a change the tick comparison never saw (made while the app was
+  stopped, or before this check existed) is caught too: with no trades, wins, losses,
+  realized P&L or fills since the trading day began, and the account flat for 10 minutes,
+  `start_equity` (and any resume baseline) is set to the current equity (audit `cash_flow`
+  with `source: "untraded day"`); the curve restarts only if its last point shows the jump.
+  A halt stays until the owner resumes.
+- **Loss limit after a resume**: `DecisionContext.loss_baseline` carries the resume baseline
+  so the prompt's "left before the halt" matches the engine's halt check instead of showing
+  $0 for the rest of the day.
 - **IBKR password**: letters and digits only (a `$` was cut off on the way to the
   gateway); `.env.example` and DEPLOY show a length check that prints no secret.

@@ -165,17 +165,25 @@ def _today(ctx: DecisionContext) -> str:
     else:
         basis = acct.equity
         pnl = acct.realized_pnl_today + acct.unrealized_pnl
-    loss_limit = basis * limits.max_daily_loss_pct / 100
+    pct = limits.max_daily_loss_pct
+    resumed = ctx.loss_baseline if ctx.loss_baseline and ctx.loss_baseline != basis else None
+    if resumed is not None:
+        loss_limit = resumed * pct / 100
+        room = acct.equity - (resumed - loss_limit)
+        limit_of = f"{_num(pct)}% of {_usd(resumed)}, the equity when the owner resumed trading"
+    else:
+        loss_limit = basis * pct / 100
+        room = loss_limit + pnl
+        limit_of = f"{_num(pct)}% of start equity"
     target = limits.daily_profit_target_usd
     progress = f"{pnl / target:.0%} of target" if target > 0 else "no target set"
-    room = loss_limit + pnl
     return (
         f"## Today {day.day}\n"
         f"start equity {_usd(basis)} | P&L {_signed(pnl)} (realized {_signed(day.realized_pnl)}, "
         f"unrealized {_signed(acct.unrealized_pnl)})\n"
         f"profit target {_usd(target)} (informational, never a reason to add risk): {progress}\n"
-        f"daily loss limit -{_usd(loss_limit)} ({_num(limits.max_daily_loss_pct)}% of start "
-        f"equity, binding): {_usd(max(room, 0.0))} left before the halt\n"
+        f"daily loss limit -{_usd(loss_limit)} ({limit_of}, binding): "
+        f"{_usd(max(room, 0.0))} left before the halt\n"
         f"entries {day.trades}/{limits.max_trades_per_day}"
         f"{' (limit reached: no new BUYs)' if day.trades >= limits.max_trades_per_day else ''}"
         f" | wins {day.wins} losses "

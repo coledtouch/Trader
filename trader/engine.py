@@ -85,6 +85,7 @@ from trader.timeutil import (
     minutes_to_close,
     stock_market_open,
     trading_day,
+    trading_day_start,
 )
 
 log = logging.getLogger(__name__)
@@ -617,6 +618,56 @@ class Engine:
             f"treated as a {kind}. Today's P&L and limits leave it out.",
         )
 
+    def _untraded_day_gap(self, day: DayStats, account: AccountSnapshot, now: datetime) -> float:
+        """Equity minus today's start equity when today cannot have trading P&L (no fills or
+        trades since the day began, and the account flat for CASH_FLOW_QUIET), else 0.0.
+        Catches a balance change the snapshot comparison never saw: one made while the app
+        was stopped, or before an upgrade that added the comparison."""
+        start = day.start_equity
+        if start is None or not math.isfinite(start) or start <= 0:
+            return 0.0
+        if day.trades or day.wins or day.losses or abs(day.realized_pnl) > EPS:
+            return 0.0
+        gap = account.equity - start
+        if abs(gap) < CASH_FLOW_MIN_USD or now - self._busy_at < CASH_FLOW_QUIET:
+            return 0.0
+        if self.db.list_fills(since=trading_day_start(day.day), limit=1):
+            return 0.0
+        return round(gap, 2)
+
+    async def _rebase_untraded_day(
+        self, gap: float, account: AccountSnapshot, day: DayStats, now: datetime
+    ) -> None:
+        """Restart today's P&L and limits from the current equity (see _untraded_day_gap).
+        A halt stays: only the owner clears it."""
+        old = day.start_equity or 0.0
+        day.start_equity = account.equity
+        if self.db.get_kv(BASELINE_PREFIX + day.day):
+            self.db.set_kv(BASELINE_PREFIX + day.day, repr(account.equity))
+        # Restart the equity curve only when the jump is on it (it may already have been
+        # recorded after the change, e.g. by a version without this check).
+        points = self.db.list_equity(limit=1)
+        last = points[-1]["equity"] if points else None
+        if last and abs(account.equity - last) / last >= CURVE_RESTART_FRACTION:
+            self.db.start_equity_history(now)
+            self._last_equity_at = None
+        log.warning(
+            "no trading today but equity moved %+.2f from the day's start: treated as a "
+            "balance change",
+            gap,
+        )
+        self.db.audit(
+            "cash_flow",
+            {"amount": gap, "equity": round(account.equity, 2), "source": "untraded day"},
+            actor="engine",
+        )
+        await self._notify(
+            "Balance change detected",
+            f"Today started at ${old:,.2f} and there were no trades, so the "
+            f"{'+' if gap > 0 else '-'}${abs(gap):,.2f} difference is a deposit, withdrawal "
+            f"or reset. Today's P&L and limits now start from ${account.equity:,.2f}.",
+        )
+
     def _halt_eval_day(self, day: DayStats) -> DayStats:
         """After a resume, halts are measured from the equity at the resume."""
         raw = self.db.get_kv(BASELINE_PREFIX + day.day)
@@ -1093,6 +1144,11 @@ class Engine:
                         # The equity curve restarts too, with a first point right now.
                         self.db.start_equity_history(now)
                         self._last_equity_at = None
+                if not changed:
+                    gap = self._untraded_day_gap(day, account, now)
+                    if gap:
+                        await self._rebase_untraded_day(gap, account, day, now)
+                        changed = True
                 if day.start_equity is None:
                     day.start_equity, changed = account.equity, True
                 if day.end_equity != account.equity:
@@ -2288,6 +2344,7 @@ class Engine:
             positions=positions,
             candidates=actionable,
             day=day.model_copy(),
+            loss_baseline=self._halt_eval_day(day).start_equity,
             limits=self.risk.effective_limits(),
             recent_trades=self.db.list_trades(limit=10),
             market=market,

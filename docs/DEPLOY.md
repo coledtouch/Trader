@@ -348,6 +348,8 @@ loss limit leave it out, and the app sends a "Balance change detected" notice. M
 while the bot is flat (outside market hours is simplest). A change that arrives while a
 position is open, or within 10 minutes of a trade, counts as trading P&L, so a deposit then
 could stop the bot for the day at "daily target reached" (press **Resume** to continue).
+If the balance changed while the app was stopped, the bot catches it once it has been flat
+for 10 minutes, as long as nothing has traded that day.
 
 All of these start with `cd ~/Trader`.
 

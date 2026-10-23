@@ -925,6 +925,69 @@ async def test_paper_reset_while_flat_is_not_a_loss(db, config) -> None:
     assert curve and all(p["equity"] == pytest.approx(50.0) for p in curve)  # restarted
 
 
+def _start_day_on_old_balance(h: H, start: float) -> None:
+    """Today's start equity as recorded before a balance change the snapshot comparison
+    never saw (e.g. a paper reset made before an upgrade), plus a resume baseline."""
+    day = h.engine._today(h.clock())
+    day.start_equity = start
+    h.engine._save_day()
+    h.db.set_kv("halt_baseline:" + day.day, repr(h.engine._account.equity))
+
+
+async def test_missed_balance_change_on_an_untraded_day_is_rebased(db, config) -> None:
+    h = await harness(db, config)
+    await h.engine.monitor_tick()
+    _start_day_on_old_balance(h, 1_000_000.0)
+    before = db.list_equity()
+    assert h.engine.status().pnl_today < -999_000
+    h.clock.advance(minutes=5)
+    await h.engine.monitor_tick()
+    assert h.day().start_equity == 1_000_000.0  # not yet: the account must be quiet first
+    h.clock.advance(minutes=6)
+    await h.engine.monitor_tick()
+    day = h.day()
+    assert day.start_equity == pytest.approx(500.0) and not day.halted
+    assert float(db.get_kv("halt_baseline:" + day.day)) == pytest.approx(500.0)
+    assert h.engine.status().pnl_today == pytest.approx(0.0)
+    [flow] = [a for a in db.list_audit() if a["action"] == "cash_flow"]
+    assert flow["detail"]["amount"] == pytest.approx(-999_500.0)
+    assert flow["detail"]["source"] == "untraded day"
+    assert "Balance change detected" in h.notes.titles()
+    assert db.list_equity()[: len(before)] == before  # the curve had no jump: kept
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    assert len([a for a in db.list_audit() if a["action"] == "cash_flow"]) == 1
+
+
+async def test_missed_balance_change_restarts_a_curve_that_shows_the_jump(db, config) -> None:
+    h = await harness(db, config)
+    await h.engine.monitor_tick()
+    _start_day_on_old_balance(h, 1_000_000.0)
+    db.add_equity_point(1_000_000.0, ts=h.clock())
+    h.clock.advance(minutes=11)
+    await h.engine.monitor_tick()
+    curve = db.list_equity()
+    assert curve and all(p["equity"] == pytest.approx(500.0) for p in curve)
+
+
+async def test_a_real_loss_is_never_rebased_away(db, config) -> None:
+    """A day with trades keeps its start equity however long the account then sits flat."""
+    h = await harness(db, config, native=False)
+    await enter_f(h)
+    h.broker.set_price("F", 9.0)
+    for _ in range(2):  # the engine stop closes F at a loss
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    assert h.broker.pos == {}
+    start = h.day().start_equity
+    for _ in range(4):
+        h.clock.advance(minutes=15)
+        await h.engine.monitor_tick()
+    assert h.day().start_equity == pytest.approx(start)
+    assert h.engine.status().pnl_today < 0
+    assert not [a for a in db.list_audit() if a["action"] == "cash_flow"]
+
+
 async def test_balance_change_soon_after_a_trade_still_counts(db, config) -> None:
     """IBKR's account values can lag a closed trade: a change within the quiet window of a
     fill is trading P&L and must still count toward the loss limit."""

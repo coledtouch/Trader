@@ -457,6 +457,9 @@ class DecisionContext(BaseModel):
     positions: list[Position]
     candidates: list[Candidate]
     day: DayStats
+    # Equity the daily loss limit is measured from: the day's start equity, or the equity
+    # when the owner last resumed trading today. None = day.start_equity.
+    loss_baseline: float | None = None
     limits: RiskLimits
     recent_trades: list[TradeRecord] = Field(default_factory=list)
     # Per-instrument indicator snapshot (instrument key -> {"price": .., "rsi14": .., ...})

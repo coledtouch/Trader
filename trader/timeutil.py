@@ -87,6 +87,11 @@ def trading_day(now: datetime) -> str:
     return ny_time(now).date().isoformat()
 
 
+def trading_day_start(day: date | str) -> datetime:
+    """Midnight New York time at the start of `day` (the trading_day boundary), in UTC."""
+    return datetime.combine(_as_date(day), time(0), tzinfo=NY).astimezone(UTC)
+
+
 def _as_date(day: date | str) -> date:
     return date.fromisoformat(day) if isinstance(day, str) else day
 

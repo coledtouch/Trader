@@ -711,6 +711,20 @@ def test_render_context_includes_target_and_loss_limit():
     assert "2026-10-21 15:00 UTC (11:00 New York)" in text
 
 
+def test_render_context_measures_the_loss_limit_from_the_resume():
+    """After the owner resumes a halted day, the engine measures the loss limit from the
+    equity at the resume, so the AI must not be told that nothing is left."""
+    ctx = rich_ctx(limits=RiskLimits(max_daily_loss_pct=6.0), equity=460.0)
+    text = render_context(ctx)
+    assert "$0.00 left before the halt" in text  # down $40 against a $30 limit
+    text = render_context(ctx.model_copy(update={"loss_baseline": 465.0}))
+    assert "P&L -$40.00" in text  # the day's P&L still counts from the $500 start
+    assert "daily loss limit -$27.90 (6% of $465.00, the equity when the owner resumed" in text
+    assert "$22.90 left before the halt" in text  # floor $437.10
+    same = render_context(ctx.model_copy(update={"loss_baseline": 500.0}))
+    assert "(6% of start equity, binding): $0.00 left" in same
+
+
 def test_render_context_lists_positions_candidates_and_market():
     text = render_context(rich_ctx())
     assert "STK:SPY qty 1 avg 600 | last 602" in text
