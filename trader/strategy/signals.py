@@ -1,9 +1,10 @@
 """Rule-based setup scanner: bars + quote -> scored, long-only trade candidates.
 
-Setups (docs/SPEC.md 5.3): orb_breakout (stocks only), vwap_reclaim, trend_pullback and
-rsi_reversion. Each candidate carries an ATR-based stop below the price and a target at
-least max(TARGET_RR, risk.min_reward_risk) times the risk above it. The scanner only
-proposes; the decision maker and the risk manager decide.
+Setups (docs/SPEC.md 5.3 and 7): orb_breakout (stocks only), vwap_reclaim,
+trend_pullback, rsi_reversion and volume_spike (momentum ignition). Each candidate carries
+an ATR-based stop below the price and a target at least max(TARGET_RR,
+risk.min_reward_risk) times the risk above it. The scanner only proposes; the decision
+maker and the risk manager decide.
 
 Stocks are evaluated on regular-hours bars with a VWAP that resets each New York
 session; crypto uses a rolling 24h window for VWAP, the day's range and day change.
@@ -11,6 +12,7 @@ session; crypto uses a rolling 24h window for VWAP, the day's range and day chan
 
 from __future__ import annotations
 
+import bisect
 import math
 import statistics
 from collections.abc import Callable, Sequence
@@ -31,6 +33,14 @@ SESSION_CLOSE = time(16, 0)
 OPENING_RANGE = timedelta(minutes=15)
 ORB_MIN_REL_VOLUME = 1.5
 CRYPTO_WINDOW = timedelta(hours=24)
+# volume_spike: the bar's volume vs the average of the 20 bars before it; stock spikes
+# only count once the open has settled; ATR % of price must sit in a sane band (scaled
+# from the 5-minute band by sqrt(bar minutes / 5), upper end capped).
+SPIKE_MIN_MULTIPLE = 3.0
+SPIKE_LOOKBACK = 20
+SPIKE_EARLIEST = time(9, 45)
+SPIKE_ATR_PCT_5MIN = (0.3, 8.0)
+PERF_DAYS = 20  # sessions (stocks) or days (crypto) for the trend filter
 
 # Stop distance in ATRs per setup.
 STOP_ATR = {
@@ -38,6 +48,7 @@ STOP_ATR = {
     "vwap_reclaim": 1.5,
     "trend_pullback": 1.5,
     "rsi_reversion": 1.0,
+    "volume_spike": 1.5,
 }
 
 
@@ -114,6 +125,7 @@ class Scanner:
             self._vwap_reclaim,
             self._trend_pullback,
             self._rsi_reversion,
+            self._volume_spike,
         ]
         if ctx.is_stock:
             detectors.insert(0, self._orb_breakout)
@@ -176,11 +188,15 @@ class Scanner:
         for name, value in (
             ("ema9", ind.last(ctx.ema9)),
             ("ema21", ind.last(ctx.ema21)),
+            ("sma20", ind.last(ind.sma(closes, 20))),
+            ("sma50", ind.last(ind.sma(closes, 50))),
             ("rsi14", ind.last(ctx.rsi)),
             ("atr14", ctx.atr),
             ("bb_upper", ind.last(bb_upper)),
             ("bb_lower", ind.last(bb_lower)),
             ("vwap", ind.last(vwap)),
+            ("volume_multiple", self._volume_multiple(bars)),
+            ("perf_20d_pct", self._perf_20d_pct(ctx)),
         ):
             if value is not None:
                 f[name] = value
@@ -198,6 +214,33 @@ class Scanner:
         if quote is not None and quote.bid and quote.ask and quote.ask >= quote.bid > 0:
             f["spread_pct"] = (quote.ask - quote.bid) / ((quote.ask + quote.bid) / 2) * 100
         return ctx
+
+    @staticmethod
+    def _volume_multiple(bars: Sequence[Bar]) -> float | None:
+        """The newest bar's volume vs the average of the SPIKE_LOOKBACK bars before it."""
+        prior = bars[-SPIKE_LOOKBACK - 1 : -1]
+        if len(prior) < SPIKE_LOOKBACK:
+            return None
+        average = sum(b.volume for b in prior) / len(prior)
+        return bars[-1].volume / average if average > 0 else None
+
+    def _perf_20d_pct(self, ctx: _Context) -> float | None:
+        """Change vs the close PERF_DAYS sessions (stocks) or days (crypto) ago; None when
+        the bars do not reach that far back."""
+        bars = ctx.bars
+        if ctx.is_stock:
+            days = sorted({b.ts.astimezone(self.tz).date() for b in bars})
+            if len(days) <= PERF_DAYS:
+                return None
+            then = days[-PERF_DAYS - 1]
+            reference = [b for b in bars if b.ts.astimezone(self.tz).date() == then][-1].close
+        else:
+            cutoff = bars[-1].ts - timedelta(days=PERF_DAYS)
+            i = bisect.bisect_right([b.ts for b in bars], cutoff) - 1
+            if i < 0:
+                return None
+            reference = bars[i].close
+        return (ctx.price / reference - 1) * 100
 
     def _day_reference(self, ctx: _Context) -> float | None:
         """Previous session close (stocks) or the price 24h ago (crypto)."""
@@ -371,6 +414,57 @@ class Scanner:
         recent_low = min(b.low for b in bars[-3:])
         stop = min(recent_low - 0.25 * atr, price - STOP_ATR["rsi_reversion"] * atr)
         return _Signal("rsi_reversion", score, stop, f"RSI {oversold:.0f} turning up at lower band")
+
+    def _volume_spike(self, ctx: _Context, now: datetime) -> _Signal | None:
+        """Momentum ignition: a bullish bar on >= 3x the 20-bar average volume, closing above
+        SMA20 and SMA50 (when there are 50 bars), with the price above the session open
+        (stocks) or the 24h open (crypto) and a positive 20-day trend when the history
+        reaches that far. ATR % must be sane for the bar size. Stocks: not before 09:45."""
+        f, atr, price = ctx.features, ctx.atr or 0.0, ctx.price
+        last = ctx.bars[-1]
+        multiple, sma20, sma50 = f.get("volume_multiple"), f.get("sma20"), f.get("sma50")
+        if multiple is None or multiple < SPIKE_MIN_MULTIPLE or sma20 is None:
+            return None
+        if ctx.is_stock and last.ts.astimezone(self.tz).time() < SPIKE_EARLIEST:
+            return None  # the opening bars are always busy: wait for the open to settle
+        low, high = self._spike_atr_band(ctx.interval)
+        perf = f.get("perf_20d_pct")
+        session_open = ctx.session[0].open
+        if not (
+            last.close > last.open
+            and last.close > sma20
+            and (sma50 is None or last.close > sma50)
+            and price > session_open
+            and low <= f["atr_pct"] <= high
+            and (perf is None or perf > 0)
+        ):
+            return None
+        bar_range = last.high - last.low
+        close_strength = (last.close - last.low) / bar_range if bar_range > 0 else 1.0
+        extension = (price - sma20) / atr
+        score = (
+            0.55
+            + 0.1 * _clamp((multiple - SPIKE_MIN_MULTIPLE) / SPIKE_MIN_MULTIPLE)
+            + (0.05 if sma50 is not None else 0.0)
+            + (0.05 if perf is not None else 0.0)
+            + 0.05 * close_strength
+            - 0.05 * max(0.0, extension - 2.0)  # far above the mean: late to the move
+        )
+        averages = "SMA20/50" if sma50 is not None else "SMA20"
+        where = "session open" if ctx.is_stock else "24h open"
+        return _Signal(
+            "volume_spike",
+            score,
+            price - STOP_ATR["volume_spike"] * atr,
+            f"volume {multiple:.1f}x the 20-bar average, above {averages} and the {where}",
+            {"session_open": session_open},
+        )
+
+    @staticmethod
+    def _spike_atr_band(interval: timedelta) -> tuple[float, float]:
+        scale = math.sqrt(interval.total_seconds() / 300)
+        low, high = SPIKE_ATR_PCT_5MIN
+        return low * scale, min(high, high * scale)
 
     # ------------------------------------------------------------------ candidates
     def _candidate(self, ctx: _Context, signal: _Signal) -> Candidate | None:

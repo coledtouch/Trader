@@ -9,16 +9,20 @@ Design notes:
   contracts are kept because IBKR contract ids are stable across sessions.
 - Stock entries go out as a bracket: parent LMT/MKT (DAY) plus a protective STP and an
   optional take-profit LMT, both GTC and in one OCA group, so protection lives at the
-  broker and survives disconnects and the day boundary.
-- IBKR crypto (Paxos/Zero Hash) only accepts LMT and MKT orders: buy MKT uses
-  ``cashQty`` and MKT orders must be IOC. There are no native crypto stops, so
-  ``supports_native_stops`` is False for crypto and the engine manages those exits.
+  broker and survives disconnects and the day boundary. ``modify_stop`` raises that STP
+  in place (same orderId, new auxPrice) for breakeven and trailing stops.
+- IBKR crypto routes through ``config.ib_crypto_exchange`` (ZEROHASH; older accounts
+  PAXOS) and only accepts LMT and MKT orders: buy MKT uses ``cashQty`` and MKT orders
+  must be IOC. There are no native crypto stops, so ``supports_native_stops`` is False
+  for crypto and the engine manages those exits.
+- Commission estimates come from ``trader.fees`` with ``config.commission_plan``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import logging
 import math
 import re
@@ -45,6 +49,7 @@ from ib_async import (
     Trade,
 )
 
+from trader import fees
 from trader.broker.base import Broker, BrokerError
 from trader.config import AppConfig
 from trader.models import (
@@ -80,6 +85,10 @@ WORKING_IB_STATES = frozenset(
 )
 CANCELLED_IB_STATES = frozenset({"Cancelled", "ApiCancelled"})
 DONE_IB_STATES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})
+# Acknowledged, still-live orders that may be modified (IB holds untriggered stops as
+# PreSubmitted; ValidationError is a refused modification of an order that is still live).
+MODIFIABLE_IB_STATES = frozenset({"PreSubmitted", "Submitted", "ApiUpdate", "ValidationError"})
+DEFAULT_CRYPTO_EXCHANGE = "ZEROHASH"
 
 PREFERRED_CURRENCIES = ("USD", "BASE", "")  # first match wins for each account tag
 VALID_BAR_SIZES = frozenset(
@@ -134,6 +143,19 @@ def _price(value: object) -> float | None:
     """A usable market price: finite and > 0 (IB uses NaN and -1 for "no value")."""
     num = _to_float(value)
     return num if num is not None and 0 < num < 1e12 else None
+
+
+def _size(value: object) -> float | None:
+    """A quoted bid/ask size: finite and >= 0 (IB uses NaN and -1 for "no value")."""
+    num = _to_float(value)
+    return num if num is not None and 0 <= num < 1e12 else None
+
+
+def _is_halted(value: object) -> bool:
+    """Ticker.halted (generic tick 49): 1 = halted, 2 = volatility (LULD) pause; 0 = trading,
+    -1 = unknown and NaN = not reported yet, which both count as not halted."""
+    num = _to_float(value)
+    return num is not None and num > 0
 
 
 def _commission(value: object) -> float:
@@ -243,9 +265,10 @@ def instrument_from_contract(contract: Contract | None) -> Instrument | None:
     return None
 
 
-def _trade_error(trade: Trade) -> tuple[int, str] | None:
-    """Most recent (code, message) error that IB attached to the order, if any."""
-    for entry in reversed(trade.log):
+def _trade_error(trade: Trade, since: int = 0) -> tuple[int, str] | None:
+    """Most recent (code, message) error that IB attached to the order, if any; only log
+    entries from index ``since`` on are considered."""
+    for entry in reversed(trade.log[since:]):
         if entry.errorCode:
             message = entry.message.split(", contract:", 1)[0]
             return entry.errorCode, message[:300]
@@ -277,21 +300,6 @@ def map_ib_status(trade: Trade, cancel_requested: bool = False) -> tuple[OrderSt
             return OrderStatus.REJECTED, error_msg
         return OrderStatus.CANCELLED, error_msg or ("cancelled" if cancel_requested else "")
     return OrderStatus.SUBMITTED, f"unrecognised IBKR status {status!r}"
-
-
-def stock_commission(qty: float, price: float) -> float:
-    """IBKR Pro Fixed: $0.005/share, min $1.00, max 1% of trade value."""
-    if qty <= 0 or price <= 0:
-        return 0.0
-    return min(max(0.005 * qty, 1.0), 0.01 * qty * price)
-
-
-def crypto_commission(qty: float, price: float) -> float:
-    """IBKR crypto: 0.18% of trade value, min $1.75, max 1% of trade value."""
-    if qty <= 0 or price <= 0:
-        return 0.0
-    value = qty * price
-    return min(max(0.0018 * value, 1.75), 0.01 * value)
 
 
 async def _wait_until(predicate: Callable[[], bool], within: float, interval: float = 0.05) -> bool:
@@ -347,6 +355,7 @@ class IBKRBroker(Broker):
         self._config = config
         self._ib = ib if ib is not None else IB()
         self._client_id = int(config.ib_client_id)
+        self._crypto_exchange = config.ib_crypto_exchange.strip().upper() or DEFAULT_CRYPTO_EXCHANGE
         self._account: str | None = None
         self._syncing = False
         self._connect_lock = asyncio.Lock()
@@ -556,7 +565,7 @@ class IBKRBroker(Broker):
             if instrument.asset_class == AssetClass.STOCK:
                 template: Contract = Stock(instrument.symbol, "SMART", "USD")
             else:
-                template = Crypto(instrument.symbol, "PAXOS", "USD")
+                template = Crypto(instrument.symbol, self._crypto_exchange, "USD")
             details = await self._call(
                 lambda: self._ib.reqContractDetailsAsync(template),
                 self.REQUEST_TIMEOUT,
@@ -570,7 +579,7 @@ class IBKRBroker(Broker):
             detail = matches[0]
             contract = detail.contract
             assert contract is not None  # filtered above; narrows the type
-            contract.exchange = template.exchange  # keep SMART routing / PAXOS
+            contract.exchange = template.exchange  # keep SMART routing / the crypto venue
             info = _ContractInfo(
                 contract=contract,
                 min_tick=_to_float(detail.minTick) or 0.0,
@@ -688,8 +697,11 @@ class IBKRBroker(Broker):
             bid=_price(ticker.bid),
             ask=_price(ticker.ask),
             last=_price(ticker.last),
+            bid_size=_size(ticker.bidSize),
+            ask_size=_size(ticker.askSize),
             ts=ts if ts.tzinfo else ts.replace(tzinfo=UTC),
             delayed=delayed,
+            halted=_is_halted(ticker.halted),
         )
 
     async def bars(
@@ -732,10 +744,11 @@ class IBKRBroker(Broker):
 
     async def scan_movers(self, limit: int = 10) -> list[str]:
         """Top % gainers among liquid US stocks priced $2-$50; [] on any error."""
-        if not self.connected:
+        limit = min(int(limit), 50)
+        if limit < 1 or not self.connected:
             return []
         sub = ScannerSubscription(
-            numberOfRows=max(1, min(int(limit), 50)),
+            numberOfRows=limit,
             instrument="STK",
             locationCode="STK.US.MAJOR",
             scanCode="TOP_PERC_GAIN",
@@ -1131,10 +1144,118 @@ class IBKRBroker(Broker):
         rounded = _round_to_increment(qty + 1e-12, info.size_increment, up=False)
         return rounded if rounded >= info.min_size else 0.0
 
-    def estimate_commission(self, instrument: Instrument, qty: float, price: float) -> float:
-        if instrument.asset_class == AssetClass.STOCK:
-            return stock_commission(qty, price)
-        return crypto_commission(qty, price)
+    def estimate_commission(
+        self, instrument: Instrument, qty: float, price: float, side: Side = Side.BUY
+    ) -> float:
+        return fees.estimate_commission(instrument, qty, price, side, self._config.commission_plan)
+
+    # ------------------------------------------------------------------ stop management
+    async def modify_stop(self, instrument: Instrument, new_stop: float) -> bool:
+        """Raise the working GTC protective stop(s) this client placed for a long stock
+        position to ``new_stop`` (rounded up to the tick): same orderId, new auxPrice. Never
+        lowers a stop. True only when IBKR acknowledged the new price on every stop; False
+        when there is nothing to move, the move was refused or not confirmed in time (the
+        engine then manages the stop itself)."""
+        requested = _price(new_stop)
+        if requested is None or instrument.asset_class != AssetClass.STOCK:
+            return False
+        try:
+            acct = self._require_connected()
+            if self._upstream_lost_at is not None:
+                raise BrokerError("IB Gateway has lost its link to IBKR servers")
+            info = await self._contract_info(instrument)
+        except BrokerError as exc:
+            logger.warning("cannot move the IBKR stop for %s: %s", instrument.key, exc)
+            return False
+        if self._held_qty(acct, instrument) <= 0:
+            return False
+        stops = self._protective_stops(acct, instrument)
+        if not stops:
+            return False
+        tick = self._tick_size(info, instrument, requested)
+        target = _round_to_increment(requested, tick, up=True)
+        results = [await self._raise_stop(info.contract, trade, target, tick) for trade in stops]
+        return all(results)
+
+    def _protective_stops(self, acct: str, instrument: Instrument) -> list[Trade]:
+        """Working SELL STP orders for the instrument that this client placed (bracket
+        children or re-placed protective stops)."""
+        return [
+            trade
+            for trade in self._ib.openTrades()
+            if self._is_own(trade.order)
+            and trade.order.action == "SELL"
+            and trade.order.orderType == "STP"
+            and trade.orderStatus.status in MODIFIABLE_IB_STATES
+            and trade.order.orderId not in self._cancel_requested
+            and (not trade.order.account or trade.order.account == acct)
+            and (inst := instrument_from_contract(trade.contract)) is not None
+            and inst.key == instrument.key
+        ]
+
+    async def _raise_stop(
+        self, contract: Contract, trade: Trade, target: float, tick: float
+    ) -> bool:
+        order = trade.order
+        current = _price(order.auxPrice)
+        if current is None:
+            logger.warning(
+                "IBKR stop order %s has no known stop price; not modifying", order.orderId
+            )
+            return False
+        if target <= current + tick / 2:
+            if target < current - tick / 2:
+                logger.info(
+                    "not moving the IBKR stop %s down from %g to %g", order.orderId, current, target
+                )
+                return False
+            return True  # already there
+        modified = copy.copy(order)  # IB modifies an order re-sent with the same orderId
+        modified.auxPrice = target
+        modified.transmit = True  # bracket children were staged with transmit=False
+        mark = len(trade.log)
+        try:
+            self._ib.placeOrder(contract, modified)
+        except (ConnectionError, AssertionError) as exc:  # ib_async asserts on done orders
+            logger.warning("could not modify IBKR stop %s: %r", order.orderId, exc)
+            return False
+
+        def confirmed() -> bool:
+            return abs((_price(trade.order.auxPrice) or 0.0) - target) < tick / 2
+
+        def settled() -> bool:
+            return trade.isDone() or _trade_error(trade, mark) is not None or confirmed()
+
+        await _wait_until(settled, self.ORDER_ACK_TIMEOUT)
+        error = _trade_error(trade, mark)
+        if error is None and not trade.isDone() and confirmed():
+            logger.info(
+                "moved IBKR stop %s for %s from %g to %g",
+                order.orderId,
+                contract.symbol,
+                current,
+                target,
+            )
+            return True
+        if error is not None:
+            reason = error[1]
+        else:
+            reason = "order no longer working" if trade.isDone() else "no confirmation in time"
+        logger.warning(
+            "IBKR did not confirm moving stop %s from %g to %g: %s",
+            order.orderId,
+            current,
+            target,
+            reason,
+        )
+        # ib_async marks an order whose modification was refused as cancelled although IB
+        # keeps it live; a fresh open-orders snapshot restores the real status.
+        with contextlib.suppress(BrokerError):
+            async with self._open_orders_lock:
+                await self._call(
+                    self._ib.reqAllOpenOrdersAsync, self.REQUEST_TIMEOUT, "open orders"
+                )
+        return False
 
 
 # ---------------------------------------------------------------------- module helpers

@@ -31,16 +31,15 @@ from ib_async import Fill as IBFill
 from ib_async import OrderStatus as IBOrderStatus
 from ib_async import Position as IBPosition
 
+from trader import fees
 from trader.broker.base import BrokerError
 from trader.broker.ibkr import (
     IBKRBroker,
-    crypto_commission,
     ib_bar_size,
     ib_duration,
     map_ib_status,
     mode_from_account,
     parse_account,
-    stock_commission,
 )
 from trader.config import AppConfig
 from trader.models import (
@@ -65,8 +64,8 @@ def stock(symbol: str = "AAPL", con_id: int = 265598) -> Contract:
     return Stock(symbol, "SMART", "USD", conId=con_id, primaryExchange="NASDAQ")
 
 
-def crypto(symbol: str = "BTC", con_id: int = 479624278) -> Contract:
-    return Crypto(symbol, "PAXOS", "USD", conId=con_id)
+def crypto(symbol: str = "BTC", con_id: int = 541686651) -> Contract:
+    return Crypto(symbol, "ZEROHASH", "USD", conId=con_id)
 
 
 def log_error(trade: Trade, code: int, text: str) -> None:
@@ -117,6 +116,11 @@ class FakeIB:
         self.hist: list[BarData] = []
         self.hist_calls: list[dict[str, object]] = []
         self.placed: list[tuple[Contract, Order]] = []
+        self.modified: list[tuple[Contract, Order]] = []
+        self.modify_error: tuple[int, str] | None = None  # IB refuses modifications
+        self.modify_silent = False  # IB never confirms modifications
+        self.restore_on_refresh: dict[int, str] = {}  # orderId -> status IB really has
+        self.open_order_refreshes = 0
         self.trade_list: list[Trade] = []
         self.on_place: Callable[[Trade], None] | None = None
         self.cancelled: list[int] = []
@@ -190,6 +194,22 @@ class FakeIB:
     def placeOrder(self, contract: Contract, order: Order) -> Trade:
         if not self.client.ready:
             raise ConnectionError("Not connected")
+        existing = next(
+            (t for t in self.trade_list if order.orderId and t.order.orderId == order.orderId),
+            None,
+        )
+        if existing is not None:  # a modification, handled like ib_async + IB would
+            assert existing.orderStatus.status not in DONE
+            existing.log.append(TradeLogEntry(NOW, existing.orderStatus.status, "Modify"))
+            self.modified.append((contract, order))
+            if self.modify_error is not None:
+                # ib_async marks the order cancelled locally; IB keeps it live.
+                self.restore_on_refresh[order.orderId] = existing.orderStatus.status
+                existing.orderStatus.status = "Cancelled"
+                log_error(existing, *self.modify_error)
+            elif not self.modify_silent:
+                existing.order.auxPrice = order.auxPrice  # IB echoes openOrder
+            return existing
         order.orderId = order.orderId or self.client.getReqId()
         order.clientId = CLIENT_ID
         status = IBOrderStatus(orderId=order.orderId, status="PendingSubmit")
@@ -226,6 +246,10 @@ class FakeIB:
         return [t for t in self.trades() if t.orderStatus.status not in DONE]
 
     async def reqAllOpenOrdersAsync(self) -> list[Trade]:
+        self.open_order_refreshes += 1
+        for trade in self.trade_list:  # IB re-sends orderStatus with the real state
+            if trade.order.orderId in self.restore_on_refresh:
+                trade.orderStatus.status = self.restore_on_refresh.pop(trade.order.orderId)
         return [*[t for t in self.trade_list if t.orderStatus.status not in DONE], *self.all_open]
 
     async def reqExecutionsAsync(self, execFilter=None) -> list[IBFill]:
@@ -483,6 +507,31 @@ async def test_quote_live_data_type_and_no_data() -> None:
     assert btc.price is None and btc.delayed
 
 
+@pytest.mark.parametrize(
+    ("halted", "expected"),
+    [(math.nan, False), (-1.0, False), (0.0, False), (1.0, True), (2.0, True)],
+)
+async def test_quote_sizes_and_halt_flag(halted: float, expected: bool) -> None:
+    broker, fake = await connected_broker(ib_market_data_type=1)
+    fake.ticker_values[stock().conId] = {
+        "bid": 100.0,
+        "ask": 100.02,
+        "bidSize": 300.0,
+        "askSize": 500.0,
+        "halted": halted,
+    }
+    quote = await broker.quote(AAPL)
+    assert (quote.bid_size, quote.ask_size) == (300.0, 500.0)
+    assert quote.halted is expected
+
+
+async def test_quote_sizes_missing() -> None:
+    broker, fake = await connected_broker()
+    fake.ticker_values[stock().conId] = {"last": 101.0, "bidSize": math.nan, "askSize": -1.0}
+    quote = await broker.quote(AAPL)
+    assert quote.bid_size is None and quote.ask_size is None and not quote.halted
+
+
 async def test_unknown_symbol_raises() -> None:
     broker, _ = await connected_broker()
     with pytest.raises(BrokerError, match="unknown"):
@@ -538,7 +587,22 @@ async def test_bars_convert_to_utc_and_use_asset_specific_settings() -> None:
     await broker.bars(BTC, "1 min", "1 D")
     call = fake.hist_calls[-1]
     assert call["whatToShow"] == "AGGTRADES" and call["useRTH"] is False
-    assert call["contract"].exchange == "PAXOS"
+    assert call["contract"].exchange == "ZEROHASH"
+
+
+@pytest.mark.parametrize(("configured", "venue"), [("ZEROHASH", "ZEROHASH"), (" paxos ", "PAXOS")])
+async def test_crypto_contract_uses_the_configured_exchange(configured: str, venue: str) -> None:
+    broker, fake = await connected_broker(ib_crypto_exchange=configured)
+    looked_up: list[Contract] = []
+    lookup = fake.reqContractDetailsAsync
+
+    async def spy(contract: Contract) -> list[ContractDetails]:
+        looked_up.append(contract)
+        return await lookup(contract)
+
+    fake.reqContractDetailsAsync = spy  # type: ignore[method-assign]
+    await broker.quote(BTC)
+    assert [(c.secType, c.exchange) for c in looked_up] == [("CRYPTO", venue)]
 
 
 # ---------------------------------------------------------------------- order construction
@@ -696,7 +760,7 @@ async def test_crypto_orders_follow_ibkr_crypto_rules() -> None:
     )
     assert rec.status is OrderStatus.SUBMITTED
     [(contract, order)] = fake.placed  # no native children: the engine manages crypto stops
-    assert contract.exchange == "PAXOS"
+    assert contract.exchange == "ZEROHASH"
     assert (order.action, order.orderType, order.tif) == ("BUY", "LMT", "DAY")
     assert order.lmtPrice == 60010.5 and order.totalQuantity == 0.0123
 
@@ -884,11 +948,28 @@ async def test_fills_since() -> None:
 
 # ---------------------------------------------------------------------- costs / sizing
 @pytest.mark.parametrize(
-    ("qty", "price", "expected"),
-    [(100, 10.0, 1.0), (1000, 50.0, 5.0), (10, 5.0, 0.5), (0, 10.0, 0.0)],
+    ("plan", "qty", "price", "side", "expected"),
+    [
+        # Tiered: max($0.35, $0.0035/share) + ~$0.0032/share exchange and clearing
+        ("tiered", 10, 100.0, Side.BUY, 0.35 + 10 * 0.0032),
+        ("tiered", 1000, 50.0, Side.BUY, 3.5 + 1000 * 0.0032),
+        # sells add the SEC fee and FINRA TAF
+        ("tiered", 10, 100.0, Side.SELL, 0.35 + 10 * 0.0032 + 1000 * 0.0000278 + 10 * 0.000166),
+        # Fixed: $0.005/share, min $1.00, max 1% of value
+        ("fixed", 100, 10.0, Side.BUY, 1.0),
+        ("fixed", 1000, 50.0, Side.BUY, 5.0),
+        ("fixed", 10, 5.0, Side.BUY, 0.5),
+        ("fixed", 0, 10.0, Side.BUY, 0.0),
+    ],
 )
-def test_stock_commission(qty: float, price: float, expected: float) -> None:
-    assert stock_commission(qty, price) == pytest.approx(expected)
+async def test_stock_commission_uses_the_configured_plan(
+    plan: str, qty: float, price: float, side: Side, expected: float
+) -> None:
+    broker, _ = make_broker(commission_plan=plan)
+    assert broker.estimate_commission(AAPL, qty, price, side) == pytest.approx(expected, abs=1e-4)
+    assert broker.estimate_commission(AAPL, qty, price, side) == fees.estimate_commission(
+        AAPL, qty, price, side, plan
+    )
 
 
 @pytest.mark.parametrize(
@@ -896,12 +977,14 @@ def test_stock_commission(qty: float, price: float, expected: float) -> None:
     [(0.01, 60000.0, 1.75), (1.0, 10000.0, 18.0), (0.001, 100000.0, 1.0)],
 )
 def test_crypto_commission(qty: float, price: float, expected: float) -> None:
-    assert crypto_commission(qty, price) == pytest.approx(expected)
+    broker, _ = make_broker()
+    assert broker.estimate_commission(BTC, qty, price) == pytest.approx(expected)
+    assert broker.estimate_commission(BTC, qty, price, Side.SELL) == pytest.approx(expected)
 
 
 async def test_estimate_commission_and_round_qty() -> None:
     broker, _ = await connected_broker()
-    assert broker.estimate_commission(AAPL, 10, 100.0) == pytest.approx(1.0)
+    assert broker.estimate_commission(AAPL, 10, 100.0) == pytest.approx(0.382)  # tiered default
     assert broker.estimate_commission(BTC, 0.01, 60000.0) == pytest.approx(1.75)
     assert broker.round_qty(AAPL, 3.99, allow_fractional=True) == 3.0  # whole shares only
     assert broker.round_qty(BTC, 0.0123456) == pytest.approx(0.012345)  # default 6 dp
@@ -935,5 +1018,96 @@ async def test_scan_movers_returns_empty_on_errors() -> None:
     broker, fake = make_broker()
     assert await broker.scan_movers() == []  # not connected
     await broker.connect()
+    assert await broker.scan_movers(limit=0) == []
+    assert not hasattr(fake, "scan_subscription")  # nothing requested
     fake.scan_error = ConnectionError("Not connected")
     assert await broker.scan_movers() == []
+
+
+# ---------------------------------------------------------------------- stop modification
+async def filled_bracket(**overrides) -> tuple[IBKRBroker, FakeIB, Trade]:
+    """A filled stock entry whose GTC stop child (at 98.12) is working; returns its trade."""
+    broker, fake = await connected_broker(**overrides)
+    await broker.place_order(entry())
+    parent, stop, _ = fake.trade_list
+    parent.orderStatus.status = "Filled"
+    parent.orderStatus.filled = 3
+    hold(fake, stock(), 3)
+    assert stop.order.orderType == "STP" and stop.order.auxPrice == 98.12
+    return broker, fake, stop
+
+
+async def test_modify_stop_moves_the_bracket_stop_up_in_place() -> None:
+    broker, fake, stop = await filled_bracket()
+    assert await broker.modify_stop(AAPL, 100.234) is True
+    [(contract, sent)] = fake.modified
+    assert contract.conId == stock().conId
+    assert sent.orderId == stop.order.orderId and sent is not stop.order  # same id: a modify
+    assert (sent.orderType, sent.action, sent.tif) == ("STP", "SELL", "GTC")
+    assert sent.auxPrice == 100.24  # rounded UP to the tick
+    assert sent.transmit  # the staged child must be transmitted
+    assert (sent.parentId, sent.ocaGroup, sent.totalQuantity) == (
+        stop.order.parentId,
+        stop.order.ocaGroup,
+        3,
+    )
+    assert stop.order.auxPrice == 100.24  # IB's echo
+    orders = {o.broker_order_id: o for o in await broker.open_orders()}
+    assert orders[str(stop.order.orderId)].request.stop_loss == 100.24
+
+
+async def test_modify_stop_never_lowers_and_skips_no_ops() -> None:
+    broker, fake, stop = await filled_bracket()
+    assert await broker.modify_stop(AAPL, 97.5) is False  # below the current stop
+    assert await broker.modify_stop(AAPL, 98.115) is True  # rounds to the current 98.12
+    assert fake.modified == []
+    assert stop.order.auxPrice == 98.12
+
+
+async def test_modify_stop_refused_by_ibkr_keeps_the_old_stop() -> None:
+    broker, fake, stop = await filled_bracket()
+    fake.modify_error = (201, "Order rejected - reason: invalid stop price")
+    refreshes = fake.open_order_refreshes
+    assert await broker.modify_stop(AAPL, 100.0) is False
+    assert stop.order.auxPrice == 98.12
+    assert fake.open_order_refreshes == refreshes + 1  # resynced the real order state
+    orders = {o.broker_order_id: o for o in await broker.open_orders()}
+    assert orders[str(stop.order.orderId)].request.stop_loss == 98.12  # still protecting
+
+
+async def test_modify_stop_unconfirmed_is_false() -> None:
+    broker, fake, stop = await filled_bracket()
+    fake.modify_silent = True
+    assert await broker.modify_stop(AAPL, 100.0) is False
+    assert len(fake.modified) == 1 and stop.order.auxPrice == 98.12
+
+
+async def test_modify_stop_needs_an_own_working_stop_on_a_long() -> None:
+    broker, fake = await connected_broker()
+    assert await broker.modify_stop(AAPL, 100.0) is False  # nothing held, no stop
+    hold(fake, stock(), 3)
+    fake.all_open = [
+        Trade(
+            stock(),
+            Order(orderId=0, clientId=0, permId=555, action="SELL", totalQuantity=3,
+                  orderType="STP", auxPrice=95.0, account=PAPER),
+            IBOrderStatus(status="PreSubmitted"),
+        )
+    ]  # fmt: skip
+    assert await broker.modify_stop(AAPL, 100.0) is False  # placed by another client
+    assert await broker.modify_stop(BTC, 60000.0) is False  # no native crypto stops
+    assert await broker.modify_stop(AAPL, math.nan) is False
+    assert fake.modified == []
+
+
+async def test_modify_stop_without_a_position_or_connection() -> None:
+    broker, fake = await connected_broker()
+    await broker.place_order(entry())  # parent not filled, nothing held
+    assert await broker.modify_stop(AAPL, 100.0) is False
+    _, stop, _ = fake.trade_list
+    hold(fake, stock(), 3)
+    stop.orderStatus.status = "Cancelled"
+    assert await broker.modify_stop(AAPL, 100.0) is False  # no working stop left
+    fake.disconnect()
+    assert await broker.modify_stop(AAPL, 100.0) is False  # fail safe, no exception
+    assert fake.modified == []

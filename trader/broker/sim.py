@@ -15,9 +15,15 @@ liquidity shrinks and as the order takes a bigger share of the minute's volume; 
 order fills at most MAX_PARTICIPATION of a minute's volume (the rest waits); resting
 limit orders fill only when the price trades through the limit. Stock entries carry
 native bracket stop/target orders; crypto has none, so the engine's own stop logic is
-exercised. Cash-account semantics: no shorting, no borrowing, stock sale proceeds
-settle T+1 (unsettled cash may still be used, like an IBKR "No Borrow Margin" account).
-State is in memory only: a restarted SimBroker starts from `starting_cash` again.
+exercised; `modify_stop` raises those native stops (breakeven/trailing). Commissions
+come from `trader.fees` (IBKR Pro Tiered by default, or Fixed), sells included.
+Cash-account semantics: no shorting, no borrowing, stock sale proceeds settle T+1
+(unsettled cash may still be used, like an IBKR "No Borrow Margin" account). Quotes carry
+top-of-book sizes that shrink with liquidity. `set_halted()` (a test hook) halts a symbol:
+the quote freezes with `halted=True`, new entries are rejected and nothing fills until it
+resumes, optionally with a gap (halts often reopen far away); exits are accepted and wait
+for the reopen, as at IBKR. State is in memory only: a restarted SimBroker starts from
+`starting_cash` again.
 """
 
 from __future__ import annotations
@@ -32,9 +38,12 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, time, timedelta
 from itertools import count, pairwise
 from statistics import NormalDist
+from typing import get_args
 from zoneinfo import ZoneInfo
 
+from trader import fees
 from trader.broker.base import Broker, BrokerError
+from trader.fees import Plan
 from trader.models import (
     OPEN_ORDER_STATUSES,
     AccountSnapshot,
@@ -54,33 +63,7 @@ from trader.models import (
 )
 
 NY = ZoneInfo("America/New_York")
-
-# --------------------------------------------------------------------------- commissions
-# IBKR Pro "Fixed" pricing. The per-order maximum (1% of trade value) wins over the
-# minimum, so a $50 stock order pays $0.50, not $1.00.
-STOCK_COMMISSION_PER_SHARE = 0.005
-STOCK_COMMISSION_MIN = 1.00
-STOCK_COMMISSION_MAX_PCT = 1.0
-CRYPTO_COMMISSION_PCT = 0.18
-CRYPTO_COMMISSION_MIN = 1.75
-CRYPTO_COMMISSION_MAX_PCT = 1.0
-COMMISSION_MODELS = ("ibkr_pro_fixed",)
-
-
-def ibkr_pro_fixed_commission(asset_class: AssetClass, qty: float, price: float) -> float:
-    """Commission in USD for one order of `qty` filled at average `price` (IBKR Pro Fixed)."""
-    qty = abs(qty)
-    value = qty * price
-    if value <= 0:
-        return 0.0
-    if asset_class == AssetClass.STOCK:
-        fee = max(qty * STOCK_COMMISSION_PER_SHARE, STOCK_COMMISSION_MIN)
-        cap = value * STOCK_COMMISSION_MAX_PCT / 100
-    else:
-        fee = max(value * CRYPTO_COMMISSION_PCT / 100, CRYPTO_COMMISSION_MIN)
-        cap = value * CRYPTO_COMMISSION_MAX_PCT / 100
-    return round(min(fee, cap), 4)
-
+COMMISSION_PLANS: tuple[str, ...] = get_args(Plan)
 
 # --------------------------------------------------------------------------- market model
 DAY_MINUTES = 1440
@@ -96,6 +79,8 @@ REF_MINUTE_DOLLAR_VOLUME = 1_000_000.0
 IMPACT_BPS_PER_PCT = 10.0  # extra slippage per 1% of the minute's volume the order takes
 MAX_SLIPPAGE_BPS = 300.0
 MAX_PARTICIPATION = 0.10  # one order fills at most this share of a minute's volume
+TOP_OF_BOOK_SHARE = 0.05  # displayed size at the best bid/ask, vs a minute's volume
+STOCK_LOT = 100  # quoted stock sizes are whole round lots
 
 REGIME_MINUTES = 30
 # (probability, volatility multiplier); E[multiplier^2] ~= 1 so daily vol stays calibrated.
@@ -118,17 +103,23 @@ class SymbolProfile:
     daily_volume: float  # average units (shares/coins) traded per day
 
 
+# Rough October 2026 levels; the default universe plus a few benchmarks.
 KNOWN_PROFILES: dict[str, SymbolProfile] = {
-    "STK:SPY": SymbolProfile(600.0, 0.010, 60e6),
-    "STK:QQQ": SymbolProfile(520.0, 0.013, 35e6),
-    "STK:AAPL": SymbolProfile(230.0, 0.016, 50e6),
-    "STK:AMD": SymbolProfile(160.0, 0.030, 40e6),
-    "STK:F": SymbolProfile(11.0, 0.018, 50e6),
-    "STK:SOFI": SymbolProfile(15.0, 0.035, 50e6),
-    "STK:PLTR": SymbolProfile(40.0, 0.038, 60e6),
-    "STK:INTC": SymbolProfile(22.0, 0.025, 50e6),
-    "CRYPTO:BTC": SymbolProfile(65_000.0, 0.028, 30_000),
-    "CRYPTO:ETH": SymbolProfile(3_000.0, 0.035, 400_000),
+    "STK:SPY": SymbolProfile(764.0, 0.010, 60e6),
+    "STK:QQQ": SymbolProfile(690.0, 0.013, 35e6),
+    "STK:AAPL": SymbolProfile(265.0, 0.016, 50e6),
+    "STK:AMD": SymbolProfile(230.0, 0.030, 40e6),
+    "STK:F": SymbolProfile(12.0, 0.018, 50e6),
+    "STK:SOFI": SymbolProfile(28.0, 0.035, 50e6),
+    "STK:INTC": SymbolProfile(38.0, 0.028, 60e6),
+    "STK:T": SymbolProfile(27.0, 0.012, 35e6),
+    "STK:PFE": SymbolProfile(25.0, 0.013, 40e6),
+    "STK:AAL": SymbolProfile(13.0, 0.028, 35e6),
+    "STK:SNAP": SymbolProfile(9.0, 0.035, 30e6),
+    "STK:RIVN": SymbolProfile(14.0, 0.035, 30e6),
+    "STK:NU": SymbolProfile(16.0, 0.025, 40e6),
+    "CRYPTO:BTC": SymbolProfile(81_700.0, 0.028, 30_000),
+    "CRYPTO:ETH": SymbolProfile(3_900.0, 0.035, 400_000),
 }
 
 _NORMAL = NormalDist()
@@ -314,6 +305,8 @@ class _Series:
         self.trading = bytearray()
         self._regimes: dict[int, tuple[float, float]] = {}
         self._adjust: list[tuple[int, float]] = []
+        # Trading halts as [start, end) minute ranges; end is None while still halted.
+        self._halts: list[tuple[int, int | None]] = []
 
     @property
     def end(self) -> int:
@@ -443,8 +436,20 @@ class _Series:
         """Scale the path from `minute` on (test hook behind SimBroker.set_price)."""
         self._adjust.append((minute, factor))
 
+    def halt(self, minute: int) -> None:
+        self._halts.append((minute, None))
+
+    def resume(self, minute: int) -> None:
+        start, _ = self._halts.pop()
+        if minute > start:
+            self._halts.append((start, minute))
+
+    def halted(self, minute: int) -> bool:
+        return any(a <= minute and (b is None or minute < b) for a, b in self._halts)
+
     def is_open(self, minute: int) -> bool:
-        return bool(self.trading[minute - self.start])
+        """Regular trading in this minute (market hours, not halted)."""
+        return bool(self.trading[minute - self.start]) and not (self._halts and self.halted(minute))
 
     def volume(self, minute: int) -> float:
         return self.volumes[minute - self.start]
@@ -496,9 +501,9 @@ class _Series:
             ts = _minute_dt(first)
             out.append(Bar(ts=ts, open=bo, high=bh, low=bl, close=bc, volume=round(bv, decimals)))
 
-        trading, base = self.trading, self.start
+        trading, base, halts = self.trading, self.start, self._halts
         for minute in range(start, now_minute + 1):
-            if not trading[minute - base]:
+            if not trading[minute - base] or (halts and self.halted(minute)):
                 continue
             if minute < now_minute:
                 mo, mh, ml, mc, mv = self.ohlcv(minute)
@@ -522,6 +527,19 @@ class _Series:
         bid = max(round_price(price - spread / 2, "down"), tick_size(price))
         ask = round_price(bid + spread, "up")
         return bid, max(ask, round(bid + tick_size(bid), 4))
+
+    def book_sizes(self, minute: int) -> tuple[float, float]:
+        """(bid size, ask size) at the top of the book: a share of the minute's volume
+        (typical volume when closed), varying per minute; round lots for stocks."""
+        base = TOP_OF_BOOK_SHARE * (self.volume(minute) or self.typical_volume)
+        sizes = []
+        for side in ("bid", "ask"):
+            size = base * (0.5 + _hash_unit(self._tag, "book", minute, side))
+            if self.is_stock:
+                sizes.append(float(max(STOCK_LOT, math.floor(size / STOCK_LOT) * STOCK_LOT)))
+            else:
+                sizes.append(max(round(size, 4), 0.0001))
+        return sizes[0], sizes[1]
 
 
 # --------------------------------------------------------------------------- broker state
@@ -574,18 +592,18 @@ class SimBroker(Broker):
         seed: int = 7,
         starting_cash: float = 250.0,
         clock: Callable[[], datetime] = utcnow,
-        commission_model: str = "ibkr_pro_fixed",
+        commission_plan: Plan = "tiered",
         *,
         max_history_days: int = 30,
     ):
-        if commission_model not in COMMISSION_MODELS:
-            raise ValueError(f"unknown commission model {commission_model!r}")
+        if commission_plan not in COMMISSION_PLANS:
+            raise ValueError(f"unknown commission plan {commission_plan!r}")
         if starting_cash < 0:
             raise ValueError("starting_cash must be >= 0")
         if max_history_days < 1:
             raise ValueError("max_history_days must be >= 1")
         self.seed = seed
-        self.commission_model = commission_model
+        self.commission_plan: Plan = commission_plan
         self.account_id = f"SIM-{seed}"
         self._clock = clock
         self._offset = 0.0
@@ -601,6 +619,7 @@ class SimBroker(Broker):
         self._orders: dict[str, _Order] = {}
         self._fills: list[Fill] = []
         self._realized: dict[date, float] = {}  # New York day -> realized P&L
+        self._halted: dict[str, float] = {}  # instrument key -> price frozen at the halt
         # Ids include the start time so they stay unique across app restarts (the journal
         # dedupes fills by exec_id).
         self._run = format(int(self._last_now.timestamp() * 1000), "x")
@@ -697,6 +716,9 @@ class SimBroker(Broker):
         return series
 
     def _last_price(self, series: _Series) -> float:
+        frozen = self._halted.get(series.instrument.key)
+        if frozen is not None:
+            return frozen
         minute, frac = self._cursor
         series.ensure(minute, minute)
         return series.price_at(minute, frac)
@@ -704,9 +726,21 @@ class SimBroker(Broker):
     async def quote(self, instrument: Instrument) -> Quote:
         self._require()
         self._sync()
-        last = self._last_price(self._get_series(instrument))
-        bid, ask = self._get_series(instrument).bid_ask(last)
-        return Quote(instrument=instrument, bid=bid, ask=ask, last=last, ts=self._last_now)
+        series = self._get_series(instrument)
+        last = self._last_price(series)
+        bid, ask = series.bid_ask(last)
+        halted = instrument.key in self._halted
+        bid_size, ask_size = (0.0, 0.0) if halted else series.book_sizes(self._cursor[0])
+        return Quote(
+            instrument=instrument,
+            bid=bid,
+            ask=ask,
+            last=last,
+            bid_size=bid_size,
+            ask_size=ask_size,
+            ts=self._last_now,
+            halted=halted,
+        )
 
     async def bars(
         self, instrument: Instrument, bar_size: str = "5 mins", lookback: str = "2 D"
@@ -746,7 +780,7 @@ class SimBroker(Broker):
                     return _session_open_minute(day)
             day -= timedelta(days=1)
 
-    # ------------------------------------------------------------------ test hook
+    # ------------------------------------------------------------------ test hooks
     def set_price(self, instrument: Instrument, price: float) -> None:
         """Test hook: gap the price so the current price is `price` (the path keeps its shape
         from here on, scaled; the current minute's bar is rescaled too). Working orders see
@@ -758,9 +792,54 @@ class SimBroker(Broker):
         series = self._get_series(instrument)
         series.ensure(minute, minute)
         series.adjust(minute, price / _interp(series.path(minute), frac))
-        orders = self._working(instrument.key)
-        if orders and series.is_open(minute):
+        if instrument.key in self._halted:
+            self._halted[instrument.key] = round_price(price)
+        self._match_now(series)
+
+    def set_halted(
+        self, symbol: str | Instrument, halted: bool, *, gap_pct: float | None = None
+    ) -> None:
+        """Test hook: halt or resume trading (a plain symbol means the stock).
+
+        While halted the quote is frozen at the halt price with `halted=True` and no bid/ask
+        size, new buy orders are rejected, nothing fills and no bars print. Sell orders
+        (exits, protective stops) are accepted and wait for the reopen, as IBKR queues them,
+        so cancelling a stop to exit never leaves a position unprotected. On resume the
+        price continues from the random walk, or reopens `gap_pct` percent away from the
+        halt price when given (e.g. -35), and working orders are matched against the
+        reopening price at once: a stop gapped through fills there.
+        """
+        if gap_pct is not None and not -100 < gap_pct < math.inf:
+            raise ValueError("gap_pct must be above -100")
+        instrument = Instrument(symbol=symbol) if isinstance(symbol, str) else symbol
+        key = instrument.key
+        self._sync()
+        minute, frac = self._cursor
+        series = self._get_series(instrument)
+        series.ensure(minute, minute)
+        if halted:
+            if key not in self._halted:
+                self._halted[key] = self._last_price(series)
+                series.halt(minute)
+            return
+        frozen = self._halted.pop(key, None)
+        if frozen is None:
+            return
+        series.resume(minute)
+        if gap_pct is not None:
+            reopen = frozen * (1 + gap_pct / 100)
+            series.adjust(minute, reopen / _interp(series.path(minute), frac))
+        self._match_now(series)
+
+    def _match_now(self, series: _Series) -> None:
+        """Match the instrument's working orders against the current price point."""
+        minute, frac = self._cursor
+        orders = self._working(series.instrument.key)
+        if orders and self._tradable(series, minute):
             self._process(series, minute, frac, frac, orders)
+
+    def _tradable(self, series: _Series, minute: int) -> bool:
+        return series.instrument.key not in self._halted and series.is_open(minute)
 
     # ------------------------------------------------------------------ orders
     async def place_order(self, req: OrderRequest) -> OrderRecord:
@@ -787,7 +866,7 @@ class SimBroker(Broker):
         series = self._get_series(req.instrument)
         minute, frac = self._cursor
         series.ensure(minute, minute)
-        if series.is_open(minute):
+        if self._tradable(series, minute):
             price = series.price_at(minute, frac)
             self._match(
                 order, series, minute, [(frac, price)], series.volume(minute), placement=True
@@ -799,6 +878,8 @@ class SimBroker(Broker):
         if req.order_type == OrderType.LIMIT and (req.limit_price is None or req.limit_price <= 0):
             return "limit order needs a positive limit_price"
         key = req.instrument.key
+        if key in self._halted and req.side == Side.BUY:
+            return f"trading in {req.instrument.symbol} is halted; no new entries"
         if req.side == Side.SELL:
             if req.stop_loss is not None and req.stop_loss <= 0:
                 return "stop_loss must be positive"
@@ -934,8 +1015,40 @@ class SimBroker(Broker):
     def supports_native_stops(self, instrument: Instrument) -> bool:
         return instrument.asset_class == AssetClass.STOCK
 
-    def estimate_commission(self, instrument: Instrument, qty: float, price: float) -> float:
-        return ibkr_pro_fixed_commission(instrument.asset_class, qty, price)
+    def estimate_commission(
+        self, instrument: Instrument, qty: float, price: float, side: Side = Side.BUY
+    ) -> float:
+        return fees.estimate_commission(instrument, qty, price, side, self.commission_plan)
+
+    async def modify_stop(self, instrument: Instrument, new_stop: float) -> bool:
+        """Raise the native protective stop(s) of a long stock position to `new_stop`
+        (rounded up to the tick). Never lowers a stop: False when asked to, or when there
+        is no working stop to move. A stop raised to or above the market triggers at once."""
+        if not self._connected or not self.supports_native_stops(instrument):
+            return False
+        if not math.isfinite(new_stop) or new_stop <= 0:
+            return False
+        self._sync()
+        key = instrument.key
+        pos = self._positions.get(key)
+        stops = [
+            o
+            for o in self._working(key)
+            if o.kind == "stop" and self._active(o) and not o.triggered
+        ]
+        if pos is None or pos.qty <= EPS or not stops:
+            return False
+        target = round_price(new_stop, "up")
+        moved_all = True
+        for order in stops:
+            current = order.request.stop_loss or 0.0
+            if target < current - EPS:
+                moved_all = False
+            elif target > current + EPS:
+                order.request = order.request.model_copy(update={"stop_loss": target})
+                order.updated_at = self._last_now
+        self._match_now(self._series[key])
+        return moved_all
 
     # ------------------------------------------------------------------ matching engine
     def _working(self, key: str) -> list[_Order]:
@@ -985,8 +1098,9 @@ class SimBroker(Broker):
         self._unsettled = [(t, amount) for t, amount in self._unsettled if t > now]
         groups: dict[str, list[_Order]] = {}
         for order in self._orders.values():
-            if order.working:
-                groups.setdefault(order.request.instrument.key, []).append(order)
+            key = order.request.instrument.key
+            if order.working and key not in self._halted:  # nothing trades during a halt
+                groups.setdefault(key, []).append(order)
         for key in groups:
             self._series[key].ensure(cur_minute, minute)
         for m in range(cur_minute, minute + 1):
@@ -1116,7 +1230,7 @@ class SimBroker(Broker):
                 return 0.0
             qty = min(qty, pos.qty)
         elif qty > 0:
-            fee = self.estimate_commission(req.instrument, qty, price)
+            fee = self.estimate_commission(req.instrument, qty, price, Side.BUY)
             affordable = (self._cash - fee) / price
             if affordable < qty:
                 qty, cash_limited = affordable, True
@@ -1147,7 +1261,7 @@ class SimBroker(Broker):
         order.filled += qty
         order.notional += qty * price
         total_fee = self.estimate_commission(
-            req.instrument, order.filled, order.notional / order.filled
+            req.instrument, order.filled, order.notional / order.filled, req.side
         )
         fee = max(0.0, total_fee - order.commission)
         order.commission += fee

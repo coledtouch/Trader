@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from trader import fees
 from trader.backtest import (
     BacktestConfig,
     last_session_close,
@@ -11,8 +12,7 @@ from trader.backtest import (
     main,
     run_backtest,
 )
-from trader.broker.sim import ibkr_pro_fixed_commission
-from trader.models import AssetClass, Bar, BotSettings, Instrument, RiskLimits
+from trader.models import Bar, BotSettings, Instrument, RiskLimits, Side
 from trader.strategy.signals import Scanner
 
 NY = ZoneInfo("America/New_York")
@@ -76,17 +76,21 @@ def test_entry_next_open_and_stop_first_when_bar_hits_both():
     assert trade.exit_price == pytest.approx(cand.suggested_stop * 0.9995)
     # 2% of $10,000 risk is capped by max position (50%) and max notional ($5,000)
     assert trade.qty == int(5000 / entry)
-    fees = ibkr_pro_fixed_commission(AssetClass.STOCK, trade.qty, entry)
-    fees += ibkr_pro_fixed_commission(AssetClass.STOCK, trade.qty, trade.exit_price)
-    assert trade.commission == pytest.approx(fees)
-    assert trade.pnl == pytest.approx((trade.exit_price - entry) * trade.qty - fees)
+    # IBKR Pro Tiered by default; the sale also pays the SEC fee and FINRA TAF
+    commission = fees.estimate_commission(STOCK, trade.qty, entry, Side.BUY, "tiered")
+    commission += fees.estimate_commission(STOCK, trade.qty, trade.exit_price, Side.SELL, "tiered")
+    assert trade.commission == pytest.approx(commission)
+    assert trade.gross_pnl == pytest.approx((trade.exit_price - entry) * trade.qty)
+    assert trade.pnl == pytest.approx(trade.gross_pnl - commission)
     assert trade.slippage == pytest.approx(
         (entry - 101.1 + cand.suggested_stop - trade.exit_price) * trade.qty
     )
     assert trade.r_multiple < -1  # a full stop plus costs
     stats = result.stats()
     assert stats["trades"] == 1 and stats["losses"] == 1 and stats["win_rate_pct"] == 0
-    assert stats["fees"] == pytest.approx(fees)
+    assert stats["fees"] == stats["fees_per_trade"] == pytest.approx(commission)
+    assert stats["gross_pnl"] == pytest.approx(trade.gross_pnl)
+    assert stats["fees_pct_of_gross_profit"] is None  # a loss: no gross profit to share
     assert stats["pre_cost_pnl"] == pytest.approx(trade.pnl + trade.commission + trade.slippage)
     assert stats["total_pnl"] == pytest.approx(trade.pnl)
     assert stats["ending_equity"] == pytest.approx(10_000 + trade.pnl)
@@ -107,6 +111,9 @@ def test_target_fill_is_a_limit_without_slippage():
     stats = result.stats()
     assert stats["win_rate_pct"] == 100 and stats["profit_factor"] is None
     assert stats["days_hitting_target"] == 1
+    assert stats["fees_pct_of_gross_profit"] == pytest.approx(
+        trade.commission / trade.gross_pnl * 100
+    )
     assert result.daily_pnl[TODAY] == pytest.approx(trade.pnl)
 
 
@@ -132,7 +139,8 @@ def test_stocks_are_flat_before_the_close():
 
 
 def test_small_account_fees_block_the_trade_honestly():
-    # Defaults: $500 equity, $250 max order -> 2 shares; $2 round trip vs ~$1.7 reward.
+    # Defaults: $500 equity, $250 max order -> 2 shares; ~$0.72 tiered round trip is more
+    # than 25% of the ~$1.7 reward.
     result = run_backtest(
         [(STOCK, with_after([(101.1, 103.0, 100.0, 101.0, 30_000)]))],
         BotSettings(),
@@ -140,6 +148,20 @@ def test_small_account_fees_block_the_trade_honestly():
     )
     assert result.trades == []
     assert result.skipped == {"round-trip fees too high vs reward": 1}
+
+
+def test_commission_plan_changes_the_fees():
+    data = [(STOCK, with_after([(101.1, 103.0, 100.0, 101.0, 30_000)]))]
+    by_plan = {}
+    for plan in ("tiered", "fixed"):
+        cfg = BacktestConfig(starting_equity=10_000, commission_plan=plan)
+        [trade] = run_backtest(data, BIG, cfg).trades
+        expected = fees.estimate_commission(STOCK, trade.qty, trade.entry_price, Side.BUY, plan)
+        expected += fees.estimate_commission(STOCK, trade.qty, trade.exit_price, Side.SELL, plan)
+        assert trade.commission == pytest.approx(expected)
+        by_plan[plan] = trade
+    assert by_plan["tiered"].qty == by_plan["fixed"].qty
+    assert by_plan["tiered"].commission != by_plan["fixed"].commission
 
 
 def test_size_never_depends_on_the_daily_target():
@@ -222,7 +244,23 @@ def test_main_with_csv_prints_costs(tmp_path, capsys):
     assert "TEST" in out and "orb_breakout" in out
     for label in ("P&L before costs", "Commissions", "Slippage", "Net P&L", "Days >= $100.00"):
         assert label in out
+    assert "IBKR Pro Tiered fees" in out
+    assert "per trade" in out and "no gross profit to pay them from" in out  # a stopped trade
     assert "too few to tell skill from luck" in out
+
+    cand = signal()
+    win = [(101.1, cand.suggested_target + 0.3, 100.9, 101.8, 30_000)]
+    lines = ["ts,open,high,low,close,volume"]
+    lines += [
+        f"{b.ts.isoformat()},{b.open},{b.high},{b.low},{b.close},{b.volume}"
+        for b in with_after(win)
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+    args = ["--csv", str(path), "--equity", "10000", "--max-notional", "5000", "--plan", "fixed"]
+    assert main([*args, "--trades"]) == 0
+    out = capsys.readouterr().out
+    assert "IBKR Pro Fixed fees" in out
+    assert "gross profit (before commissions)" in out and "of gross)" in out
 
 
 def test_main_synthetic_json(capsys):
@@ -233,7 +271,17 @@ def test_main_synthetic_json(capsys):
     assert code == 0
     stats = payload["stats"]
     assert stats["trading_days"] == 2 and stats["target_usd"] == 50
-    for key in ("trades", "win_rate_pct", "avg_r", "profit_factor", "fees", "slippage"):
+    for key in (
+        "trades",
+        "win_rate_pct",
+        "avg_r",
+        "profit_factor",
+        "fees",
+        "fees_per_trade",
+        "fees_pct_of_gross_profit",
+        "gross_pnl",
+        "slippage",
+    ):
         assert key in stats
     assert stats["max_drawdown"] >= 0
 
@@ -243,6 +291,8 @@ def test_main_reports_bad_input(tmp_path, capsys):
     assert "error" in capsys.readouterr().err
     with pytest.raises(SystemExit):
         main(["--equity", "-5"])
+    with pytest.raises(SystemExit):
+        main(["--plan", "lite"])  # IBKR Lite has no API access
 
 
 def test_daily_loss_limit_halts_and_flattens():

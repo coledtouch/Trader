@@ -13,7 +13,9 @@ Mirrored from the live RiskManager so the numbers reflect what the bot could act
 do: max position %, max order notional, cash (no borrowing), round-trip fees vs reward,
 minimum reward:risk after slippage, trades per day, the daily loss limit (halt, and
 flatten when configured), stop-at-target, and half size after a losing streak. Size
-never depends on being behind the daily target.
+never depends on being behind the daily target. Commissions come from `trader.fees`
+(IBKR Pro Tiered by default, or Fixed; sells include regulatory fees) and are reported
+per trade and as a share of the gross (pre-commission) profit.
 
 Data: a CSV (columns ts,open,high,low,close,volume; ISO timestamps; one instrument) or
 SimBroker synthetic history. Synthetic data is a random walk: it exercises mechanics
@@ -38,9 +40,20 @@ from itertools import pairwise
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from trader import fees
 from trader.broker.base import BrokerError
-from trader.broker.sim import SimBroker, ibkr_pro_fixed_commission
-from trader.models import HARD_CAPS, AssetClass, Bar, BotSettings, Candidate, Instrument, utcnow
+from trader.broker.sim import SimBroker
+from trader.fees import Plan
+from trader.models import (
+    HARD_CAPS,
+    AssetClass,
+    Bar,
+    BotSettings,
+    Candidate,
+    Instrument,
+    Side,
+    utcnow,
+)
 from trader.strategy.signals import Scanner
 
 NY = ZoneInfo("America/New_York")
@@ -59,6 +72,7 @@ class BacktestConfig:
     target_usd: float = 100.0  # daily target for the report; never affects sizing
     allow_fractional: bool = False  # fractional stock shares
     lookback_sessions: int = 2  # history the scanner sees, like the engine's "2 D" request
+    commission_plan: Plan = "tiered"  # IBKR Pro pricing plan for stock commissions
 
 
 @dataclass(frozen=True)
@@ -77,9 +91,14 @@ class Trade:
     exit_reason: str
 
     @property
+    def gross_pnl(self) -> float:
+        """Fill-to-fill P&L before commissions (slippage is already in the fill prices)."""
+        return (self.exit_price - self.entry_price) * self.qty
+
+    @property
     def pnl(self) -> float:
         """Net P&L: fill-to-fill minus commissions."""
-        return (self.exit_price - self.entry_price) * self.qty - self.commission
+        return self.gross_pnl - self.commission
 
     @property
     def r_multiple(self) -> float:
@@ -105,9 +124,10 @@ class BacktestResult:
         pnls = [t.pnl for t in trades]
         gross_win = sum(p for p in pnls if p > 0)
         gross_loss = -sum(p for p in pnls if p <= 0)
-        fees = sum(t.commission for t in trades)
+        commissions = sum(t.commission for t in trades)
         slippage = sum(t.slippage for t in trades)
         net = sum(pnls)
+        gross = net + commissions
         peak = self.config.starting_equity
         max_dd = max_dd_pct = 0.0
         for _, equity in self.equity_curve:
@@ -123,8 +143,11 @@ class BacktestResult:
             "win_rate_pct": sum(1 for p in pnls if p > 0) / len(trades) * 100 if trades else None,
             "avg_r": statistics.fmean(t.r_multiple for t in trades) if trades else None,
             "profit_factor": gross_win / gross_loss if gross_loss > 0 else None,
-            "pre_cost_pnl": net + fees + slippage,
-            "fees": fees,
+            "pre_cost_pnl": gross + slippage,
+            "gross_pnl": gross,
+            "fees": commissions,
+            "fees_per_trade": commissions / len(trades) if trades else None,
+            "fees_pct_of_gross_profit": commissions / gross * 100 if gross > 0 else None,
             "slippage": slippage,
             "total_pnl": net,
             "starting_equity": start,
@@ -387,13 +410,14 @@ class _Backtest:
         else:
             step = 1e-4 if instrument.asset_class == AssetClass.STOCK else 1e-6
         qty = math.floor(qty / step + 1e-9) * step
-        while (
-            qty > 0
-            and qty * entry + ibkr_pro_fixed_commission(instrument.asset_class, qty, entry)
-            > self.cash + 1e-9
+        while qty > 0 and qty * entry + self._fee(instrument, qty, entry, Side.BUY) > (
+            self.cash + 1e-9
         ):
             qty = round(qty - step, 6)
         return max(qty, 0.0)
+
+    def _fee(self, instrument: Instrument, qty: float, price: float, side: Side) -> float:
+        return fees.estimate_commission(instrument, qty, price, side, self.config.commission_plan)
 
     def _enter(self, feed: _Feed, i: int) -> None:
         pending, self.pending = self.pending, None
@@ -414,8 +438,9 @@ class _Backtest:
         if qty <= 0:
             self.skipped["position size rounds to zero"] += 1
             return
-        fee = ibkr_pro_fixed_commission(feed.instrument.asset_class, qty, entry)
-        if 2 * fee > self.limits.max_fee_to_reward_pct / 100 * (target - entry) * qty:
+        fee = self._fee(feed.instrument, qty, entry, Side.BUY)
+        round_trip = fee + self._fee(feed.instrument, qty, target, Side.SELL)
+        if round_trip > self.limits.max_fee_to_reward_pct / 100 * (target - entry) * qty:
             self.skipped["round-trip fees too high vs reward"] += 1
             return
         self.cash -= qty * entry + fee
@@ -452,8 +477,7 @@ class _Backtest:
         if pos is None:
             return
         price = ref * (1 - self.slip) if market else ref
-        asset = pos.feed.instrument.asset_class
-        fee = ibkr_pro_fixed_commission(asset, pos.qty, price)
+        fee = self._fee(pos.feed.instrument, pos.qty, price, Side.SELL)
         self.cash += pos.qty * price - fee
         trade = Trade(
             instrument=pos.feed.instrument,
@@ -515,6 +539,12 @@ def _usd(value: float, signed: bool = True) -> str:
     return f"{sign}${abs(value):,.2f}"
 
 
+def _share_of(cost: float, gross: float) -> str:
+    """Cost relative to a positive gross profit: "16% of" or, beyond it, "8.5x"."""
+    ratio = cost / gross
+    return f"{ratio:.0%} of" if ratio <= 1 else f"{ratio:,.1f}x"
+
+
 def format_report(
     result: BacktestResult, source: str, *, synthetic: bool, show_trades: bool = False
 ) -> str:
@@ -540,8 +570,9 @@ def format_report(
         f"{lim.max_trades_per_day} trades/day"
     )
     out.append(
-        f"           slippage {cfg.slippage_bps:g} bps per market fill; IBKR Pro Fixed fees; "
-        "stop first if a bar hits both; stocks flat by 15:50 ET"
+        f"           slippage {cfg.slippage_bps:g} bps per market fill; IBKR Pro "
+        f"{cfg.commission_plan.title()} fees; stop first if a bar hits both; stocks flat by "
+        "15:50 ET"
     )
 
     out += ["", "Results"]
@@ -559,6 +590,16 @@ def format_report(
         out.append("  Trades             0 (no signal passed the threshold and the risk caps)")
     out.append(f"  P&L before costs   {_usd(s['pre_cost_pnl'])}")
     out.append(f"  Commissions        {_usd(-s['fees'])}")
+    if trades:
+        gross = s["gross_pnl"]
+        out.append(
+            f"    per trade        {_usd(s['fees_per_trade'], False)} round trip; "
+            + (
+                f"{_share_of(s['fees'], gross)} the {_usd(gross)} gross profit (before commissions)"
+                if gross > 0
+                else f"no gross profit to pay them from ({_usd(gross)} before commissions)"
+            )
+        )
     out.append(f"  Slippage           {_usd(-s['slippage'])}")
     out.append(
         f"  Net P&L            {_usd(s['total_pnl'])} ({s['return_pct']:+.2f}%: "
@@ -625,10 +666,11 @@ def format_report(
         out += ["", "Trades"]
         for t in result.trades:
             when = t.entry_ts.astimezone(NY).strftime("%Y-%m-%d %H:%M")
+            share = f" ({_share_of(t.commission, t.gross_pnl)} gross)" if t.gross_pnl > 0 else ""
             out.append(
                 f"  {when} {t.instrument.key:<12} {t.setup:<15} qty {t.qty:g} "
                 f"{t.entry_price:.6g} -> {t.exit_price:.6g} ({t.exit_reason}) {_usd(t.pnl)} "
-                f"{t.r_multiple:+.2f}R fees {_usd(t.commission, False)} "
+                f"{t.r_multiple:+.2f}R fees {_usd(t.commission, False)}{share} "
                 f"slip {_usd(t.slippage, False)}"
             )
     return "\n".join(out)
@@ -698,6 +740,12 @@ def _parser() -> argparse.ArgumentParser:
         "--max-notional", type=_positive, help="max order notional USD (default: settings)"
     )
     p.add_argument("--fractional", action="store_true", help="allow fractional stock shares")
+    p.add_argument(
+        "--plan",
+        choices=["tiered", "fixed"],
+        default="tiered",
+        help="IBKR Pro commission plan (default tiered)",
+    )
     p.add_argument("--trades", action="store_true", help="list every trade")
     p.add_argument("--json", action="store_true", help="print the statistics as JSON")
     return p
@@ -744,6 +792,7 @@ def main(argv: list[str] | None = None) -> int:
         slippage_bps=args.slippage_bps,
         target_usd=args.target,
         allow_fractional=args.fractional,
+        commission_plan=args.plan,
     )
     result = run_backtest(data, settings, config)
     if args.json:

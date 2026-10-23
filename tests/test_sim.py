@@ -3,9 +3,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from trader import fees
 from trader.broker import sim
 from trader.broker.base import BrokerError
-from trader.broker.sim import SimBroker, SymbolProfile, ibkr_pro_fixed_commission
+from trader.broker.sim import SimBroker, SymbolProfile
 from trader.models import (
     AssetClass,
     Instrument,
@@ -57,29 +58,48 @@ def thin_symbol(monkeypatch):
 
 # ---------------------------------------------------------------------------- commissions
 @pytest.mark.parametrize(
-    ("asset", "qty", "price", "expected"),
+    ("plan", "inst", "qty", "price", "side", "expected"),
     [
-        (AssetClass.STOCK, 100, 50.0, 1.00),  # $0.50 per-share -> $1.00 minimum
-        (AssetClass.STOCK, 1000, 20.0, 5.00),  # $0.005/share
-        (AssetClass.STOCK, 10, 5.0, 0.50),  # 1% of $50 caps below the minimum
-        (AssetClass.STOCK, 10_000, 0.5, 50.0),  # per-share == 1% cap
-        (AssetClass.CRYPTO, 1, 10_000.0, 18.0),  # 0.18%
-        (AssetClass.CRYPTO, 1, 500.0, 1.75),  # minimum
-        (AssetClass.CRYPTO, 1, 100.0, 1.00),  # 1% cap below the minimum
-        (AssetClass.STOCK, 0, 10.0, 0.0),
+        ("fixed", F, 100, 50.0, Side.BUY, 1.00),  # $0.50 per-share -> $1.00 minimum
+        ("fixed", F, 1000, 20.0, Side.BUY, 5.00),  # $0.005/share
+        ("fixed", F, 10, 5.0, Side.BUY, 0.50),  # 1% of $50 caps below the minimum
+        ("tiered", F, 20, 12.0, Side.BUY, 0.35 + 20 * 0.0032),  # $0.35 min + exchange/clearing
+        ("tiered", F, 1000, 20.0, Side.BUY, 3.5 + 1000 * 0.0032),
+        # sells add the SEC fee and FINRA TAF
+        ("tiered", F, 20, 12.0, Side.SELL, 0.35 + 20 * 0.0032 + 240 * 0.0000278 + 20 * 0.000166),
+        ("tiered", BTC, 1, 10_000.0, Side.BUY, 18.0),  # crypto 0.18%
+        ("fixed", BTC, 1, 500.0, Side.SELL, 1.75),  # minimum
+        ("tiered", BTC, 1, 100.0, Side.BUY, 1.00),  # 1% cap below the minimum
+        ("tiered", F, 0, 10.0, Side.BUY, 0.0),
     ],
 )
-def test_ibkr_pro_fixed_commission(asset, qty, price, expected):
-    assert ibkr_pro_fixed_commission(asset, qty, price) == pytest.approx(expected)
+def test_commissions_come_from_the_fee_module(plan, inst, qty, price, side, expected):
+    broker = SimBroker(commission_plan=plan, clock=FakeClock(WED_1100))
+    assert broker.estimate_commission(inst, qty, price, side) == pytest.approx(expected, abs=1e-4)
+    assert broker.estimate_commission(inst, qty, price, side) == fees.estimate_commission(
+        inst, qty, price, side, plan
+    )
 
 
 async def test_estimate_commission_and_capabilities():
     broker, _ = await make_broker()
-    assert broker.estimate_commission(F, 20, 11.0) == pytest.approx(1.0)
+    assert broker.commission_plan == "tiered"
+    assert broker.estimate_commission(F, 20, 11.0) == pytest.approx(0.35 + 20 * 0.0032)
     assert broker.supports_native_stops(SPY) is True
     assert broker.supports_native_stops(BTC) is False
     with pytest.raises(ValueError):
-        SimBroker(commission_model="tiered")
+        SimBroker(commission_plan="ibkr_pro_fixed")  # type: ignore[arg-type]
+
+
+async def test_fixed_plan_charges_fixed_commissions():
+    clock = FakeClock(WED_1100)
+    broker = SimBroker(starting_cash=500.0, clock=clock, commission_plan="fixed")
+    await broker.connect()
+    rec = await broker.place_order(buy(F, 20))
+    assert rec.commission == pytest.approx(1.0)
+    sale = await broker.place_order(sell(F, 20))
+    expected = fees.estimate_commission(F, 20, sale.avg_fill_price, Side.SELL, "fixed")
+    assert sale.commission == pytest.approx(expected) and expected > 1.0  # + regulatory fees
 
 
 # ---------------------------------------------------------------------------- account
@@ -109,8 +129,9 @@ async def test_deterministic_per_seed_and_base_prices():
     bars_a = await a.bars(BTC, "5 mins", "1 D")
     assert bars_a == await b.bars(BTC, "5 mins", "1 D")
     assert bars_a != await c.bars(BTC, "5 mins", "1 D")
-    assert (await a.quote(SPY)).last == 600.0
-    assert (await a.quote(BTC)).last == 65_000.0
+    assert (await a.quote(SPY)).last == 764.0
+    assert (await a.quote(BTC)).last == 81_700.0
+    assert (await a.quote(F)).last == 12.0
     unknown = Instrument(symbol="ZZZQ")
     price = (await a.quote(unknown)).last
     assert price == (await c.quote(unknown)).last  # stable hash-based base price
@@ -207,14 +228,15 @@ async def test_market_buy_pays_ask_plus_slippage_and_commission():
     assert rec.status == OrderStatus.FILLED
     assert rec.broker_order_id and rec.id is None
     assert rec.avg_fill_price >= quote.ask
-    assert rec.commission == pytest.approx(1.0)
+    fee = fees.estimate_commission(F, 20, rec.avg_fill_price)  # IBKR Pro Tiered
+    assert rec.commission == pytest.approx(fee)
     acct = await broker.account()
-    assert acct.cash == pytest.approx(500.0 - 20 * rec.avg_fill_price - 1.0)
+    assert acct.cash == pytest.approx(500.0 - 20 * rec.avg_fill_price - fee)
     [pos] = await broker.positions()
     assert pos.instrument == F and pos.qty == 20 and pos.avg_cost == rec.avg_fill_price
     assert pos.stop_loss is None
     [fill] = await broker.fills_since(WED_1100)
-    assert fill.side == Side.BUY and fill.qty == 20 and fill.commission == pytest.approx(1.0)
+    assert fill.side == Side.BUY and fill.qty == 20 and fill.commission == pytest.approx(fee)
 
 
 async def test_slippage_grows_as_liquidity_shrinks(thin_symbol):
@@ -244,7 +266,8 @@ async def test_partial_fills_on_thin_volume(thin_symbol):
     assert sum(f.qty for f in fills) == 30
     # Per-order commission: the minimum/maximum applies to the whole order, not each fill.
     assert sum(f.commission for f in fills) == pytest.approx(done.commission)
-    assert done.commission == pytest.approx(min(1.0, 0.01 * 30 * done.avg_fill_price), abs=1e-3)
+    expected = fees.estimate_commission(THIN, 30, done.avg_fill_price)
+    assert done.commission == pytest.approx(expected, abs=1e-3)
 
 
 async def test_no_shorting():
@@ -502,3 +525,125 @@ async def test_long_time_jump_with_working_orders():
     assert status.status == OrderStatus.SUBMITTED
     bars = await broker.bars(F, "5 mins", "5 D")
     assert bars[0].ts >= clock.t - timedelta(days=3)  # clamped to the retained history
+
+
+# ---------------------------------------------------------------------------- quote sizes
+async def test_quotes_carry_top_of_book_sizes(thin_symbol):
+    broker, _ = await make_broker()
+    liquid, thin, btc = [await broker.quote(i) for i in (F, THIN, BTC)]
+    for quote in (liquid, thin):
+        assert quote.bid_size >= 100 and quote.bid_size % 100 == 0  # round lots
+        assert quote.ask_size >= 100 and quote.ask_size % 100 == 0
+        assert not quote.halted
+    assert liquid.bid_size > 10 * thin.bid_size  # thin names show little size
+    assert 0 < btc.bid_size < 100 and 0 < btc.ask_size < 100
+    assert liquid.spread_pct < 0.3 < thin.spread_pct
+
+
+# ---------------------------------------------------------------------------- halts
+async def test_halt_freezes_the_quote_and_rejects_entries():
+    broker, clock = await make_broker()
+    before = await broker.quote(F)
+    broker.set_halted("F", True)
+    clock.t += timedelta(minutes=12)
+    quote = await broker.quote(F)
+    assert quote.halted and quote.last == before.last
+    assert quote.bid_size == quote.ask_size == 0
+    rec = await broker.place_order(buy(F, 5))
+    assert rec.status == OrderStatus.REJECTED and "halted" in rec.message
+    assert not (await broker.quote(SPY)).halted  # other symbols keep trading
+    bars = await broker.bars(F, "1 min", "3600 S")
+    assert bars[-1].ts < WED_1100  # no prints during the halt
+    broker.set_halted(F, False)
+    resumed = await broker.quote(F)
+    assert not resumed.halted and resumed.bid_size > 0
+    assert (await broker.place_order(buy(F, 5))).status == OrderStatus.FILLED
+
+
+async def test_stops_wait_for_the_reopen_and_fill_at_the_gap():
+    broker, clock = await make_broker()
+    price = (await broker.quote(F)).last
+    stop = round(price - 0.30, 2)
+    rec = await broker.place_order(buy(F, 20, stop_loss=stop))
+    broker.set_halted(F, True)
+    broker.set_price(F, price - 1.0)  # the book moves, but nothing trades while halted
+    clock.t += timedelta(minutes=10)
+    sl = await broker.order_status(f"{rec.broker_order_id}-SL")
+    assert sl.status == OrderStatus.SUBMITTED
+    assert [p.qty for p in await broker.positions()] == [20]
+    broker.set_halted(F, False, gap_pct=-35)  # reopens 35% below the halt price
+    sl = await broker.order_status(f"{rec.broker_order_id}-SL")
+    assert sl.status == OrderStatus.FILLED
+    assert sl.avg_fill_price <= (price - 1.0) * 0.65  # far worse than the stop
+    assert await broker.positions() == []
+    assert (await broker.account()).realized_pnl_today < -20 * (price - stop)
+
+
+async def test_exits_during_a_halt_wait_for_the_reopen():
+    broker, clock = await make_broker()
+    price = (await broker.quote(F)).last
+    await broker.place_order(buy(F, 20, stop_loss=round(price - 0.30, 2)))
+    broker.set_halted(F, True)
+    exit_order = await broker.close_position(F, "kill switch")
+    assert exit_order.status == OrderStatus.SUBMITTED  # queued, not rejected
+    clock.t += timedelta(minutes=5)
+    assert [p.qty for p in await broker.positions()] == [20]
+    broker.set_halted(F, False, gap_pct=-30)
+    done = await broker.order_status(exit_order.broker_order_id)
+    assert done.status == OrderStatus.FILLED
+    assert done.avg_fill_price <= price * 0.70
+    assert await broker.positions() == []
+
+
+def test_set_halted_validates_the_gap():
+    broker = SimBroker(clock=FakeClock(WED_1100))
+    with pytest.raises(ValueError):
+        broker.set_halted(F, False, gap_pct=-100)
+
+
+# ---------------------------------------------------------------------------- modify_stop
+async def test_modify_stop_raises_the_native_stop():
+    broker, _ = await make_broker()
+    price = (await broker.quote(F)).last
+    stop, target = round(price - 0.30, 2), round(price + 0.60, 2)
+    rec = await broker.place_order(buy(F, 20, stop_loss=stop, take_profit=target))
+    sl_id = f"{rec.broker_order_id}-SL"
+    assert await broker.modify_stop(F, price - 0.104) is True
+    moved = round(price - 0.10, 2)  # rounded UP to the tick
+    assert (await broker.order_status(sl_id)).request.stop_loss == pytest.approx(moved)
+    assert await broker.modify_stop(F, stop) is False  # never lowered
+    assert (await broker.order_status(sl_id)).request.stop_loss == pytest.approx(moved)
+    assert await broker.modify_stop(F, moved) is True  # already there
+    broker.set_price(F, price - 0.20)  # below the new stop, above the original one
+    sl = await broker.order_status(sl_id)
+    assert sl.status == OrderStatus.FILLED
+    assert (await broker.order_status(f"{rec.broker_order_id}-TP")).status == (
+        OrderStatus.CANCELLED
+    )
+
+
+async def test_modify_stop_above_the_market_exits_at_once():
+    broker, _ = await make_broker()
+    price = (await broker.quote(F)).last
+    rec = await broker.place_order(buy(F, 20, stop_loss=round(price - 0.30, 2)))
+    assert await broker.modify_stop(F, price + 0.05) is True
+    assert (await broker.order_status(f"{rec.broker_order_id}-SL")).status == OrderStatus.FILLED
+    assert await broker.positions() == []
+
+
+async def test_modify_stop_needs_a_native_stop_on_a_long():
+    broker, _ = await make_broker(cash=2000.0)
+    price = (await broker.quote(F)).last
+    assert await broker.modify_stop(F, price - 0.1) is False  # no position
+    await broker.place_order(buy(F, 5))  # no stop attached
+    assert await broker.modify_stop(F, price - 0.1) is False
+    await broker.place_order(buy(BTC, 0.005, stop_loss=1000.0))
+    assert await broker.modify_stop(BTC, 2000.0) is False  # crypto stops are engine-managed
+    pending = await broker.place_order(
+        buy(SPY, 1, OrderType.LIMIT, limit_price=700.0, stop_loss=690.0)
+    )
+    assert pending.status == OrderStatus.SUBMITTED
+    assert await broker.modify_stop(SPY, 695.0) is False  # entry not filled yet
+    assert await broker.modify_stop(F, float("nan")) is False
+    await broker.disconnect()
+    assert await broker.modify_stop(F, price - 0.1) is False

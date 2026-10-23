@@ -223,3 +223,121 @@ def test_snapshot_features():
     assert scanner.snapshot(STOCK, []) == {}
     few = scanner.snapshot(CRYPTO, make_bars(T0, [10.0, 10.5], 1.0))
     assert few["price"] == 10.5 and "rsi14" not in few
+
+
+# ----------------------------------------------------------------------------- volume spike
+def spike_bars(
+    *, multiple: float = 6.0, first: float = 20.05, drift: float = 0.02, today: int = 8, **kw
+) -> list[Bar]:
+    """A quiet prior session at 20.00, `today` bars drifting from `first`, then one bullish
+    bar (to 20.45) on `multiple` times the usual volume."""
+    prior = session(PRIOR_DAY, [20.0] * 78, 10_000, **kw)
+    closes = [first + drift * i for i in range(today)] + [20.45]
+    volumes = [10_000] * today + [10_000 * multiple]
+    return prior + session(TODAY, closes, volumes, **kw)
+
+
+def spike(candidates):
+    return next((c for c in candidates if c.setup == "volume_spike"), None)
+
+
+def test_volume_spike_triggers_for_stocks():
+    bars = spike_bars()
+    cand = spike(scan(bars))
+    assert cand is not None
+    assert_sane(cand)
+    f = cand.features
+    assert f["volume_multiple"] == pytest.approx(6.0)
+    assert cand.price > f["sma20"] and cand.price > f["sma50"]
+    assert f["session_open"] == pytest.approx(20.05)
+    assert "perf_20d_pct" not in f  # two sessions of history: the trend filter is skipped
+    assert cand.suggested_stop == pytest.approx(cand.price - 1.5 * f["atr14"], abs=0.011)
+    assert 0.5 <= cand.score <= 0.85
+    assert "6.0x" in cand.note
+
+
+def test_volume_spike_needs_three_times_the_volume():
+    assert spike(scan(spike_bars(multiple=2.5))) is None
+    assert spike(scan(spike_bars(multiple=3.0))) is not None
+
+
+def test_volume_spike_waits_for_the_open_to_settle():
+    early = spike_bars(today=2)  # the spike is the 09:40 bar
+    assert early[-1].ts.astimezone(NY).time() == time(9, 40)
+    assert spike(scan(early)) is None
+
+
+def test_volume_spike_needs_price_above_the_session_open():
+    faded = spike_bars(first=20.6, drift=-0.05)  # gapped up to 20.60, faded to 20.25
+    cand_features = Scanner(BotSettings()).snapshot(STOCK, faded)
+    assert cand_features["price"] > cand_features["sma20"]  # only the open check fails
+    assert spike(scan(faded)) is None
+
+
+def test_volume_spike_needs_price_above_sma20():
+    prior = session(PRIOR_DAY, [20.0] * 66 + [21.0] * 12, 10_000)
+    today = session(TODAY, [19.5, 19.6, 19.7, 19.8, 19.9, 19.95, 20.0, 20.05, 20.3],
+                    [10_000] * 8 + [60_000])  # fmt: skip
+    snap = Scanner(BotSettings()).snapshot(STOCK, prior + today)
+    assert snap["price"] < snap["sma20"]
+    assert spike(scan(prior + today)) is None
+
+
+@pytest.mark.parametrize(("wick", "inside"), [(0.1, True), (1.2, False), (0.005, False)])
+def test_volume_spike_needs_a_sane_atr(wick: float, inside: bool):
+    bars = spike_bars(wick=wick, drift=0.001)
+    atr_pct = Scanner(BotSettings()).snapshot(STOCK, bars)["atr_pct"]
+    assert (0.3 <= atr_pct <= 8.0) is inside
+    assert (spike(scan(bars)) is not None) is inside
+
+
+def crypto_spike_bars(start: float) -> list[Bar]:
+    """21 days of hourly bars trending from `start` to 20, a quiet day, then a spike."""
+    trend = [start + (20.0 - start) * i / 479 for i in range(480)]
+    quiet = [20.0 + 0.01 * i for i in range(24)]
+    closes = [*trend, *quiet, 20.73]
+    volumes = [100.0] * (len(closes) - 1) + [600.0]
+    out, prev = [], closes[0]
+    for i, (c, v) in enumerate(zip(closes, volumes, strict=True)):
+        ts = T0 + timedelta(hours=i)
+        out.append(Bar(ts=ts, open=prev, high=max(prev, c) + 0.2, low=min(prev, c) - 0.2,
+                       close=c, volume=v))  # fmt: skip
+        prev = c
+    return out
+
+
+def test_volume_spike_for_crypto_uses_the_20_day_trend():
+    rising = crypto_spike_bars(15.0)
+    cand = spike(scan(rising, inst=CRYPTO, now=rising[-1].ts + timedelta(minutes=30)))
+    assert cand is not None
+    assert_sane(cand)
+    assert cand.features["perf_20d_pct"] > 0
+    assert "24h open" in cand.note
+    falling = crypto_spike_bars(25.0)
+    now = falling[-1].ts + timedelta(minutes=30)
+    snap = Scanner(BotSettings()).snapshot(CRYPTO, falling)
+    assert snap["perf_20d_pct"] < 0 and snap["price"] > snap["sma50"]
+    assert spike(scan(falling, inst=CRYPTO, now=now)) is None
+
+
+def stock_history(start: float, sessions: int = 21) -> list[Bar]:
+    """`sessions` quiet weekday sessions before PRIOR_DAY's close, stepping from `start` to
+    20.00, followed by the spike scenario."""
+    days, day = [], PRIOR_DAY
+    while len(days) < sessions:
+        if day.weekday() < 5:
+            days.append(day)
+        day -= timedelta(days=1)
+    days.reverse()
+    levels = [start + (20.0 - start) * i / (sessions - 1) for i in range(sessions)]
+    history = [b for d, level in zip(days[:-1], levels, strict=False) for b in
+               session(d, [level] * 78, 10_000)]  # fmt: skip
+    return history + spike_bars()
+
+
+@pytest.mark.parametrize(("start", "triggers"), [(15.0, True), (25.0, False)])
+def test_volume_spike_for_stocks_uses_the_20_session_trend(start: float, triggers: bool):
+    bars = stock_history(start)
+    snap = Scanner(BotSettings()).snapshot(STOCK, bars)
+    assert (snap["perf_20d_pct"] > 0) is triggers
+    assert (spike(scan(bars)) is not None) is triggers
