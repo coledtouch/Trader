@@ -394,3 +394,26 @@ async def test_disabling_asset_class_clears_its_unheld_quote_cache(db, config) -
     db.save_settings(settings)
     h.engine.reload_settings()
     assert h.engine.status().quote_health == []
+
+
+async def test_paper_switch_allows_delayed_entries_and_tags_the_trade(db, config) -> None:
+    h = await harness(db, config, mode=Mode.PAPER, risk={"allow_delayed_paper_entries": True})
+    h.broker.delayed = True
+    await h.engine.run_cycle()
+    assert h.decider.calls and h.broker.placed  # the AI was asked and the entry went out
+    status = h.engine.status()
+    assert "paper entries are allowed" in (status.data_warning or "")
+    h.broker.set_price("F", 9.0)  # through the stop: the trade closes at a loss
+    for _ in range(3):
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    [trade] = db.list_trades(limit=5)
+    assert trade.delayed_data is True
+
+
+async def test_live_ignores_the_paper_delayed_switch(db, config) -> None:
+    h = await harness(db, config, mode=Mode.LIVE, risk={"allow_delayed_paper_entries": True})
+    h.broker.delayed = True
+    await h.engine.run_cycle()
+    assert not h.broker.placed
+    assert "delayed market data" in db.list_signals()[0].skip_reason

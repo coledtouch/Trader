@@ -1056,3 +1056,17 @@ from the stop or target when this client has no order row for that perm id.
   the database exists, copy it with the SQLite backup API from a read-only connection in a
   worker thread, `PRAGMA integrity_check` the copy, write mode 600 in a 700 directory, keep
   the newest `backup_keep` (default 14). `python -m trader backup` does the same on demand.
+
+### 7.12 Paper-only entries on delayed data (owner decision, 2026-10-24)
+
+- `RiskLimits.allow_delayed_paper_entries` (default false; in `BOOL_TRUE_IS_LOOSER`, so
+  turning it on needs fresh TOTP). `RiskManager._check_entry` skips the delayed-data
+  block only when `mode == PAPER` and the flag is set; LIVE and SIM always block. The
+  pre-AI eligibility pass (`Engine._not_actionable`) goes through the same check.
+- At entry the engine stores `delayed_data: 1.0` in the position extras when the feed or
+  the instrument's latest quote is delayed; `_journal_trade` copies it to
+  `TradeRecord.delayed_data` (new `trades.delayed_data` column, migrated with default 0).
+- `performance_report` counts `delayed_data_trades`, warns, and `_setup_report` leaves
+  those trades out of the per-setup statistics. The dashboard data warning says paper
+  entries are allowed instead of "blocked".
+

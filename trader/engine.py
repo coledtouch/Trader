@@ -1217,8 +1217,16 @@ class Engine:
             for q in self._latest_quotes.values()
             if q.instrument.asset_class == AssetClass.STOCK and q.delayed
         )
-        if self.broker.data_delayed:
-            warnings.append("Delayed stock market data: stock entries are blocked in all modes")
+        paper_allowed = (
+            self.broker.mode == Mode.PAPER and self.risk.limits.allow_delayed_paper_entries
+        )
+        if paper_allowed and (self.broker.data_delayed or delayed):
+            warnings.append(
+                "Delayed stock market data: paper entries are allowed by your setting. They "
+                "test the order plumbing; their results are kept out of the edge statistics"
+            )
+        elif self.broker.data_delayed:
+            warnings.append("Delayed stock market data: stock entries are blocked")
         elif delayed:
             warnings.append(
                 f"Delayed market data for {', '.join(delayed)}: stock entries are blocked"
@@ -2210,6 +2218,7 @@ class Engine:
             decision_id=meta.get("decision_id") if meta else None,
             r_multiple=r_multiple,
             exit_reason=self._exit_reason(key, trip, meta),
+            delayed_data=bool(self._extra(key).get("delayed_data")),
         )
         record.id = self.db.insert_trade(record)
         assert self._last_exit is not None
@@ -2901,10 +2910,11 @@ class Engine:
             decision_id=order.decision_id,
             setup=order.setup,
         )
-        self.db.set_kv(
-            EXTRA_PREFIX + key,
-            json.dumps({"initial_stop": stop, "unit_risk": entry - stop, "best_price": entry}),
-        )
+        extra = {"initial_stop": stop, "unit_risk": entry - stop, "best_price": entry}
+        latest = self._latest_quotes.get(key)
+        if self.broker.data_delayed or (latest is not None and latest.delayed):
+            extra["delayed_data"] = 1.0  # paper-only entry on delayed data (RiskLimits)
+        self.db.set_kv(EXTRA_PREFIX + key, json.dumps(extra))
         try:
             placed = await self.broker.place_order(order)
         except Exception as exc:

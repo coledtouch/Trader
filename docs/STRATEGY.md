@@ -75,6 +75,14 @@ per-symbol quote blocks stock entries in PAPER and LIVE (also SIM if a supplied 
 flagged delayed). It also removes that candidate from paid entry analysis. Existing
 positions keep their exit management; the bot may still pay for an exit review.
 
+**Exception, paper only:** Settings > Risk limits > "Paper: trade on delayed prices"
+(`risk.allow_delayed_paper_entries`, off by default, turning it on needs a 2FA code) lets
+the bot enter on delayed data in PAPER mode, to exercise the order plumbing (brackets,
+stop moves) before real-time data is subscribed. Decisions then use prices about 15
+minutes old while paper fills use current ones, so those trades say nothing about an
+edge: each is stored with `delayed_data` and left out of the per-setup results (they still
+count in the account totals). LIVE ignores the switch and always blocks.
+
 The quote-age table reports elapsed time since the broker/transport timestamp. It is
 not a measurement of how far an exchange-delayed price is behind the market: a quote
 received one second ago can still be a delayed quote. Fresh age and a usable two-sided

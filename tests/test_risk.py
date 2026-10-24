@@ -713,3 +713,17 @@ def test_dollar_target_applies_when_the_percent_is_zero() -> None:
     off = RiskLimits(daily_profit_target_pct=0.0, daily_profit_target_usd=0.0)
     assert off.profit_target_usd(500) == 0.0
     assert RiskManager(off).halt_reason(account=account(equity=900.0), day=day()) is None
+
+
+def test_paper_can_allow_delayed_stock_entries_but_live_never() -> None:
+    """Owner choice: a paper-only switch lets the bot test its order plumbing on the free
+    delayed data. Live always needs real-time data."""
+    allow = RiskLimits(allow_delayed_paper_entries=True)
+    paper = run_check(mode=Mode.PAPER, delayed=True, limits=allow)
+    assert not any("delayed" in r for r in paper.reasons), paper.reasons
+    quoted = run_check(mode=Mode.PAPER, q=quote(delayed=True), limits=allow)
+    assert not any("delayed" in r for r in quoted.reasons), quoted.reasons
+    assert blocked_with(run_check(mode=Mode.LIVE, delayed=True, limits=allow), "delayed market")
+    assert blocked_with(run_check(mode=Mode.SIM, delayed=True, limits=allow), "delayed market")
+    off = run_check(mode=Mode.PAPER, delayed=True)
+    assert blocked_with(off, "paper can allow them in Settings")

@@ -137,7 +137,8 @@ CREATE TABLE IF NOT EXISTS trades (
     setup TEXT,
     decision_id INTEGER,
     r_multiple REAL,
-    exit_reason TEXT NOT NULL DEFAULT ''
+    exit_reason TEXT NOT NULL DEFAULT '',
+    delayed_data INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS daily_stats (
     day TEXT PRIMARY KEY,
@@ -175,6 +176,7 @@ MIGRATIONS: tuple[tuple[str, str, str], ...] = (
     ("decisions", "vote_failures", "TEXT"),
     ("research_frames", "cohort", "TEXT"),
     ("research_frames", "account_id", "TEXT"),
+    ("trades", "delayed_data", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -693,8 +695,8 @@ class Database:
     def insert_trade(self, tr: TradeRecord) -> int:
         cur = self._exec(
             "INSERT INTO trades(instrument, qty, entry_price, exit_price, entry_ts, exit_ts, pnl,"
-            " commission, setup, decision_id, r_multiple, exit_reason)"
-            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " commission, setup, decision_id, r_multiple, exit_reason, delayed_data)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 tr.instrument.key,
                 tr.qty,
@@ -708,6 +710,7 @@ class Database:
                 tr.decision_id,
                 tr.r_multiple,
                 tr.exit_reason,
+                int(tr.delayed_data),
             ),
         )
         return int(cur.lastrowid)
@@ -735,6 +738,7 @@ class Database:
                 decision_id=r["decision_id"],
                 r_multiple=r["r_multiple"],
                 exit_reason=r["exit_reason"],
+                delayed_data=bool(r["delayed_data"]),
             )
             for r in rows
         ]

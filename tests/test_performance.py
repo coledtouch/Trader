@@ -240,3 +240,53 @@ def test_metadata_cohort_does_not_recombine_separate_experiments(db):
     assert window["first_id"] == 4
     assert window["last_id"] == 5
     assert db.research_window(NOW, "OTHER") is None
+
+
+def test_delayed_data_trades_are_kept_out_of_setup_stats(db):
+    """Paper trades entered on delayed data test the plumbing, not the edge."""
+    db.upsert_day(DayStats(day="2026-10-23", start_equity=600, end_equity=615))
+    db.insert_trade(trade(pnl=8.0))
+    db.insert_trade(trade(pnl=7.0).model_copy(update={"delayed_data": True}))
+    stored = db.list_trades(limit=10)
+    assert sorted(t.delayed_data for t in stored) == [False, True]
+    settings = BotSettings()
+    settings.risk.allow_delayed_paper_entries = True
+    status = EngineStatus(day="2026-10-23", mode="paper", equity=615, data_delayed=True)
+    report = performance_report(db, settings, status, NOW)
+    assert report["closed_trades"] == 2 and report["delayed_data_trades"] == 1
+    assert [(s["setup"], s["trades"], s["net_pnl"]) for s in report["setup_stats"]] == [
+        ("trend_pullback", 1, 8.0)
+    ]
+    assert any("entered on delayed data" in w for w in report["warnings"])
+    assert any("paper entries are allowed" in w for w in report["warnings"])
+
+
+def test_old_trades_table_gains_the_delayed_column(tmp_path):
+    import sqlite3
+
+    from trader.db import Database
+
+    path = tmp_path / "old.db"
+    old = sqlite3.connect(path)
+    old.execute(
+        "CREATE TABLE trades (id INTEGER PRIMARY KEY AUTOINCREMENT, instrument TEXT NOT NULL,"
+        " qty REAL NOT NULL, entry_price REAL NOT NULL, exit_price REAL NOT NULL,"
+        " entry_ts TEXT NOT NULL, exit_ts TEXT NOT NULL, pnl REAL NOT NULL,"
+        " commission REAL NOT NULL DEFAULT 0, setup TEXT, decision_id INTEGER,"
+        " r_multiple REAL, exit_reason TEXT NOT NULL DEFAULT '')"
+    )
+    old.execute(
+        "INSERT INTO trades(instrument, qty, entry_price, exit_price, entry_ts, exit_ts, pnl)"
+        " VALUES('STK:F', 10, 10, 11, '2026-10-22T14:00:00+00:00',"
+        " '2026-10-22T15:00:00+00:00', 8)"
+    )
+    old.commit()
+    old.close()
+    db = Database(path)
+    try:
+        [kept] = db.list_trades(limit=5)
+        assert kept.pnl == 8 and kept.delayed_data is False
+        db.insert_trade(trade().model_copy(update={"delayed_data": True}))
+        assert sum(t.delayed_data for t in db.list_trades(limit=5)) == 1
+    finally:
+        db.close()

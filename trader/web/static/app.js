@@ -1741,6 +1741,10 @@
     'risk.allow_leveraged_etfs': {
       label: 'Allow leveraged and inverse ETFs', help: 'Not recommended for a small account.',
     },
+    'risk.allow_delayed_paper_entries': {
+      label: 'Paper: trade on delayed prices',
+      help: 'Paper account only. Lets the bot buy on the free 15-minute-delayed prices so the order plumbing gets tested. Those trades are not evidence of an edge and are left out of the per-setup results. Live trading always needs real-time data.',
+    },
     'exits.time_stop_minutes': {
       label: 'Time stop', unit: 'minutes', int: true, min: 0, max: 1440,
       help: 'Close a trade that has not reached the minimum R by then.',

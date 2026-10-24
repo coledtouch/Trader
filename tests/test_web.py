@@ -199,7 +199,7 @@ def test_healthz_and_no_docs(env):
         assert env.client.get(path).status_code == 404
 
 
-@pytest.mark.parametrize("asset", ["app.js?v=9", "login.js?v=9", "styles.css?v=9", "sw.js"])
+@pytest.mark.parametrize("asset", ["app.js?v=10", "login.js?v=10", "styles.css?v=10", "sw.js"])
 def test_executable_shell_assets_revalidate_on_deploy(env, asset):
     response = env.client.get(f"/static/{asset}")
     assert response.status_code == 200
@@ -673,6 +673,7 @@ def test_loosened_fields_rules():
     assert changed(min_reward_risk=1.0) == ["risk.min_reward_risk"]
     assert changed(halt_cooldown_minutes=0) == ["risk.halt_cooldown_minutes"]
     assert changed(allow_leveraged_etfs=True) == ["risk.allow_leveraged_etfs"]
+    assert changed(allow_delayed_paper_entries=True) == ["risk.allow_delayed_paper_entries"]
     assert changed(stop_trading_at_target=False) == ["risk.stop_trading_at_target"]
     assert changed(flatten_on_halt=False) == ["risk.flatten_on_halt"]
     assert changed(max_spread_pct=0.2) == []

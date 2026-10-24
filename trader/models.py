@@ -307,6 +307,11 @@ class RiskLimits(BaseModel):
     max_spread_pct: float = Field(default=0.3, gt=0)  # skip entries with wider bid/ask spreads
     halt_cooldown_minutes: int = Field(default=15, ge=0)  # no entries this long after a halt
     allow_leveraged_etfs: bool = False  # leveraged/inverse ETPs (TQQQ, SQQQ, UVXY, ...)
+    # PAPER only: allow stock entries on delayed (~15 min) market data. Off by default:
+    # such fills happen at current prices on decisions made from stale ones, so the
+    # trades test the plumbing (brackets, stop moves) and are kept out of the edge
+    # statistics (TradeRecord.delayed_data). LIVE always blocks entries on delayed data.
+    allow_delayed_paper_entries: bool = False
 
     @model_validator(mode="before")
     @classmethod
@@ -408,7 +413,7 @@ LOWER_IS_LOOSER = {
     "halt_cooldown_minutes",
 }
 # Boolean risk fields where switching to True loosens, and where switching to False loosens.
-BOOL_TRUE_IS_LOOSER = {"allow_leveraged_etfs"}
+BOOL_TRUE_IS_LOOSER = {"allow_leveraged_etfs", "allow_delayed_paper_entries"}
 BOOL_FALSE_IS_LOOSER = {"stop_trading_at_target", "flatten_on_halt"}
 
 # Leveraged and inverse exchange-traded products. Blocked unless allow_leveraged_etfs is True.
@@ -538,6 +543,8 @@ class TradeRecord(BaseModel):
     decision_id: int | None = None
     r_multiple: float | None = None  # pnl / initial risk
     exit_reason: str = ""
+    # Entered on delayed market data (paper only, see RiskLimits): not evidence of an edge.
+    delayed_data: bool = False
 
 
 class QuoteHealth(BaseModel):

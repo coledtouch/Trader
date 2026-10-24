@@ -37,8 +37,13 @@ def monthly_fraction(start: datetime, end: datetime) -> float:
 
 
 def _setup_report(trades: list[TradeRecord]) -> list[dict[str, Any]]:
+    """Per-setup results of trades entered on real-time data. Paper trades entered on
+    delayed data (RiskLimits.allow_delayed_paper_entries) only test the order plumbing,
+    so they are left out (counted separately by performance_report)."""
     grouped: dict[str, list[TradeRecord]] = defaultdict(list)
     for trade in trades:
+        if trade.delayed_data:
+            continue
         grouped[trade.setup or "unclassified"].append(trade)
     result = []
     for setup, items in sorted(grouped.items()):
@@ -109,9 +114,15 @@ def performance_report(
     if current.mode == Mode.SIM:
         warnings.append("Synthetic simulator results test mechanics, not market profitability.")
     if current.data_delayed:
-        warnings.append(
-            "Delayed data: stock entry analysis is paused; signals are diagnostics only."
-        )
+        if current.mode == Mode.PAPER and settings.risk.allow_delayed_paper_entries:
+            warnings.append(
+                "Delayed data: paper entries are allowed by your setting. Those trades test "
+                "the order plumbing and are left out of the per-setup results."
+            )
+        else:
+            warnings.append(
+                "Delayed data: stock entry analysis is paused; signals are diagnostics only."
+            )
     if epoch is not None and epoch > datetime.combine(
         epoch.astimezone(NY).date(), datetime.min.time(), NY
     ):
@@ -144,6 +155,12 @@ def performance_report(
             previous_day, previous_end = row.day, end
     trading_pnl = sum(pnl for _, pnl in valid)
     trades = [t for t in db.list_trades(limit=100_000, since=since) if t.exit_ts <= now]
+    delayed_trades = sum(1 for t in trades if t.delayed_data)
+    if delayed_trades:
+        warnings.append(
+            f"{delayed_trades} trade(s) were entered on delayed data (paper): they count in the "
+            "account totals but are left out of the per-setup results."
+        )
     ai_cost = db.decision_cost(since, now)
     history_start = (
         datetime.combine(
@@ -200,6 +217,7 @@ def performance_report(
         "known_cost_pnl": round(known_net, 4),
         "all_in_pnl": round(known_net, 4) if configured and valid else None,
         "closed_trades": len(trades),
+        "delayed_data_trades": delayed_trades,
         "net_expectancy": round(sum(t.pnl for t in trades) / len(trades), 4) if trades else None,
         "profit_factor": round(positive / negative, 4) if negative else None,
         "max_drawdown_pct": round(drawdown, 4) if valid else None,

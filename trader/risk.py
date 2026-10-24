@@ -384,7 +384,11 @@ class RiskManager:
                     f"(cooldown {lim.halt_cooldown_minutes} min)"
                 )
         if is_stock and (data_delayed or (quote and quote.delayed)):
-            reasons.append("delayed market data: stock entries are blocked in all modes")
+            if not (mode == Mode.PAPER and lim.allow_delayed_paper_entries):
+                reasons.append(
+                    "delayed market data: stock entries are blocked"
+                    + (" (paper can allow them in Settings)" if mode == Mode.PAPER else "")
+                )
         if is_stock:
             if not stock_market_open(now):
                 reasons.append("US stock market is closed")
