@@ -1767,8 +1767,11 @@ form[data-dirty="true"] .form-actions {
     background: CanvasText;
   }
 
-  /* Bars keep their meaning without color: direction carries gain or loss. */
-  .chart .bar {
+  /* Bars keep their meaning without color: direction carries gain or loss. Same
+     specificity as the palette rules, so these win. */
+  .chart .bar.gain,
+  .chart .bar.loss,
+  .chart .bar.cost {
     fill: CanvasText;
   }
 }

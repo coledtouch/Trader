@@ -26,7 +26,7 @@ from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from trader.config import AppConfig, get_config
-from trader.db import Database
+from trader.db import Database, thin_curve
 from trader.models import (
     BOOL_FALSE_IS_LOOSER,
     BOOL_TRUE_IS_LOOSER,
@@ -60,6 +60,8 @@ log = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY_BYTES = 64 * 1024
 MAX_UNIVERSE = 50
+# /api/equity returns at most about twice this many points (the low and high of each bucket).
+EQUITY_CHART_BUCKETS = 1000
 _SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,11}$")
 CONTENT_SECURITY_POLICY = (
     "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
@@ -685,7 +687,12 @@ def create_app(
         session: Session = Depends(require_session),
     ) -> Any:
         since = utcnow() - timedelta(days=min(days, 3650))
-        return state(request).db.list_equity(since=since)
+        db = state(request).db
+        # The whole window, thinned: the curve gets a point every 5 minutes around the
+        # clock (~288 a day), so a plain row cap would cut a 30- or 90-day chart down to
+        # its newest couple of weeks.
+        points = await run_in_threadpool(db.list_equity, since, None)
+        return thin_curve(points, EQUITY_CHART_BUCKETS)
 
     @app.get("/api/days")
     async def days_stats(

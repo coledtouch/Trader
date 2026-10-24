@@ -192,6 +192,27 @@ def _dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
+def thin_curve(points: list[dict[str, Any]], buckets: int) -> list[dict[str, Any]]:
+    """At most about 2 * `buckets` points that still span the whole curve: the lowest and
+    highest point of each run of consecutive points (so dips and spikes survive), in time
+    order, plus the last point."""
+    if buckets < 1 or len(points) <= buckets * 2:
+        return points
+    size = -(-len(points) // buckets)
+    out: list[dict[str, Any]] = []
+    for i in range(0, len(points), size):
+        chunk = points[i : i + size]
+        lo = min(chunk, key=lambda p: p["equity"])
+        hi = max(chunk, key=lambda p: p["equity"])
+        if lo is hi:
+            out.append(lo)
+        else:
+            out.extend((lo, hi) if lo["ts"] < hi["ts"] else (hi, lo))
+    if out[-1] is not points[-1]:
+        out.append(points[-1])
+    return out
+
+
 class Database:
     def __init__(self, path: Path | str):
         self.path = str(path)
@@ -776,17 +797,23 @@ class Database:
         """Hide earlier equity points (they belong to another broker account) from now on."""
         self.set_kv(EQUITY_SINCE_KEY, _iso(ts))
 
-    def list_equity(self, since: datetime | None = None, limit: int = 5000) -> list[dict[str, Any]]:
+    def list_equity(
+        self, since: datetime | None = None, limit: int | None = 5000
+    ) -> list[dict[str, Any]]:
+        """The newest `limit` points since `since` (all of them when `limit` is None),
+        oldest first."""
         floor = _dt(self.get_kv(EQUITY_SINCE_KEY))
         if floor is not None and (since is None or since < floor):
             since = floor
-        if since is None:
-            rows = self._all("SELECT * FROM equity ORDER BY ts DESC LIMIT ?", (limit,))
-        else:
-            rows = self._all(
-                "SELECT * FROM equity WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
-                (_iso(since), limit),
-            )
+        sql, params = "SELECT * FROM equity", []
+        if since is not None:
+            sql += " WHERE ts >= ?"
+            params.append(_iso(since))
+        sql += " ORDER BY ts DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self._all(sql, params)
         return [{"ts": r["ts"], "equity": r["equity"]} for r in reversed(rows)]
 
     # ------------------------------------------------------------------ signal ledger

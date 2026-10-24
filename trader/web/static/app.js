@@ -121,6 +121,9 @@
     minute: '2-digit',
   });
   const fmtDate = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric' });
+  // For calendar days stored as noon UTC (dayDate): formatting them in UTC keeps the date
+  // right in every time zone, including UTC+12 and later.
+  const fmtDayAxis = new Intl.DateTimeFormat(undefined, { month: 'short', day: 'numeric', timeZone: 'UTC' });
   const fmtDay = new Intl.DateTimeFormat(undefined, {
     weekday: 'short',
     month: 'short',
@@ -1158,12 +1161,19 @@
     return { ticks, step };
   }
 
+  /** Axis label with as many decimals as the step needs ($2.50 steps, $0.025 steps). */
+  const tickFormats = new Map();
   function tickLabel(value, step) {
-    if (step >= 1) {
-      const whole = Math.round(value);
-      return `${whole < 0 ? '-' : ''}$${Math.abs(whole).toLocaleString('en-US')}`;
+    const v = Math.abs(value) < step * 1e-6 ? 0 : value; // no "-$0.00" from float drift
+    let digits = 0;
+    while (digits < 4 && Math.abs(step * 10 ** digits - Math.round(step * 10 ** digits)) > 1e-6) digits += 1;
+    if (digits === 1) digits = 2; // cents, not dimes
+    if (!tickFormats.has(digits)) {
+      tickFormats.set(digits, new Intl.NumberFormat('en-US', {
+        style: 'currency', currency: 'USD', minimumFractionDigits: digits, maximumFractionDigits: digits,
+      }));
     }
-    return usd.format(value);
+    return `${v < 0 ? '-' : ''}${tickFormats.get(digits).format(Math.abs(v))}`;
   }
 
   function equityReadout(first, last) {
@@ -1193,6 +1203,9 @@
     const width = Math.max(260, Math.floor(box.clientWidth));
     const height = width < 520 ? 190 : 240;
     const pad = { left: 64, right: 12, top: 10, bottom: 26 };
+    const prev = box.querySelector('svg.chart');
+    const hadFocus = Boolean(prev) && prev === document.activeElement;
+    const keptT = prev && prev.dataset.selected ? Number(prev.dataset.selected) : null;
     const data = downsample(points, Math.max(30, Math.floor((width - pad.left - pad.right) / 3)));
     const first = data[0];
     const last = data[data.length - 1];
@@ -1261,10 +1274,12 @@
       cross.setAttribute('visibility', 'visible');
       marker.setAttribute('visibility', 'visible');
       readout.replaceChildren(el('strong', { text: money(data[index].v) }), ` · ${fmtDateTime.format(new Date(data[index].t))}`);
+      root.dataset.selected = String(data[index].t);
     };
     const hide = () => {
       cross.setAttribute('visibility', 'hidden');
       marker.setAttribute('visibility', 'hidden');
+      delete root.dataset.selected;
       resetReadout();
     };
     const nearest = (event) => {
@@ -1281,15 +1296,18 @@
     };
     root.addEventListener('pointermove', (event) => show(nearest(event)));
     root.addEventListener('pointerdown', (event) => show(nearest(event)));
-    // A lifted finger also 'leaves': keep a tapped point on screen until the next tap.
+    // A lifted finger also 'leaves': keep a tapped point on screen until the next tap. A
+    // finger that scrolls the page instead (pointercancel) clears it.
     root.addEventListener('pointerleave', (event) => {
       if (event.pointerType !== 'touch') hide();
     });
+    root.addEventListener('pointercancel', hide);
     root.addEventListener('focus', () => {
       readout.setAttribute('aria-live', 'polite');
       show(index);
     });
     root.addEventListener('blur', () => {
+      if (!root.isConnected) return; // replaced by a redraw, which owns the readout now
       readout.removeAttribute('aria-live');
       hide();
     });
@@ -1301,6 +1319,12 @@
     });
     box.replaceChildren(root);
     resetReadout();
+    // A redraw keeps the reader's place: the focused chart and the point being read.
+    if (keptT !== null) {
+      index = data.reduce((best, p, i) => (Math.abs(p.t - keptT) < Math.abs(data[best].t - keptT) ? i : best), 0);
+    }
+    if (hadFocus) root.focus({ preventScroll: true });
+    else if (keptT !== null) show(index);
     return width;
   }
 
@@ -1329,10 +1353,14 @@
     const width = Math.max(260, Math.floor(box.clientWidth));
     const height = width < 520 ? 170 : 200;
     const pad = { left: 60, right: 8, top: 10, bottom: 26 };
+    const prev = box.querySelector('svg.chart');
+    const hadFocus = Boolean(prev) && prev === document.activeElement;
+    const keptDay = prev ? prev.dataset.selected : undefined;
     const values = items.map((d) => d.v);
     const lowV = Math.min(0, ...values);
     const highV = Math.max(0, ...values);
-    const { ticks, step } = niceTicks(lowV, highV, 3);
+    // Costs never go below zero: an all-zero cost period gets a $0-$1 axis, not -$1..$1.
+    const { ticks, step } = niceTicks(lowV, kind === 'cost' && highV <= 0 ? 1 : highV, 3);
     const yLo = Math.min(ticks[0], 0);
     const yHi = Math.max(ticks[ticks.length - 1], 0);
     const plotW = width - pad.left - pad.right;
@@ -1368,7 +1396,7 @@
     for (const [i, anchor] of xLabels) {
       const tx = anchor === 'start' ? pad.left : anchor === 'end' ? width - pad.right : cx(i);
       const label = svg('text', { class: 'tick', x: tx.toFixed(1), y: height - 6, 'text-anchor': anchor });
-      label.textContent = fmtDate.format(items[i].t);
+      label.textContent = fmtDayAxis.format(items[i].t);
       root.append(label);
     }
     const bars = items.map((d, i) => {
@@ -1384,6 +1412,7 @@
     const resetReadout = () => {
       readout.replaceChildren(...summary.readout);
       for (const bar of bars) bar.classList.remove('active', 'dim');
+      delete root.dataset.selected;
     };
     let index = items.length - 1;
     const show = (i) => {
@@ -1393,6 +1422,7 @@
         bar.classList.toggle('dim', j !== index);
       });
       readout.replaceChildren(...detail(items[index]));
+      root.dataset.selected = items[index].day;
     };
     const nearest = (event) => {
       const rect = root.getBoundingClientRect();
@@ -1404,11 +1434,13 @@
     root.addEventListener('pointerleave', (event) => {
       if (event.pointerType !== 'touch') resetReadout();
     });
+    root.addEventListener('pointercancel', resetReadout); // the finger scrolled the page
     root.addEventListener('focus', () => {
       readout.setAttribute('aria-live', 'polite');
       show(index);
     });
     root.addEventListener('blur', () => {
+      if (!root.isConnected) return; // replaced by a redraw, which owns the readout now
       readout.removeAttribute('aria-live');
       resetReadout();
     });
@@ -1420,6 +1452,11 @@
     });
     box.replaceChildren(root);
     resetReadout();
+    // A redraw keeps the reader's place: the focused chart and the day being read.
+    const kept = keptDay ? items.findIndex((d) => d.day === keptDay) : -1;
+    if (kept >= 0) index = kept;
+    if (hadFocus) root.focus({ preventScroll: true });
+    else if (kept >= 0) show(index);
     return width;
   }
 
@@ -1431,10 +1468,11 @@
   /** "YYYY-MM-DD" -> a Date at noon UTC (stable across time zones and DST). */
   const dayDate = (day) => new Date(`${day}T12:00:00Z`);
 
-  /** Daily rows inside the period, oldest first: weekdays, plus any other day with activity. */
-  function dashDays(rows, days) {
-    const today = dayDate(nyDate.format(new Date()));
-    const cutoff = new Date(today.getTime() - (days - 1) * 86400000).toISOString().slice(0, 10);
+  /** Daily rows inside the period, oldest first: weekdays, plus any other day with activity.
+   * `today` is the New York date, "YYYY-MM-DD". */
+  function dashDays(rows, days, today = nyDate.format(new Date())) {
+    const end = dayDate(today);
+    const cutoff = new Date(end.getTime() - (days - 1) * 86400000).toISOString().slice(0, 10);
     return asList(rows)
       .filter((d) => d && typeof d.day === 'string' && d.day >= cutoff)
       .map((d) => {
@@ -1468,9 +1506,12 @@
         .sort((a, b) => a.t - b.t);
       state.dashDays = dashDays(rows, days);
       state.dashPeriod = days;
-      drawDashboardCharts();
+      // The 60-second background refresh redraws only when the data moved.
+      const fresh = changed('dash-charts', [days, state.dashEquity, state.dashDays]);
+      if (fresh || !background) drawDashboardCharts();
       state.dashChartsLoadedAt = Date.now();
     } catch (err) {
+      rendered.delete('dash-charts'); // the next good response replaces the error line
       if (!err.fatal) boxes[0].replaceChildren(errorLine(`Charts unavailable: ${err.message}`));
     } finally {
       state.dashChartsBusy = false;
@@ -1478,6 +1519,9 @@
       if (Number($('performance-days').value || '30') !== days) loadDashboardCharts();
     }
   }
+
+  /** Cents for a dollar or more; up to 4 decimals below that, where AI costs live. */
+  const costText = (v) => (Math.abs(v) >= 1 ? usd : usdFine).format(v);
 
   function drawDashboardCharts() {
     const days = state.dashPeriod || 30;
@@ -1517,8 +1561,8 @@
       drawBarChart(costBox, $('dash-cost-readout'), costRows, {
         kind: 'cost',
         summary: {
-          label: `AI cost per day, ${period}: total ${usd.format(spent)}`,
-          readout: [el('strong', { text: usd.format(spent) }), ` total · ${usd.format(spent / costRows.length)} a day on average`],
+          label: `AI cost per day, ${period}: total ${costText(spent)}`,
+          readout: [el('strong', { text: costText(spent) }), ` total · ${costText(spent / costRows.length)} a day on average`],
         },
         detail: (d) => [el('strong', { text: usdFine.format(d.v) }), ` · ${dayLabel(d.day)}`],
       });

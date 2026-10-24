@@ -199,7 +199,7 @@ def test_healthz_and_no_docs(env):
         assert env.client.get(path).status_code == 404
 
 
-@pytest.mark.parametrize("asset", ["app.js?v=12", "login.js?v=12", "styles.css?v=12", "sw.js"])
+@pytest.mark.parametrize("asset", ["app.js?v=13", "login.js?v=13", "styles.css?v=13", "sw.js"])
 def test_executable_shell_assets_revalidate_on_deploy(env, asset):
     response = env.client.get(f"/static/{asset}")
     assert response.status_code == 200
@@ -917,3 +917,21 @@ def test_startup_log_says_whether_the_access_check_is_on(caplog):
     assert "Cloudflare Access check: disabled" in caplog.text
     on.db.close()
     off.db.close()
+
+
+def test_equity_chart_covers_the_whole_window_thinned(env, monkeypatch):
+    """A point every 5 minutes is ~288 a day: a 90-day chart must start ~90 days back, not
+    stop at the newest rows, and must stay small."""
+    login(env)
+    monkeypatch.setattr(app_module, "EQUITY_CHART_BUCKETS", 200)
+    now = datetime.now(UTC)
+    start = now - timedelta(days=89, hours=23)
+    for i in range(0, 90 * 288 - 12, 3):  # every 15 minutes keeps the test fast
+        value = 100.0 if i == 6000 else 600.0 + i % 97  # one deep dip
+        env.db.add_equity_point(value, start + timedelta(minutes=5 * i))
+    curve = env.client.get("/api/equity?days=90").json()
+    first = datetime.fromisoformat(curve[0]["ts"])
+    assert first - start < timedelta(hours=12)  # the whole window, not its newest weeks
+    assert len(curve) <= 2 * 200 + 1
+    assert min(p["equity"] for p in curve) == 100.0  # the dip survives thinning
+    assert [p["ts"] for p in curve] == sorted(p["ts"] for p in curve)
