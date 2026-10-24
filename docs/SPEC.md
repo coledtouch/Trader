@@ -1066,7 +1066,11 @@ from the stop or target when this client has no order row for that perm id.
 - At entry the engine stores `delayed_data: 1.0` in the position extras when the feed or
   the instrument's latest quote is delayed; `_journal_trade` copies it to
   `TradeRecord.delayed_data` (new `trades.delayed_data` column, migrated with default 0).
-- `performance_report` counts `delayed_data_trades`, warns, and `_setup_report` leaves
-  those trades out of the per-setup statistics. The dashboard data warning says paper
-  entries are allowed instead of "blocked".
+- `performance_report` counts `delayed_data_trades`, warns, and leaves those trades out of
+  `net_expectancy`, `profit_factor` and the per-setup statistics (account totals keep them).
+  The models' recent-trades context marks them "paper on delayed data: not evidence".
+- Only PAPER **stock** entries are tagged (`Engine._is_delayed_paper_entry`); crypto was
+  never blocked on delayed data and keeps counting. `EngineStatus.delayed_paper_entries`
+  drives the dashboard banner and the quote table's "Delayed: paper entries allowed" chip
+  instead of "paused"/"Blocked".
 

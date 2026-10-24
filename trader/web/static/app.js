@@ -770,7 +770,11 @@
       { label: 'Symbol', head: true, value: (q) => q.symbol || DASH },
       { label: 'Age', num: true, value: (q) => isNum(q.age_seconds) ? `${Math.max(0, Math.round(q.age_seconds))} sec` : 'Unknown' },
       { label: 'Feed', value: (q) => state.data.status.broker === 'sim' ? chipNode('Synthetic', null) : q.delayed ? chipNode('Delayed', 'warn') : chipNode('Real-time', null) },
-      { label: 'Freshness check', value: (q) => q.valid && !q.delayed ? chipNode('Usable', 'ok') : chipNode('Blocked', 'warn') },
+      { label: 'Freshness check', value: (q) => {
+        if (q.valid && !q.delayed) return chipNode('Usable', 'ok');
+        if (q.valid && state.data.status.delayed_paper_entries) return chipNode('Delayed: paper entries allowed', 'warn');
+        return chipNode('Blocked', 'warn');
+      } },
     ], quotes));
   }
 
@@ -800,8 +804,10 @@
     setChip('chip-data', s.broker === 'sim' ? 'Synthetic data' : delayed ? 'Delayed data' : blockedQuotes ? 'Quotes need review' : quotes.length ? 'Real-time feed' : 'Data not verified',
       delayed || blockedQuotes ? 'warn' : s.broker === 'sim' || !quotes.length ? null : 'ok');
     $('market-data-banner').hidden = !delayed;
-    setText($('market-data-text'), delayed
-      ? 'Delayed market data: stock entries and paid stock entry analysis are paused. Existing exits remain managed.' : '');
+    setText($('market-data-text'), !delayed ? ''
+      : s.delayed_paper_entries
+        ? 'Delayed market data: paper entries are allowed by your setting. They test the order plumbing and are left out of the edge statistics. Live trading needs real-time data.'
+        : 'Delayed market data: stock entries and paid stock entry analysis are paused. Existing exits remain managed.');
     setChip('chip-autopilot', s.autopilot ? 'Autopilot on' : 'Approval required', s.autopilot ? 'ok' : 'warn');
     setChip('chip-ai', AI_CHIP[s.decision_maker] || `AI: ${makerLabel(s.decision_maker)}`,
       s.decision_warning ? 'warn' : s.decision_maker === 'consensus' ? 'ok' : null);

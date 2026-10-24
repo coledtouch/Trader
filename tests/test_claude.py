@@ -876,3 +876,21 @@ def test_fee_share_that_rounds_to_the_limit_is_flagged_as_over_it():
     text = render_context(ctx)
     assert "round-trip fees ~$3.50 = 25.2% of the $13.90 reward" in text
     assert "(over the 25% limit: the risk manager rejects it)" in text
+
+
+def test_recent_delayed_data_trades_are_marked_for_the_models():
+    from datetime import timedelta
+
+    trade = TradeRecord(
+        instrument=Instrument(symbol="F"),
+        qty=10,
+        entry_price=10,
+        exit_price=9.8,
+        entry_ts=NOW - timedelta(hours=2),
+        exit_ts=NOW - timedelta(hours=1),
+        pnl=-2.8,
+        setup="vwap_reclaim",
+        delayed_data=True,
+    )
+    ctx = make_ctx().model_copy(update={"recent_trades": [trade]})
+    assert "paper on delayed data: not evidence for the setup" in render_context(ctx)

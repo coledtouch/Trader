@@ -254,6 +254,7 @@ def test_delayed_data_trades_are_kept_out_of_setup_stats(db):
     status = EngineStatus(day="2026-10-23", mode="paper", equity=615, data_delayed=True)
     report = performance_report(db, settings, status, NOW)
     assert report["closed_trades"] == 2 and report["delayed_data_trades"] == 1
+    assert report["net_expectancy"] == 8.0  # the delayed-data trade is not edge evidence
     assert [(s["setup"], s["trades"], s["net_pnl"]) for s in report["setup_stats"]] == [
         ("trend_pullback", 1, 8.0)
     ]

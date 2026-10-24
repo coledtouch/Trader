@@ -1155,6 +1155,7 @@ class Engine:
             decision_maker=maker.name if self.settings.llm_enabled else self.rules.name,
             decision_warning=warning if self.settings.llm_enabled else None,
             data_warning=self._data_warning(),
+            delayed_paper_entries=self._delayed_paper_entries_allowed(),
             quote_health=[
                 {
                     "symbol": quote.instrument.symbol,
@@ -1210,6 +1211,17 @@ class Engine:
             active.update(self._cycle_quote_scope)
         self._latest_quotes = {k: q for k, q in self._latest_quotes.items() if k in active}
 
+    def _delayed_paper_entries_allowed(self) -> bool:
+        return self.broker.mode == Mode.PAPER and self.risk.limits.allow_delayed_paper_entries
+
+    def _is_delayed_paper_entry(self, order: OrderRequest) -> bool:
+        """A paper stock entry made on delayed data, which only the owner's switch allows
+        (crypto entries were never blocked on delayed data and are not tagged)."""
+        if order.instrument.asset_class != AssetClass.STOCK or self.broker.mode != Mode.PAPER:
+            return False
+        latest = self._latest_quotes.get(order.instrument.key)
+        return self.broker.data_delayed or (latest is not None and latest.delayed)
+
     def _data_warning(self) -> str | None:
         warnings = [self.broker.data_warning] if self.broker.data_warning else []
         delayed = sorted(
@@ -1217,9 +1229,7 @@ class Engine:
             for q in self._latest_quotes.values()
             if q.instrument.asset_class == AssetClass.STOCK and q.delayed
         )
-        paper_allowed = (
-            self.broker.mode == Mode.PAPER and self.risk.limits.allow_delayed_paper_entries
-        )
+        paper_allowed = self._delayed_paper_entries_allowed()
         if paper_allowed and (self.broker.data_delayed or delayed):
             warnings.append(
                 "Delayed stock market data: paper entries are allowed by your setting. They "
@@ -2911,9 +2921,8 @@ class Engine:
             setup=order.setup,
         )
         extra = {"initial_stop": stop, "unit_risk": entry - stop, "best_price": entry}
-        latest = self._latest_quotes.get(key)
-        if self.broker.data_delayed or (latest is not None and latest.delayed):
-            extra["delayed_data"] = 1.0  # paper-only entry on delayed data (RiskLimits)
+        if self._is_delayed_paper_entry(order):
+            extra["delayed_data"] = 1.0  # not evidence of an edge (performance report)
         self.db.set_kv(EXTRA_PREFIX + key, json.dumps(extra))
         try:
             placed = await self.broker.place_order(order)

@@ -159,7 +159,8 @@ def performance_report(
     if delayed_trades:
         warnings.append(
             f"{delayed_trades} trade(s) were entered on delayed data (paper): they count in the "
-            "account totals but are left out of the per-setup results."
+            "account totals but are left out of the expectancy, profit factor and per-setup "
+            "results."
         )
     ai_cost = db.decision_cost(since, now)
     history_start = (
@@ -199,8 +200,11 @@ def performance_report(
     warnings.append(
         "Day-to-day equity gaps include overnight moves; only recognized cash flows are excluded."
     )
-    positive = sum(max(t.pnl, 0.0) for t in trades)
-    negative = -sum(min(t.pnl, 0.0) for t in trades)
+    # Edge measures use trades entered on real-time data only (delayed-data paper trades
+    # test the plumbing); the account totals above include every trade.
+    edge_trades = [t for t in trades if not t.delayed_data]
+    positive = sum(max(t.pnl, 0.0) for t in edge_trades)
+    negative = -sum(min(t.pnl, 0.0) for t in edge_trades)
     signal_count, evaluated_signals = db.signal_counts(since, now)
     known_net = trading_pnl - ai_cost - hosting - data
     return {
@@ -218,7 +222,9 @@ def performance_report(
         "all_in_pnl": round(known_net, 4) if configured and valid else None,
         "closed_trades": len(trades),
         "delayed_data_trades": delayed_trades,
-        "net_expectancy": round(sum(t.pnl for t in trades) / len(trades), 4) if trades else None,
+        "net_expectancy": (
+            round(sum(t.pnl for t in edge_trades) / len(edge_trades), 4) if edge_trades else None
+        ),
         "profit_factor": round(positive / negative, 4) if negative else None,
         "max_drawdown_pct": round(drawdown, 4) if valid else None,
         "drawdown_basis": "daily equity observations",

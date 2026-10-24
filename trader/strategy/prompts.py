@@ -352,6 +352,7 @@ def _recent_trades(trades: list[TradeRecord]) -> str:
             f"{tr.instrument.key} {_signed(tr.pnl)}{r} | entry {_px(tr.entry_price)} exit "
             f"{_px(tr.exit_price)} | {tr.setup or '-'} | exit {tr.exit_reason or '-'} at "
             f"{_when(tr.exit_ts)}"
+            + (" | paper on delayed data: not evidence for the setup" if tr.delayed_data else "")
         )
     return "\n".join(lines)
 

@@ -403,6 +403,7 @@ async def test_paper_switch_allows_delayed_entries_and_tags_the_trade(db, config
     assert h.decider.calls and h.broker.placed  # the AI was asked and the entry went out
     status = h.engine.status()
     assert "paper entries are allowed" in (status.data_warning or "")
+    assert status.delayed_paper_entries is True
     h.broker.set_price("F", 9.0)  # through the stop: the trade closes at a loss
     for _ in range(3):
         h.clock.advance(seconds=15)
@@ -417,3 +418,51 @@ async def test_live_ignores_the_paper_delayed_switch(db, config) -> None:
     await h.engine.run_cycle()
     assert not h.broker.placed
     assert "delayed market data" in db.list_signals()[0].skip_reason
+
+
+def _crypto_candidate(h) -> None:
+    from trader.models import AssetClass, Candidate
+
+    btc = Instrument(symbol="BTC", asset_class=AssetClass.CRYPTO)
+    h.broker.set_price("BTC", 100.0, asset_class=AssetClass.CRYPTO)
+    h.scanner.candidates = {
+        btc.key: [
+            Candidate(
+                instrument=btc,
+                setup="trend_pullback",
+                score=0.8,
+                price=100.0,
+                suggested_stop=98.0,
+                suggested_target=104.0,
+            )
+        ]
+    }
+    h.decider.decisions = [
+        AIDecision(
+            action=TradeAction.BUY,
+            symbol="BTC",
+            asset_class=AssetClass.CRYPTO,
+            conviction=0.8,
+            setup="trend_pullback",
+            rationale="pullback",
+        )
+    ]
+
+
+async def test_crypto_trades_on_a_delayed_feed_are_not_tagged(db, config) -> None:
+    """Review finding: crypto entries were never blocked on delayed data, so they must not
+    be tagged as delayed-data paper trades (and dropped from the setup statistics)."""
+    from trader.models import AssetClass
+
+    h = await harness(db, config, mode=Mode.PAPER, trade_crypto=True, trade_stocks=False)
+    h.broker.delayed = True
+    _crypto_candidate(h)
+    await h.engine.run_cycle()
+    assert [r for r in h.broker.placed if r.side == Side.BUY]
+    h.broker.set_price("BTC", 97.0, asset_class=AssetClass.CRYPTO)
+    for _ in range(4):
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    [trade] = db.list_trades(limit=5)
+    assert trade.delayed_data is False
+    assert h.engine.status().delayed_paper_entries is False  # the switch is off

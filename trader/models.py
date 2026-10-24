@@ -589,6 +589,9 @@ class EngineStatus(BaseModel):
     # data while another session of the same login holds it). Affected symbols get no entries.
     data_warning: str | None = None
     quote_health: list[QuoteHealth] = Field(default_factory=list)
+    # PAPER with RiskLimits.allow_delayed_paper_entries on: stock entries on delayed data
+    # are allowed (the dashboard must not call them blocked).
+    delayed_paper_entries: bool = False
 
 
 class DecisionContext(BaseModel):
