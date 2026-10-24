@@ -36,7 +36,12 @@ TARGET_FRACTION = 0.85
 SETTLE_SECONDS = 15.0
 POLL_SECONDS = 0.5
 # Statuses of a correctly accepted bracket that is waiting (in or outside market hours).
-WAITING_STATES = frozenset({"PreSubmitted", "Submitted", "ApiPending", "PendingSubmit"})
+# ib_async reports "ValidationError" for an order IBKR accepted with a warning (e.g. 399,
+# "will not be placed at the exchange until <next open>" on a weekend); the order stays
+# live, and the broker adapter counts it as working too.
+WAITING_STATES = frozenset(
+    {"PreSubmitted", "Submitted", "ApiPending", "PendingSubmit", "ApiUpdate", "ValidationError"}
+)
 
 
 class _PaperBroker(Protocol):
@@ -275,8 +280,12 @@ async def _cancel_all(
         return [o for o in broker.orders_tagged(tag) if not o["done"]]
 
     try:
-        for order in sorted(working(), key=lambda o: bool(o["parent_id"])):  # parent first
-            await broker.cancel_order(str(order["broker_id"]))
+        # IBKR cancels a bracket's stop-loss and take-profit with its entry, so cancel the
+        # entry first and only then whatever is still working (cancelling children that
+        # IBKR is already cancelling makes it report error 10148).
+        for order in working():
+            if not order["parent_id"]:
+                await broker.cancel_order(str(order["broker_id"]))
         await _wait_for(lambda: not working(), settle_seconds, sleep)
         left = working()
         for order in left:

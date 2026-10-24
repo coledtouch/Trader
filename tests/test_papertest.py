@@ -143,3 +143,35 @@ def test_cli_paper_test_needs_the_ibkr_broker(
     monkeypatch.delenv("TRADER_BROKER", raising=False)
     assert cli.main(["paper-test", "--env-file", str(env)]) == 1
     assert "TRADER_BROKER=ibkr" in capsys.readouterr().err
+
+
+async def test_a_weekend_warning_status_still_passes_and_children_are_not_double_cancelled() -> (
+    None
+):
+    """On a weekend IBKR accepts the entry with warning 399, which ib_async reports as
+    status ValidationError (the order stays live). Cancelling the entry cancels its
+    stop-loss and take-profit at IBKR, so they are not cancelled again (error 10148)."""
+    broker, fake = make_broker()
+
+    def weekend_warning(trade) -> None:
+        if trade.order.transmit:
+            for t in fake.trade_list:
+                if not t.order.parentId:
+                    t.orderStatus.status = "ValidationError"
+
+    original_cancel = fake.cancelOrder
+
+    def cancel_with_children(order):
+        trade = original_cancel(order)
+        for t in fake.trade_list:  # as IBKR does for a bracket's children
+            if t.order.parentId == order.orderId and t.orderStatus.status not in DONE:
+                t.orderStatus.status = "Cancelled"
+        return trade
+
+    fake.on_place = weekend_warning
+    fake.cancelOrder = cancel_with_children
+    checks = await run_paper_test(broker, symbol="AAPL", ref_price=100.0, settle_seconds=0.5)
+    assert all(c.ok for c in checks), checks
+    parent_id = fake.placed[0][1].orderId
+    assert fake.cancelled == [parent_id]  # only the entry; IBKR took the children with it
+    assert all(t.orderStatus.status in DONE for t in fake.trade_list)
