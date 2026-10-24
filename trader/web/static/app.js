@@ -1328,7 +1328,8 @@
     resetReadout();
     // A redraw keeps focus on the chart, and with keepPlace the point being read (if it
     // is still in the window).
-    const keep = keptT !== null && keptT >= first.t && keptT <= last.t;
+    // Against the full series: the downsampled first point moves with the chart width.
+    const keep = keptT !== null && keptT >= points[0].t && keptT <= points[points.length - 1].t;
     if (keep) {
       index = data.reduce((best, p, i) => (Math.abs(p.t - keptT) < Math.abs(data[best].t - keptT) ? i : best), 0);
     }
