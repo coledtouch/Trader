@@ -1,0 +1,386 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#161b22" media="(prefers-color-scheme: dark)">
+  <meta name="robots" content="noindex, nofollow">
+  <title>AI Trader</title>
+  <link rel="manifest" href="/static/manifest.webmanifest" crossorigin="use-credentials">
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/static/icon-192.png">
+  <link rel="stylesheet" href="/static/styles.css?v=15">
+  <script src="/static/app.js?v=15" defer></script>
+</head>
+<body data-mode="unknown">
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <div class="appbar">
+    <header class="topbar">
+      <div class="brand">
+        <img src="/static/icon.svg" alt="" width="28" height="28">
+        <span class="brand-name">AI Trader</span>
+      </div>
+      <span id="mode-badge" class="badge mode-badge" data-mode="unknown"><span class="visually-hidden">Mode: </span><span id="mode-label">…</span></span>
+      <button id="kill-top" class="btn btn-danger btn-compact" type="button" aria-haspopup="dialog">Kill</button>
+    </header>
+
+    <nav class="tabbar" aria-label="Views">
+      <div id="tablist" class="tablist" role="tablist">
+        <button id="tab-dashboard" class="tab" type="button" role="tab" data-view="dashboard"
+                aria-controls="view-dashboard" aria-selected="true">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 13h8V3H3zM13 21h8V11h-8zM3 21h8v-6H3zM13 3v6h8V3z"/></svg>
+          <span>Dashboard</span>
+        </button>
+        <button id="tab-activity" class="tab" type="button" role="tab" data-view="activity"
+                aria-controls="view-activity" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg>
+          <span>Activity</span>
+        </button>
+        <button id="tab-signals" class="tab" type="button" role="tab" data-view="signals"
+                aria-controls="view-signals" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/></svg>
+          <span>Signals</span>
+        </button>
+        <button id="tab-settings" class="tab" type="button" role="tab" data-view="settings"
+                aria-controls="view-settings" aria-selected="false" tabindex="-1">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1"/><circle cx="15" cy="6" r="2"/><circle cx="9" cy="12" r="2"/><circle cx="17" cy="18" r="2"/></svg>
+          <span>Settings</span>
+        </button>
+      </div>
+    </nav>
+
+    <div id="session-banner" class="banner banner-danger" role="alert" hidden>
+      <span class="banner-text">Session expired - reload to sign in again</span>
+      <button id="reload-btn" class="btn btn-sm" type="button">Reload</button>
+    </div>
+    <div id="stale-banner" class="banner banner-warn" role="status" hidden>
+      <span id="stale-text" class="banner-text"></span>
+    </div>
+    <div id="market-data-banner" class="banner banner-warn" role="status" hidden>
+      <span id="market-data-text" class="banner-text"></span>
+    </div>
+    <div id="halt-region" aria-live="assertive" aria-atomic="true">
+      <div id="halt-banner" class="banner banner-halt" hidden>
+        <span class="banner-text"><strong>Trading halted:</strong> <span id="halt-reason"></span></span>
+        <button id="halt-resume" class="btn btn-sm" type="button" aria-haspopup="dialog">Resume…</button>
+      </div>
+    </div>
+  </div>
+
+  <main id="main" tabindex="-1">
+    <!-- ============================================================ Dashboard -->
+    <section id="view-dashboard" class="view" role="tabpanel" aria-labelledby="tab-dashboard">
+      <h1 class="visually-hidden">Dashboard</h1>
+      <div class="filters dash-filters">
+        <label for="performance-days">Period</label>
+        <select id="performance-days" aria-describedby="period-note">
+          <option value="1">Today</option>
+          <option value="7">Last 7 days</option>
+          <option value="30" selected>Last 30 days</option>
+          <option value="90">Last 90 days</option>
+        </select>
+        <span id="period-note" class="small muted">Applies to the profit summary and the charts</span>
+      </div>
+      <div class="dash-grid">
+        <section class="card span-all performance-card" aria-labelledby="performance-heading">
+          <div class="card-head">
+            <h2 id="performance-heading" class="card-title">Profit after costs</h2>
+          </div>
+          <div id="performance-summary" aria-live="polite" aria-atomic="true"><p class="empty">Loading performance…</p></div>
+        </section>
+
+        <section class="card span-all" aria-labelledby="equity-heading">
+          <div class="hero-row">
+            <div>
+              <h2 id="equity-heading" class="card-title">Equity</h2>
+              <p id="equity-value" class="hero-value">—</p>
+              <p id="equity-sub" class="small muted"></p>
+            </div>
+            <div class="pnl-block">
+              <h2 class="card-title">Today's trading P&amp;L</h2>
+              <p id="pnl-value" class="pnl-value" aria-live="polite" aria-atomic="true">—</p>
+              <p class="small muted">Before operating costs · open positions valued at the bid</p>
+            </div>
+          </div>
+          <div class="meter-wrap">
+            <div id="pnl-meter" class="meter" aria-hidden="true"></div>
+            <div class="meter-labels">
+              <span id="pnl-loss-label"></span>
+              <span>Daily loss budget</span>
+            </div>
+            <p id="pnl-note" class="meter-note"></p>
+          </div>
+        </section>
+
+        <section class="card span-all charts-card" aria-labelledby="charts-heading">
+          <h2 id="charts-heading" class="card-title">Charts</h2>
+          <div class="charts-grid">
+            <figure class="chart-panel chart-wide">
+              <figcaption id="dash-equity-title" class="chart-title">Equity</figcaption>
+              <p id="dash-equity-readout" class="readout"></p>
+              <div id="dash-equity-chart" class="chart-box"><p class="empty">Loading…</p></div>
+            </figure>
+            <figure class="chart-panel">
+              <figcaption class="chart-title">Profit or loss per day</figcaption>
+              <p id="dash-pnl-readout" class="readout"></p>
+              <div id="dash-pnl-chart" class="chart-box"></div>
+            </figure>
+            <figure class="chart-panel">
+              <figcaption class="chart-title">AI cost per day</figcaption>
+              <p id="dash-cost-readout" class="readout"></p>
+              <div id="dash-cost-chart" class="chart-box"></div>
+            </figure>
+          </div>
+          <details class="more mt-12">
+            <summary>Table view</summary>
+            <div id="dash-days-table"></div>
+          </details>
+        </section>
+
+        <section class="card" aria-labelledby="controls-heading">
+          <h2 id="controls-heading" class="card-title">Controls</h2>
+          <div class="controls">
+            <button id="startstop-btn" class="btn btn-primary btn-lg" type="button" disabled>Start bot</button>
+            <button id="cycle-btn" class="btn btn-lg" type="button">Run cycle now</button>
+            <button id="resume-btn" class="btn btn-lg" type="button" aria-haspopup="dialog" hidden>Resume trading…</button>
+            <button id="kill-btn" class="btn btn-danger btn-lg btn-kill" type="button" aria-haspopup="dialog">KILL: close everything</button>
+          </div>
+          <p class="small muted mt-8">Run cycle now makes one decision cycle even while the bot is
+            stopped (orders still follow autopilot and every risk check).</p>
+        </section>
+
+        <section class="card" aria-labelledby="health-heading">
+          <h2 id="health-heading" class="card-title">Status</h2>
+          <ul class="chips">
+            <li id="chip-bot" class="chip">Bot</li>
+            <li id="chip-broker" class="chip">Broker</li>
+            <li id="chip-market" class="chip">Market</li>
+            <li id="chip-data" class="chip">Data</li>
+            <li id="chip-autopilot" class="chip">Autopilot</li>
+            <li id="chip-ai" class="chip">AI</li>
+          </ul>
+          <dl class="kv">
+            <div><dt>Last cycle</dt><dd id="last-cycle">—</dd></div>
+            <div><dt>Next cycle</dt><dd id="next-cycle">—</dd></div>
+            <div><dt>Updated</dt><dd id="updated-at">—</dd></div>
+          </dl>
+          <p id="decision-warning" class="inline-warn" role="status" hidden></p>
+          <p id="data-warning" class="inline-warn" role="status" hidden></p>
+          <p id="last-error" class="inline-warn" hidden></p>
+          <details class="more mt-12">
+            <summary>Quote freshness</summary>
+            <div id="quote-health"><p class="empty">No quotes observed yet.</p></div>
+          </details>
+        </section>
+
+        <section class="card span-all" aria-labelledby="today-heading">
+          <h2 id="today-heading" class="card-title">Today</h2>
+          <dl class="tiles">
+            <div class="tile"><dt>Trades</dt><dd id="trades-value">—</dd></div>
+            <div class="tile"><dt>AI cost</dt><dd id="llm-value">—</dd></div>
+            <div class="tile"><dt>Open positions</dt><dd id="positions-value">—</dd></div>
+            <div class="tile"><dt>Day trades left</dt><dd id="daytrades-value">—</dd></div>
+            <div class="tile"><dt>Cash</dt><dd id="cash-value">—</dd></div>
+            <div class="tile"><dt>Settled cash</dt><dd id="settled-value">—</dd></div>
+          </dl>
+        </section>
+
+        <section id="pending-section" class="card span-all" aria-labelledby="pending-heading" hidden>
+          <h2 id="pending-heading" class="card-title">Waiting for your approval<span id="pending-count" class="count"></span></h2>
+          <div id="pending-list"></div>
+        </section>
+
+        <section class="card span-all" aria-labelledby="positions-heading">
+          <h2 id="positions-heading" class="card-title">Open positions</h2>
+          <div id="positions-list"><p class="empty">Loading…</p></div>
+        </section>
+
+        <section class="card span-all" aria-labelledby="open-orders-heading">
+          <h2 id="open-orders-heading" class="card-title">Working orders</h2>
+          <div id="open-orders-list"><p class="empty">Loading…</p></div>
+        </section>
+      </div>
+    </section>
+
+    <!-- ============================================================ Activity -->
+    <section id="view-activity" class="view" role="tabpanel" aria-labelledby="tab-activity" hidden>
+      <div class="view-head">
+        <h1>Activity</h1>
+        <button id="activity-refresh" class="btn btn-sm" type="button">Refresh</button>
+      </div>
+
+      <section class="card" aria-labelledby="equity-chart-heading">
+        <h2 id="equity-chart-heading" class="card-title">Equity, last 30 days</h2>
+        <p id="equity-readout" class="readout"></p>
+        <div id="equity-chart" class="chart-box"></div>
+      </section>
+
+      <section class="card" aria-labelledby="trades-heading">
+        <h2 id="trades-heading" class="card-title">Closed trades</h2>
+        <p id="trades-summary" class="summary-line" hidden></p>
+        <div id="trades-list"></div>
+      </section>
+
+      <section class="card" aria-labelledby="decisions-heading">
+        <h2 id="decisions-heading" class="card-title">AI decisions</h2>
+        <div id="decisions-list"></div>
+      </section>
+
+      <section class="card" aria-labelledby="orders-heading">
+        <h2 id="orders-heading" class="card-title">Orders</h2>
+        <div id="orders-list"></div>
+      </section>
+
+      <section class="card" aria-labelledby="days-heading">
+        <h2 id="days-heading" class="card-title">Daily stats</h2>
+        <div id="days-list"></div>
+      </section>
+    </section>
+
+    <!-- ============================================================ Signals -->
+    <section id="view-signals" class="view" role="tabpanel" aria-labelledby="tab-signals" hidden>
+      <div class="view-head">
+        <h1>Signals</h1>
+        <div class="filters">
+          <label for="stats-days">Period</label>
+          <select id="stats-days">
+            <option value="7">Last 7 days</option>
+            <option value="30" selected>Last 30 days</option>
+            <option value="90">Last 90 days</option>
+          </select>
+          <button id="signals-refresh" class="btn btn-sm" type="button">Refresh</button>
+        </div>
+      </div>
+      <p class="lede muted">Signal diagnostics measure price movement before fees and operating costs.
+        They do not reproduce actual fills or the bot's managed exits. Thirty signals are an initial review point;
+        they do not establish profitability.</p>
+
+      <section class="card" aria-labelledby="filled-setups-heading">
+        <h2 id="filled-setups-heading" class="card-title">Actual closed trades by setup</h2>
+        <p class="small muted">Realized trading P&amp;L after recorded commissions. Exploratory ranges resample trading days and need more history to be useful. Operating costs are shown on the Dashboard, not allocated to individual setups.</p>
+        <div id="filled-setups-list"><p class="empty">Loading…</p></div>
+      </section>
+
+      <section class="card" aria-labelledby="research-heading">
+        <div class="card-head">
+          <h2 id="research-heading" class="card-title">Captured-decision comparison</h2>
+          <button id="research-run" class="btn btn-sm" type="button">Compare captured decisions</button>
+        </div>
+        <p class="small muted">Replays recorded model votes and rules through separate virtual accounts. Uses stored data, makes no paid AI calls, and sends no broker orders.</p>
+        <div id="research-list"><p class="empty">Loading…</p></div>
+      </section>
+
+      <section class="card" aria-labelledby="stats-heading">
+        <div class="card-head">
+          <h2 id="stats-heading" class="card-title">Price diagnostics before costs</h2>
+        </div>
+        <div id="stats-list"></div>
+      </section>
+
+      <section class="card" aria-labelledby="signals-heading">
+        <div class="card-head">
+          <h2 id="signals-heading" class="card-title">Latest signals</h2>
+          <div class="filters">
+            <label for="signals-setup">Setup</label>
+            <select id="signals-setup">
+              <option value="">All setups</option>
+            </select>
+          </div>
+        </div>
+        <div id="signals-list"></div>
+      </section>
+    </section>
+
+    <!-- ============================================================ Settings -->
+    <section id="view-settings" class="view" role="tabpanel" aria-labelledby="tab-settings" hidden>
+      <div class="view-head">
+        <h1>Settings</h1>
+      </div>
+
+      <section id="live-card" class="card" aria-labelledby="live-heading" hidden>
+        <h2 id="live-heading" class="card-title">Live trading</h2>
+        <dl class="kv">
+          <div><dt>Server allows live orders</dt><dd id="live-allowed">—</dd></div>
+          <div><dt>Connected account</dt><dd id="live-account">—</dd></div>
+          <div><dt>Live orders</dt><dd id="live-state">—</dd></div>
+        </dl>
+        <p id="live-note" class="small muted mt-8"></p>
+        <div class="btn-row mt-12">
+          <button id="arm-btn" class="btn btn-danger" type="button" aria-haspopup="dialog">Arm live trading…</button>
+          <button id="disarm-btn" class="btn" type="button">Disarm</button>
+        </div>
+      </section>
+
+      <form id="settings-form" class="card" novalidate aria-labelledby="settings-heading">
+        <div class="card-head">
+          <h2 id="settings-heading" class="card-title">Bot settings</h2>
+        </div>
+        <p class="small muted">Changes that loosen a risk limit need a fresh 2FA code. Hard caps are
+          enforced on the server whatever is entered here.</p>
+        <p id="llm-note" class="inline-warn" hidden></p>
+        <div id="settings-error" class="form-error mt-12" role="alert"></div>
+        <div id="settings-fields" class="settings-fields mt-12"><p class="empty">Loading…</p></div>
+        <div class="form-actions">
+          <p id="settings-status" class="form-status muted" role="status"></p>
+          <button id="settings-discard" class="btn" type="button" disabled>Discard</button>
+          <button id="settings-save" class="btn btn-primary" type="submit" disabled>Save changes</button>
+        </div>
+      </form>
+
+      <section class="card" aria-labelledby="audit-heading">
+        <div class="card-head">
+          <h2 id="audit-heading" class="card-title">Audit log</h2>
+          <button id="audit-refresh" class="btn btn-sm" type="button">Refresh</button>
+        </div>
+        <div id="audit-list"></div>
+      </section>
+
+      <section class="card" aria-labelledby="session-heading">
+        <h2 id="session-heading" class="card-title">Session</h2>
+        <p class="small muted">Signed in as the owner. Sessions end after inactivity or a few hours.</p>
+        <div class="btn-row mt-12">
+          <button id="logout-btn" class="btn" type="button">Sign out</button>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <dialog id="kill-dialog" class="dialog" aria-labelledby="kill-title" aria-describedby="kill-desc">
+    <form id="kill-form" method="dialog">
+      <h2 id="kill-title">Kill switch</h2>
+      <p id="kill-desc"><strong>Cancel all orders and close every position?</strong></p>
+      <p class="small muted">Trading halts, every working order is cancelled and every position is sold
+        at market. Resuming needs a 2FA code.</p>
+      <div id="kill-error" class="form-error" role="alert"></div>
+      <div class="dialog-actions">
+        <button id="kill-cancel" class="btn" type="button" autofocus>Cancel</button>
+        <button id="kill-confirm" class="btn btn-danger" type="submit">Kill: close everything</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="totp-dialog" class="dialog" aria-labelledby="totp-title" aria-describedby="totp-message">
+    <form id="totp-form" novalidate>
+      <h2 id="totp-title">Confirm with 2FA</h2>
+      <p id="totp-message"></p>
+      <div class="field">
+        <label for="totp-input">6-digit code</label>
+        <input id="totp-input" class="code-input" type="text" inputmode="numeric"
+               autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required
+               aria-describedby="totp-help">
+        <p id="totp-help" class="help">From your authenticator app. Each code works only once.</p>
+      </div>
+      <div id="totp-error" class="form-error" role="alert"></div>
+      <div class="dialog-actions">
+        <button id="totp-cancel" class="btn" type="button">Cancel</button>
+        <button id="totp-submit" class="btn btn-primary" type="submit">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

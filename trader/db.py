@@ -25,9 +25,17 @@ from trader.models import (
     OrderRecord,
     OrderRequest,
     OrderStatus,
+    SetupStats,
+    SignalRecord,
     TradeRecord,
+    exec_revision,
+    migrate_legacy_profit_target,
     utcnow,
 )
+
+# kv: equity points before this time belong to an earlier broker account (or an earlier
+# simulator run) and are left out of the equity curve.
+EQUITY_SINCE_KEY = "equity_since"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS kv (
@@ -77,7 +85,8 @@ CREATE TABLE IF NOT EXISTS decisions (
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cost_usd REAL NOT NULL DEFAULT 0,
     refused INTEGER NOT NULL DEFAULT 0,
-    error TEXT
+    error TEXT,
+    votes TEXT
 );
 CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,6 +100,7 @@ CREATE TABLE IF NOT EXISTS orders (
     commission REAL NOT NULL DEFAULT 0,
     message TEXT NOT NULL DEFAULT ''
 );
+CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts);
 CREATE INDEX IF NOT EXISTS idx_orders_broker ON orders(broker_order_id);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status);
 CREATE TABLE IF NOT EXISTS fills (
@@ -127,7 +137,8 @@ CREATE TABLE IF NOT EXISTS trades (
     setup TEXT,
     decision_id INTEGER,
     r_multiple REAL,
-    exit_reason TEXT NOT NULL DEFAULT ''
+    exit_reason TEXT NOT NULL DEFAULT '',
+    delayed_data INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS daily_stats (
     day TEXT PRIMARY KEY,
@@ -137,7 +148,36 @@ CREATE TABLE IF NOT EXISTS equity (
     ts TEXT PRIMARY KEY,
     equity REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    instrument TEXT NOT NULL,
+    setup TEXT NOT NULL,
+    evaluated INTEGER NOT NULL DEFAULT 0,
+    data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_signals_ts ON signals(ts);
+CREATE INDEX IF NOT EXISTS idx_signals_eval ON signals(evaluated, ts);
+CREATE TABLE IF NOT EXISTS research_frames (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    cohort TEXT,
+    account_id TEXT,
+    data TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_research_frames_ts ON research_frames(ts);
 """
+
+
+# (table, column, declaration) added after the first release; applied at startup.
+MIGRATIONS: tuple[tuple[str, str, str], ...] = (
+    ("decisions", "votes", "TEXT"),
+    ("decisions", "vote_costs", "TEXT"),
+    ("decisions", "vote_failures", "TEXT"),
+    ("research_frames", "cohort", "TEXT"),
+    ("research_frames", "account_id", "TEXT"),
+    ("trades", "delayed_data", "INTEGER NOT NULL DEFAULT 0"),
+)
 
 
 def _iso(dt: datetime | None) -> str | None:
@@ -150,6 +190,27 @@ def _iso(dt: datetime | None) -> str | None:
 
 def _dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
+
+
+def thin_curve(points: list[dict[str, Any]], buckets: int) -> list[dict[str, Any]]:
+    """At most about 2 * `buckets` points that still span the whole curve: the lowest and
+    highest point of each run of consecutive points (so dips and spikes survive), in time
+    order, plus the last point."""
+    if buckets < 1 or len(points) <= buckets * 2:
+        return points
+    size = -(-len(points) // buckets)
+    out: list[dict[str, Any]] = []
+    for i in range(0, len(points), size):
+        chunk = points[i : i + size]
+        lo = min(chunk, key=lambda p: p["equity"])
+        hi = max(chunk, key=lambda p: p["equity"])
+        if lo is hi:
+            out.append(lo)
+        else:
+            out.extend((lo, hi) if lo["ts"] < hi["ts"] else (hi, lo))
+    if out[-1] is not points[-1]:
+        out.append(points[-1])
+    return out
 
 
 class Database:
@@ -172,6 +233,23 @@ class Database:
                 self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA foreign_keys=ON")
             self._conn.executescript(SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Columns added after the first release (CREATE TABLE IF NOT EXISTS skips them)."""
+        for table, column, decl in MIGRATIONS:
+            names = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            if column not in names:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        self._conn.execute(
+            "UPDATE research_frames SET cohort=COALESCE(json_extract(data, '$.cohort'), ''), "
+            "account_id=COALESCE(json_extract(data, '$.account_id'), '') "
+            "WHERE cohort IS NULL OR account_id IS NULL"
+        )
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_research_account_cohort "
+            "ON research_frames(account_id, cohort, id)"
+        )
 
     def close(self) -> None:
         with self._lock:
@@ -213,6 +291,10 @@ class Database:
         raw = self.get_kv("settings")
         if raw is None:
             return BotSettings()
+        migrated = migrate_legacy_profit_target(raw)
+        if migrated is not None:
+            self.set_kv("settings", migrated)
+            raw = migrated
         return BotSettings.model_validate_json(raw)
 
     def save_settings(self, settings: BotSettings) -> None:
@@ -333,8 +415,9 @@ class Database:
     def insert_decision(self, batch: DecisionBatch) -> int:
         cur = self._exec(
             "INSERT INTO decisions(ts, maker, model, market_view, decisions, candidates,"
-            " input_tokens, output_tokens, cost_usd, refused, error)"
-            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " input_tokens, output_tokens, cost_usd, refused, error, votes,"
+            " vote_costs, vote_failures)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 _iso(batch.ts),
                 batch.maker,
@@ -347,6 +430,16 @@ class Database:
                 batch.cost_usd,
                 1 if batch.refused else 0,
                 batch.error,
+                json.dumps(
+                    {
+                        maker: [d.model_dump(mode="json") for d in decisions]
+                        for maker, decisions in batch.votes.items()
+                    }
+                )
+                if batch.votes
+                else None,
+                json.dumps(batch.vote_costs),
+                json.dumps(batch.vote_failures),
             ),
         )
         return int(cur.lastrowid)
@@ -367,9 +460,27 @@ class Database:
                 cost_usd=r["cost_usd"],
                 refused=bool(r["refused"]),
                 error=r["error"],
+                votes=json.loads(r["votes"]) if r["votes"] else {},
+                vote_costs=json.loads(r["vote_costs"]) if r["vote_costs"] else {},
+                vote_failures=json.loads(r["vote_failures"]) if r["vote_failures"] else {},
             )
             for r in rows
         ]
+
+    def decision_cost(self, since: datetime, until: datetime) -> float:
+        row = self._one(
+            "SELECT COALESCE(SUM(cost_usd), 0) AS cost FROM decisions WHERE ts >= ? AND ts <= ?",
+            (_iso(since), _iso(until)),
+        )
+        return float(row["cost"]) if row else 0.0
+
+    def signal_counts(self, since: datetime, until: datetime) -> tuple[int, int]:
+        row = self._one(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(evaluated), 0) AS done "
+            "FROM signals WHERE ts >= ? AND ts <= ?",
+            (_iso(since), _iso(until)),
+        )
+        return (int(row["n"]), int(row["done"])) if row else (0, 0)
 
     # ------------------------------------------------------------------ orders
     def _order_from_row(self, r: sqlite3.Row) -> OrderRecord:
@@ -461,7 +572,17 @@ class Database:
 
     # ------------------------------------------------------------------ fills
     def insert_fill(self, fill: Fill) -> bool:
-        """Store a fill. Returns False if this exec_id was already recorded."""
+        """Store a fill. Returns False if this exec_id was already recorded, or when a later
+        revision of the same execution (an IBKR correction) is already stored."""
+        with self._lock:
+            revision = exec_revision(fill.exec_id)
+            if revision is not None and any(
+                rev >= revision[1] for _, rev in self._revisions(revision[0])
+            ):
+                return False
+            return self._insert_fill(fill)
+
+    def _insert_fill(self, fill: Fill) -> bool:
         cur = self._exec(
             "INSERT OR IGNORE INTO fills(exec_id, broker_order_id, instrument, side, qty, price,"
             " commission, ts) VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
@@ -478,6 +599,42 @@ class Database:
         )
         return cur.rowcount == 1
 
+    def _revisions(self, base: str) -> list[tuple[Fill, int]]:
+        """Stored fills that are revisions of the execution `base` (see exec_revision)."""
+        rows = self._all("SELECT * FROM fills WHERE exec_id LIKE ?", (base + ".%",))
+        out: list[tuple[Fill, int]] = []
+        for row in rows:
+            fill = self._fill_from_row(row)
+            revision = exec_revision(fill.exec_id)
+            if revision is not None and revision[0] == base:
+                out.append((fill, revision[1]))
+        return out
+
+    def correct_fill(self, fill: Fill) -> Fill | None:
+        """Apply an IBKR execution correction: when `fill` is a later revision of a stored
+        execution (same id up to the last period), it replaces every earlier revision and
+        the replaced fill is returned (the latest of them). None when it corrects nothing,
+        e.g. a new execution, a non-IBKR id or a revision already stored."""
+        revision = exec_revision(fill.exec_id)
+        if revision is None:
+            return None
+        base, number = revision
+        with self._lock:
+            stored = self._revisions(base)
+            older = [(f, rev) for f, rev in stored if rev < number]
+            if not older or any(rev >= number for _, rev in stored):
+                return None
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                for old, _ in older:
+                    self._conn.execute("DELETE FROM fills WHERE exec_id = ?", (old.exec_id,))
+                self._insert_fill(fill)
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            self._conn.execute("COMMIT")
+            return max(older, key=lambda item: item[1])[0]
+
     def update_fill_commission(self, exec_id: str, commission: float) -> None:
         self._exec("UPDATE fills SET commission = ? WHERE exec_id = ?", (commission, exec_id))
 
@@ -489,19 +646,20 @@ class Database:
                 "SELECT * FROM fills WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
                 (_iso(since), limit),
             )
-        return [
-            Fill(
-                exec_id=r["exec_id"],
-                broker_order_id=r["broker_order_id"],
-                instrument=Instrument.from_key(r["instrument"]),
-                side=r["side"],
-                qty=r["qty"],
-                price=r["price"],
-                commission=r["commission"],
-                ts=_dt(r["ts"]),
-            )
-            for r in rows
-        ]
+        return [self._fill_from_row(r) for r in rows]
+
+    @staticmethod
+    def _fill_from_row(r: sqlite3.Row) -> Fill:
+        return Fill(
+            exec_id=r["exec_id"],
+            broker_order_id=r["broker_order_id"],
+            instrument=Instrument.from_key(r["instrument"]),
+            side=r["side"],
+            qty=r["qty"],
+            price=r["price"],
+            commission=r["commission"],
+            ts=_dt(r["ts"]),
+        )
 
     # ------------------------------------------------------------------ position metadata
     def set_position_meta(
@@ -558,8 +716,8 @@ class Database:
     def insert_trade(self, tr: TradeRecord) -> int:
         cur = self._exec(
             "INSERT INTO trades(instrument, qty, entry_price, exit_price, entry_ts, exit_ts, pnl,"
-            " commission, setup, decision_id, r_multiple, exit_reason)"
-            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " commission, setup, decision_id, r_multiple, exit_reason, delayed_data)"
+            " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 tr.instrument.key,
                 tr.qty,
@@ -573,6 +731,7 @@ class Database:
                 tr.decision_id,
                 tr.r_multiple,
                 tr.exit_reason,
+                int(tr.delayed_data),
             ),
         )
         return int(cur.lastrowid)
@@ -600,6 +759,7 @@ class Database:
                 decision_id=r["decision_id"],
                 r_multiple=r["r_multiple"],
                 exit_reason=r["exit_reason"],
+                delayed_data=bool(r["delayed_data"]),
             )
             for r in rows
         ]
@@ -633,12 +793,207 @@ class Database:
             (_iso(ts or utcnow()), equity),
         )
 
-    def list_equity(self, since: datetime | None = None, limit: int = 5000) -> list[dict[str, Any]]:
-        if since is None:
-            rows = self._all("SELECT * FROM equity ORDER BY ts DESC LIMIT ?", (limit,))
-        else:
-            rows = self._all(
-                "SELECT * FROM equity WHERE ts >= ? ORDER BY ts DESC LIMIT ?",
-                (_iso(since), limit),
-            )
+    def start_equity_history(self, ts: datetime) -> None:
+        """Hide earlier equity points (they belong to another broker account) from now on."""
+        self.set_kv(EQUITY_SINCE_KEY, _iso(ts))
+
+    def list_equity(
+        self, since: datetime | None = None, limit: int | None = 5000
+    ) -> list[dict[str, Any]]:
+        """The newest `limit` points since `since` (all of them when `limit` is None),
+        oldest first."""
+        floor = _dt(self.get_kv(EQUITY_SINCE_KEY))
+        if floor is not None and (since is None or since < floor):
+            since = floor
+        sql, params = "SELECT * FROM equity", []
+        if since is not None:
+            sql += " WHERE ts >= ?"
+            params.append(_iso(since))
+        sql += " ORDER BY ts DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        rows = self._all(sql, params)
         return [{"ts": r["ts"], "equity": r["equity"]} for r in reversed(rows)]
+
+    # ------------------------------------------------------------------ signal ledger
+    def add_research_frame(self, payload: dict[str, Any]) -> None:
+        """Local observations only; bounded history, never a broker submission queue."""
+        ts = datetime.fromisoformat(payload["ts"])
+        self._exec(
+            "INSERT INTO research_frames(ts, cohort, account_id, data) VALUES(?, ?, ?, ?)",
+            (
+                _iso(ts),
+                payload.get("cohort") or "",
+                payload.get("account_id") or "",
+                json.dumps(payload, allow_nan=False),
+            ),
+        )
+        self._exec(
+            "DELETE FROM research_frames WHERE id <= (SELECT MAX(id) - 2500 FROM research_frames)"
+        )
+
+    def research_window(
+        self, since: datetime, account_id: str | None = None, limit: int = 1000
+    ) -> dict[str, Any] | None:
+        """Indexed metadata only: status polls must not deserialize market snapshots."""
+        params = [_iso(since), *([account_id] if account_id else [])]
+        query = (
+            "SELECT id, cohort, account_id FROM research_frames WHERE ts >= ? "
+            "AND account_id = ? ORDER BY id DESC LIMIT 1"
+            if account_id
+            else "SELECT id, cohort, account_id FROM research_frames WHERE ts >= ? "
+            "ORDER BY id DESC LIMIT 1"
+        )
+        latest = self._one(
+            query,
+            params,
+        )
+        if latest is None:
+            return None
+        boundary = self._one(
+            "SELECT COALESCE(MAX(id), 0) AS n FROM research_frames WHERE id < ? "
+            "AND (cohort != ? OR account_id != ?)",
+            (latest["id"], latest["cohort"], latest["account_id"]),
+        )
+        window = self._one(
+            "SELECT COUNT(*) AS n, MIN(id) AS first_id, MAX(id) AS last_id FROM "
+            "(SELECT id FROM research_frames WHERE ts >= ? AND id > ? AND id <= ? "
+            "AND cohort = ? AND account_id = ? ORDER BY id DESC LIMIT ?)",
+            (
+                _iso(since),
+                boundary["n"],
+                latest["id"],
+                latest["cohort"],
+                latest["account_id"],
+                max(1, min(limit, 1000)),
+            ),
+        )
+        return {
+            "frame_count": int(window["n"]),
+            "first_id": window["first_id"],
+            "last_id": window["last_id"],
+            "cohort": latest["cohort"] or None,
+        }
+
+    def research_frames_in_window(self, first_id: int, last_id: int) -> list[dict[str, Any]]:
+        rows = self._all(
+            "SELECT data FROM research_frames WHERE id >= ? AND id <= ? ORDER BY id",
+            (first_id, last_id),
+        )
+        return [json.loads(r["data"]) for r in rows]
+
+    def cash_flows(self, since: datetime, until: datetime) -> list[dict[str, Any]]:
+        rows = self._all(
+            "SELECT ts, detail FROM audit WHERE action='cash_flow' AND ts >= ? AND ts <= ? "
+            "ORDER BY ts",
+            (_iso(since), _iso(until)),
+        )
+        return [{"ts": r["ts"], **json.loads(r["detail"] or "{}")} for r in rows]
+
+    def list_research_frames(
+        self, since: datetime | None = None, limit: int = 10000
+    ) -> list[dict[str, Any]]:
+        where, params = ("WHERE ts >= ?", [_iso(since)]) if since else ("", [])
+        rows = self._all(
+            f"SELECT data FROM research_frames {where} ORDER BY id DESC LIMIT ?",  # noqa: S608
+            [*params, max(1, min(limit, 10000))],
+        )
+        return [json.loads(r["data"]) for r in reversed(rows)]
+
+    def research_frame_count(self, since: datetime | None = None) -> int:
+        if since is None:
+            row = self._one("SELECT COUNT(*) AS n FROM research_frames")
+        else:
+            row = self._one(
+                "SELECT COUNT(*) AS n FROM research_frames WHERE ts >= ?", (_iso(since),)
+            )
+        return int(row["n"]) if row else 0
+
+    def insert_signal(self, sig: SignalRecord) -> int:
+        cur = self._exec(
+            "INSERT INTO signals(ts, instrument, setup, evaluated, data) VALUES(?, ?, ?, ?, ?)",
+            (
+                _iso(sig.ts),
+                sig.instrument.key,
+                sig.setup,
+                1 if sig.evaluated else 0,
+                sig.model_dump_json(exclude={"id"}),
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def update_signal(self, sig: SignalRecord) -> None:
+        if sig.id is None:
+            raise ValueError("signal has no id")
+        self._exec(
+            "UPDATE signals SET evaluated = ?, data = ? WHERE id = ?",
+            (1 if sig.evaluated else 0, sig.model_dump_json(exclude={"id"}), sig.id),
+        )
+
+    def _signal_from_row(self, r: sqlite3.Row) -> SignalRecord:
+        sig = SignalRecord.model_validate_json(r["data"])
+        sig.id = r["id"]
+        return sig
+
+    def get_signal(self, signal_id: int) -> SignalRecord | None:
+        row = self._one("SELECT * FROM signals WHERE id = ?", (signal_id,))
+        return self._signal_from_row(row) if row else None
+
+    def list_signals(
+        self, limit: int = 100, setup: str | None = None, since: datetime | None = None
+    ) -> list[SignalRecord]:
+        clauses, params = [], []
+        if setup:
+            clauses.append("setup = ?")
+            params.append(setup)
+        if since is not None:
+            clauses.append("ts >= ?")
+            params.append(_iso(since))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._all(
+            f"SELECT * FROM signals {where} ORDER BY ts DESC LIMIT ?",  # noqa: S608
+            [*params, limit],
+        )
+        return [self._signal_from_row(r) for r in rows]
+
+    def unevaluated_signals(self, before: datetime, limit: int = 200) -> list[SignalRecord]:
+        """Signals that fired before `before` and still need their outcome scored."""
+        rows = self._all(
+            "SELECT * FROM signals WHERE evaluated = 0 AND ts < ? ORDER BY ts LIMIT ?",
+            (_iso(before), limit),
+        )
+        return [self._signal_from_row(r) for r in rows]
+
+    def setup_stats(self, since: datetime | None = None, min_samples: int = 30) -> list[SetupStats]:
+        """Per-setup forward-test statistics from the signal ledger."""
+        sigs = self.list_signals(limit=100_000, since=since)
+        by_setup: dict[str, list[SignalRecord]] = {}
+        for sig in sigs:
+            by_setup.setdefault(sig.setup, []).append(sig)
+
+        def avg(values: list[float]) -> float | None:
+            return round(sum(values) / len(values), 3) if values else None
+
+        stats: list[SetupStats] = []
+        for setup, items in sorted(by_setup.items()):
+            done = [x for x in items if x.evaluated]
+            hits = [x for x in done if x.first_hit is not None]
+            stats.append(
+                SetupStats(
+                    setup=setup,
+                    signals=len(items),
+                    taken=sum(1 for x in items if x.taken),
+                    evaluated=len(done),
+                    target_first_pct=(
+                        round(100 * sum(1 for x in hits if x.first_hit == "target") / len(hits), 1)
+                        if hits
+                        else None
+                    ),
+                    avg_r_close=avg([x.r_close for x in done if x.r_close is not None]),
+                    avg_mfe_r=avg([x.mfe_r for x in done if x.mfe_r is not None]),
+                    avg_mae_r=avg([x.mae_r for x in done if x.mae_r is not None]),
+                    enough_data=len(done) >= min_samples,
+                )
+            )
+        return stats
