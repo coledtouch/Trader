@@ -32,6 +32,12 @@
     setups: new Set(),
     performanceBusy: false,
     performanceLoadedAt: 0,
+    dashChartsBusy: false,
+    dashChartsLoadedAt: 0,
+    dashChartsWidth: 0,
+    dashEquity: null,
+    dashDays: null,
+    dashPeriod: 30,
     researchRunning: false,
     researchTimer: null,
     researchRequest: 0,
@@ -562,6 +568,7 @@
       setStale(null);
       renderStatus();
       if (state.view === 'dashboard' && Date.now() - state.performanceLoadedAt > 30000) loadPerformance({ background: true });
+      if (state.view === 'dashboard' && Date.now() - state.dashChartsLoadedAt > 60000) loadDashboardCharts({ background: true });
     } catch (err) {
       if (!err.fatal) setStale(err.message);
     } finally {
@@ -1152,7 +1159,10 @@
   }
 
   function tickLabel(value, step) {
-    if (step >= 1) return `$${Math.round(value).toLocaleString('en-US')}`;
+    if (step >= 1) {
+      const whole = Math.round(value);
+      return `${whole < 0 ? '-' : ''}$${Math.abs(whole).toLocaleString('en-US')}`;
+    }
     return usd.format(value);
   }
 
@@ -1167,18 +1177,20 @@
   }
 
   function drawEquity() {
-    const box = $('equity-chart');
-    const readout = $('equity-readout');
-    const points = state.equity || [];
+    state.chartWidth = drawLineChart($('equity-chart'), $('equity-readout'), state.equity || []);
+  }
+
+  /** Equity line with a crosshair readout (pointer, touch and arrow keys). Returns the
+   * width it was drawn at, or 0 when there was nothing to draw. */
+  function drawLineChart(box, readout, points) {
     if (points.length < 2) {
       readout.replaceChildren(points.length ? `Latest ${money(points[0].v)}` : '');
       box.replaceChildren(empty(points.length
         ? 'Only one equity point so far. The chart fills in while the bot runs.'
         : 'No equity history yet. A point is recorded every few minutes while the bot runs.'));
-      return;
+      return 0;
     }
     const width = Math.max(260, Math.floor(box.clientWidth));
-    state.chartWidth = width;
     const height = width < 520 ? 190 : 240;
     const pad = { left: 64, right: 12, top: 10, bottom: 26 };
     const data = downsample(points, Math.max(30, Math.floor((width - pad.left - pad.right) / 3)));
@@ -1269,7 +1281,10 @@
     };
     root.addEventListener('pointermove', (event) => show(nearest(event)));
     root.addEventListener('pointerdown', (event) => show(nearest(event)));
-    root.addEventListener('pointerleave', hide);
+    // A lifted finger also 'leaves': keep a tapped point on screen until the next tap.
+    root.addEventListener('pointerleave', (event) => {
+      if (event.pointerType !== 'touch') hide();
+    });
     root.addEventListener('focus', () => {
       readout.setAttribute('aria-live', 'polite');
       show(index);
@@ -1286,6 +1301,235 @@
     });
     box.replaceChildren(root);
     resetReadout();
+    return width;
+  }
+
+  /** SVG path for one bar: square at the zero line, 4px rounded corners at the data end. */
+  function barPath(x, w, yZero, yValue) {
+    const up = yValue < yZero;
+    const h = Math.abs(yZero - yValue);
+    const r = Math.min(4, w / 2, h);
+    const top = Math.min(yZero, yValue);
+    const bottom = top + h;
+    if (up) {
+      return `M${x},${bottom}V${top + r}Q${x},${top} ${x + r},${top}H${x + w - r}`
+        + `Q${x + w},${top} ${x + w},${top + r}V${bottom}Z`;
+    }
+    return `M${x},${top}V${bottom - r}Q${x},${bottom} ${x + r},${bottom}H${x + w - r}`
+      + `Q${x + w},${bottom} ${x + w},${bottom - r}V${top}Z`;
+  }
+
+  /**
+   * One value per day as columns. kind 'pnl' grows up for a gain and down for a loss (the
+   * direction carries the sign; the two colors only repeat it); kind 'cost' is a single
+   * neutral series from zero. Hover, tap or arrow keys show the day in the readout.
+   * Returns the width it was drawn at.
+   */
+  function drawBarChart(box, readout, items, { kind, summary, detail }) {
+    const width = Math.max(260, Math.floor(box.clientWidth));
+    const height = width < 520 ? 170 : 200;
+    const pad = { left: 60, right: 8, top: 10, bottom: 26 };
+    const values = items.map((d) => d.v);
+    const lowV = Math.min(0, ...values);
+    const highV = Math.max(0, ...values);
+    const { ticks, step } = niceTicks(lowV, highV, 3);
+    const yLo = Math.min(ticks[0], 0);
+    const yHi = Math.max(ticks[ticks.length - 1], 0);
+    const plotW = width - pad.left - pad.right;
+    const plotH = height - pad.top - pad.bottom;
+    const band = plotW / items.length;
+    const barW = Math.max(2, Math.min(24, band * 0.68)); // capped, with air between days
+    const y = (v) => pad.top + ((yHi - v) / (yHi - yLo || 1)) * plotH;
+    const cx = (i) => pad.left + band * (i + 0.5);
+    const yZero = y(0);
+
+    const root = svg('svg', {
+      class: 'chart',
+      width,
+      height,
+      viewBox: `0 0 ${width} ${height}`,
+      role: 'img',
+      tabindex: 0,
+      'aria-label': `${summary.label}. Use the arrow keys to read each day.`,
+    });
+    for (const tick of ticks) {
+      const ty = y(tick).toFixed(1);
+      root.append(svg('line', { class: tick === 0 ? 'zero' : 'grid', x1: pad.left, x2: width - pad.right, y1: ty, y2: ty }));
+      const label = svg('text', { class: 'tick', x: pad.left - 8, y: Number(ty) + 4, 'text-anchor': 'end' });
+      label.textContent = tickLabel(tick, step);
+      root.append(label);
+    }
+    if (!ticks.includes(0)) {
+      root.append(svg('line', { class: 'zero', x1: pad.left, x2: width - pad.right, y1: yZero.toFixed(1), y2: yZero.toFixed(1) }));
+    }
+    const xLabels = [[0, 'start']];
+    if (items.length > 1) xLabels.push([items.length - 1, 'end']);
+    if (width >= 480 && items.length > 4) xLabels.push([Math.floor(items.length / 2), 'middle']);
+    for (const [i, anchor] of xLabels) {
+      const tx = anchor === 'start' ? pad.left : anchor === 'end' ? width - pad.right : cx(i);
+      const label = svg('text', { class: 'tick', x: tx.toFixed(1), y: height - 6, 'text-anchor': anchor });
+      label.textContent = fmtDate.format(items[i].t);
+      root.append(label);
+    }
+    const bars = items.map((d, i) => {
+      const cls = kind === 'cost' ? 'bar cost' : d.v >= 0 ? 'bar gain' : 'bar loss';
+      const node = svg('path', {
+        class: cls,
+        d: Math.abs(y(d.v) - yZero) < 0.5 ? '' : barPath(cx(i) - barW / 2, barW, yZero, y(d.v)),
+      });
+      root.append(node);
+      return node;
+    });
+
+    const resetReadout = () => {
+      readout.replaceChildren(...summary.readout);
+      for (const bar of bars) bar.classList.remove('active', 'dim');
+    };
+    let index = items.length - 1;
+    const show = (i) => {
+      index = Math.max(0, Math.min(items.length - 1, i));
+      bars.forEach((bar, j) => {
+        bar.classList.toggle('active', j === index);
+        bar.classList.toggle('dim', j !== index);
+      });
+      readout.replaceChildren(...detail(items[index]));
+    };
+    const nearest = (event) => {
+      const rect = root.getBoundingClientRect();
+      const px = ((event.clientX - rect.left) / rect.width) * width;
+      return Math.floor((px - pad.left) / band);
+    };
+    root.addEventListener('pointermove', (event) => show(nearest(event)));
+    root.addEventListener('pointerdown', (event) => show(nearest(event)));
+    root.addEventListener('pointerleave', (event) => {
+      if (event.pointerType !== 'touch') resetReadout();
+    });
+    root.addEventListener('focus', () => {
+      readout.setAttribute('aria-live', 'polite');
+      show(index);
+    });
+    root.addEventListener('blur', () => {
+      readout.removeAttribute('aria-live');
+      resetReadout();
+    });
+    root.addEventListener('keydown', (event) => {
+      const moves = { ArrowLeft: index - 1, ArrowRight: index + 1, Home: 0, End: items.length - 1 };
+      if (!(event.key in moves)) return;
+      event.preventDefault();
+      show(moves[event.key]);
+    });
+    box.replaceChildren(root);
+    resetReadout();
+    return width;
+  }
+
+  // ------------------------------------------------------------------ dashboard charts
+  const nyDate = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+  });
+
+  /** "YYYY-MM-DD" -> a Date at noon UTC (stable across time zones and DST). */
+  const dayDate = (day) => new Date(`${day}T12:00:00Z`);
+
+  /** Daily rows inside the period, oldest first: weekdays, plus any other day with activity. */
+  function dashDays(rows, days) {
+    const today = dayDate(nyDate.format(new Date()));
+    const cutoff = new Date(today.getTime() - (days - 1) * 86400000).toISOString().slice(0, 10);
+    return asList(rows)
+      .filter((d) => d && typeof d.day === 'string' && d.day >= cutoff)
+      .map((d) => {
+        const pnl = isNum(d.start_equity) && isNum(d.end_equity) ? d.end_equity - d.start_equity : null;
+        const cost = isNum(d.llm_cost) ? d.llm_cost : 0;
+        return { day: d.day, t: dayDate(d.day), pnl, cost, trades: d.trades || 0, wins: d.wins || 0, losses: d.losses || 0 };
+      })
+      .filter((d) => {
+        const weekday = d.t.getUTCDay() >= 1 && d.t.getUTCDay() <= 5;
+        return weekday || d.trades > 0 || d.cost > 0 || (isNum(d.pnl) && Math.abs(d.pnl) >= 0.005);
+      })
+      .sort((a, b) => (a.day < b.day ? -1 : 1));
+  }
+
+  async function loadDashboardCharts({ background = false } = {}) {
+    if (state.dashChartsBusy) return;
+    state.dashChartsBusy = true;
+    const days = Number($('performance-days').value || '30');
+    const boxes = ['dash-equity-chart', 'dash-pnl-chart', 'dash-cost-chart'].map((id) => $(id));
+    for (const box of boxes) box.classList.add('is-loading');
+    try {
+      const [equity, rows] = await Promise.all([
+        api('GET', `/api/equity?days=${days}`, undefined, { background }),
+        api('GET', `/api/days?limit=${days + 14}`, undefined, { background }),
+      ]);
+      if (Number($('performance-days').value || '30') !== days) return;
+      state.dashEquity = asList(equity)
+        .map((p) => ({ t: parseTs(p && p.ts), v: p && p.equity }))
+        .filter((p) => p.t && isNum(p.v))
+        .map((p) => ({ t: p.t.getTime(), v: p.v }))
+        .sort((a, b) => a.t - b.t);
+      state.dashDays = dashDays(rows, days);
+      state.dashPeriod = days;
+      drawDashboardCharts();
+      state.dashChartsLoadedAt = Date.now();
+    } catch (err) {
+      if (!err.fatal) boxes[0].replaceChildren(errorLine(`Charts unavailable: ${err.message}`));
+    } finally {
+      state.dashChartsBusy = false;
+      for (const box of boxes) box.classList.remove('is-loading');
+      if (Number($('performance-days').value || '30') !== days) loadDashboardCharts();
+    }
+  }
+
+  function drawDashboardCharts() {
+    const days = state.dashPeriod || 30;
+    const period = days === 1 ? 'today' : `last ${days} days`;
+    setText($('dash-equity-title'), days === 1 ? 'Equity, last 24 hours' : `Equity, ${period}`);
+    state.dashChartsWidth = drawLineChart($('dash-equity-chart'), $('dash-equity-readout'), state.dashEquity || [])
+      || Math.floor($('dash-equity-chart').clientWidth);
+    const rows = state.dashDays || [];
+    const pnlRows = rows.filter((d) => isNum(d.pnl)).map((d) => ({ ...d, v: d.pnl }));
+    const costRows = rows.map((d) => ({ ...d, v: d.cost }));
+    const pnlBox = $('dash-pnl-chart');
+    const costBox = $('dash-cost-chart');
+    if (days === 1 || pnlRows.length < 2) {
+      $('dash-pnl-readout').replaceChildren();
+      $('dash-cost-readout').replaceChildren();
+      const why = days === 1
+        ? 'Choose 7 days or more to see one bar per day. Today’s numbers are in the tiles above.'
+        : 'Bars appear once the bot has run on at least two trading days in this period.';
+      pnlBox.replaceChildren(empty(why));
+      costBox.replaceChildren(empty(why));
+    } else {
+      const total = pnlRows.reduce((sum, d) => sum + d.v, 0);
+      const up = pnlRows.filter((d) => d.v > 0.005).length;
+      const down = pnlRows.filter((d) => d.v < -0.005).length;
+      drawBarChart(pnlBox, $('dash-pnl-readout'), pnlRows, {
+        kind: 'pnl',
+        summary: {
+          label: `Profit or loss per day, ${period}: total ${signedMoney(total)}, ${up} up days, ${down} down days`,
+          readout: [pnlSpan(total, signedMoney(total)), ` total · ${up} up, ${down} down days`],
+        },
+        detail: (d) => [
+          pnlSpan(d.v, signedMoney(d.v)), ` · ${dayLabel(d.day)}`,
+          d.trades ? ` · ${d.trades} ${d.trades === 1 ? 'trade' : 'trades'}` : ' · no trades',
+        ],
+      });
+      const spent = costRows.reduce((sum, d) => sum + d.v, 0);
+      drawBarChart(costBox, $('dash-cost-readout'), costRows, {
+        kind: 'cost',
+        summary: {
+          label: `AI cost per day, ${period}: total ${usd.format(spent)}`,
+          readout: [el('strong', { text: usd.format(spent) }), ` total · ${usd.format(spent / costRows.length)} a day on average`],
+        },
+        detail: (d) => [el('strong', { text: usdFine.format(d.v) }), ` · ${dayLabel(d.day)}`],
+      });
+    }
+    $('dash-days-table').replaceChildren(rows.length ? table([
+      { label: 'Day', head: true, value: (d) => dayLabel(d.day) },
+      { label: 'Profit or loss', num: true, value: (d) => (isNum(d.pnl) ? pnlSpan(d.pnl, signedMoney(d.pnl)) : DASH) },
+      { label: 'Trades', num: true, value: (d) => String(d.trades) },
+      { label: 'Wins / losses', num: true, value: (d) => `${d.wins} / ${d.losses}` },
+      { label: 'AI cost', num: true, value: (d) => usdFine.format(d.cost) },
+    ], rows.slice().reverse()) : empty('No daily records in this period yet.'));
   }
 
   function renderTrades(data) {
@@ -2147,7 +2391,10 @@
     if (!switched) return;
     if (name !== 'signals') clearTimeout(state.researchTimer);
     window.scrollTo(0, 0);
-    if (name === 'dashboard') loadPerformance();
+    if (name === 'dashboard') {
+      loadPerformance();
+      loadDashboardCharts();
+    }
     else if (name === 'activity') loadActivity();
     else if (name === 'signals') loadSignals();
     else if (name === 'settings') loadSettingsView();
@@ -2201,7 +2448,10 @@
     $('signals-refresh').addEventListener('click', () => busy($('signals-refresh'), loadSignals));
     $('stats-days').addEventListener('change', loadSignalPeriod);
     $('signals-setup').addEventListener('change', loadSignalList);
-    $('performance-days').addEventListener('change', loadPerformance);
+    $('performance-days').addEventListener('change', () => {
+      loadPerformance();
+      loadDashboardCharts();
+    });
     $('research-run').addEventListener('click', runResearch);
 
     const form = $('settings-form');
@@ -2231,6 +2481,12 @@
       const width = Math.floor($('equity-chart').clientWidth);
       if (state.view === 'activity' && state.equity && width && Math.abs(width - state.chartWidth) > 4) drawEquity();
     }).observe($('equity-chart'));
+    new ResizeObserver(() => {
+      const width = Math.floor($('dash-equity-chart').clientWidth);
+      if (state.view === 'dashboard' && state.dashDays && width && Math.abs(width - state.dashChartsWidth) > 4) {
+        drawDashboardCharts();
+      }
+    }).observe($('dash-equity-chart'));
   }
 
   async function start() {

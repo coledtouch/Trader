@@ -27,6 +27,11 @@
   --danger-hover: #a01a23;
   --danger-contrast: #ffffff;
   --focus: #2456c4;
+  /* Chart marks (validated for color-vision deficiency and >= 3:1 on --surface):
+     gain/loss is a blue/orange diverging pair, cost a neutral single series. */
+  --chart-gain: #2456c4;
+  --chart-loss: #c2410c;
+  --chart-cost: #5d6879;
   --backdrop: rgb(10 16 28 / 55%);
   --shadow: 0 1px 2px rgb(16 24 40 / 6%), 0 1px 3px rgb(16 24 40 / 6%);
   --shadow-lg: 0 12px 32px rgb(16 24 40 / 22%);
@@ -64,6 +69,9 @@
     --accent-soft: #1b2a48;
     --pos: #4fd086;
     --pos-soft: #10301e;
+    --chart-gain: #5b8ff0;
+    --chart-loss: #d97436;
+    --chart-cost: #98a4b3;
     --neg: #ff7d7d;
     --neg-soft: #3b1619;
     --warn: #f3bb4f;
@@ -1168,6 +1176,64 @@ main:focus {
   outline-offset: 4px;
 }
 
+.chart .zero {
+  stroke: var(--muted);
+  stroke-width: 1;
+  shape-rendering: crispedges;
+}
+
+.chart .bar {
+  transition: opacity 0.12s;
+}
+
+.chart .bar.gain {
+  fill: var(--chart-gain);
+}
+
+.chart .bar.loss {
+  fill: var(--chart-loss);
+}
+
+.chart .bar.cost {
+  fill: var(--chart-cost);
+}
+
+.chart .bar.dim {
+  opacity: 0.45;
+}
+
+/* ------------------------------------------------------------------ dashboard charts */
+.dash-filters {
+  margin-bottom: 16px;
+}
+
+.charts-grid {
+  display: grid;
+  gap: 20px;
+}
+
+@media (min-width: 900px) {
+  .charts-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .chart-wide {
+    grid-column: 1 / -1;
+  }
+}
+
+.chart-panel {
+  min-width: 0;
+  margin: 0;
+}
+
+.chart-title {
+  margin-bottom: 4px;
+  color: var(--text-2);
+  font-size: 14px;
+  font-weight: 600;
+}
+
 .summary-line {
   margin-bottom: 12px;
   color: var(--text-2);
@@ -1699,5 +1765,10 @@ form[data-dirty="true"] .form-actions {
   .switch::after {
     forced-color-adjust: none;
     background: CanvasText;
+  }
+
+  /* Bars keep their meaning without color: direction carries gain or loss. */
+  .chart .bar {
+    fill: CanvasText;
   }
 }

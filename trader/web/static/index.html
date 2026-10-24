@@ -11,8 +11,8 @@
   <link rel="manifest" href="/static/manifest.webmanifest" crossorigin="use-credentials">
   <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
-  <link rel="stylesheet" href="/static/styles.css?v=11">
-  <script src="/static/app.js?v=11" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=12">
+  <script src="/static/app.js?v=12" defer></script>
 </head>
 <body data-mode="unknown">
   <a class="skip-link" href="#main">Skip to content</a>
@@ -74,18 +74,20 @@
     <!-- ============================================================ Dashboard -->
     <section id="view-dashboard" class="view" role="tabpanel" aria-labelledby="tab-dashboard">
       <h1 class="visually-hidden">Dashboard</h1>
+      <div class="filters dash-filters">
+        <label for="performance-days">Period</label>
+        <select id="performance-days" aria-describedby="period-note">
+          <option value="1">Today</option>
+          <option value="7">Last 7 days</option>
+          <option value="30" selected>Last 30 days</option>
+          <option value="90">Last 90 days</option>
+        </select>
+        <span id="period-note" class="small muted">Applies to the profit summary and the charts</span>
+      </div>
       <div class="dash-grid">
         <section class="card span-all performance-card" aria-labelledby="performance-heading">
           <div class="card-head">
             <h2 id="performance-heading" class="card-title">Profit after costs</h2>
-            <div class="filters">
-              <label for="performance-days">Period</label>
-              <select id="performance-days">
-                <option value="7">Last 7 days</option>
-                <option value="30" selected>Last 30 days</option>
-                <option value="90">Last 90 days</option>
-              </select>
-            </div>
           </div>
           <div id="performance-summary" aria-live="polite" aria-atomic="true"><p class="empty">Loading performance…</p></div>
         </section>
@@ -111,6 +113,31 @@
             </div>
             <p id="pnl-note" class="meter-note"></p>
           </div>
+        </section>
+
+        <section class="card span-all charts-card" aria-labelledby="charts-heading">
+          <h2 id="charts-heading" class="card-title">Charts</h2>
+          <div class="charts-grid">
+            <figure class="chart-panel chart-wide">
+              <figcaption id="dash-equity-title" class="chart-title">Equity</figcaption>
+              <p id="dash-equity-readout" class="readout"></p>
+              <div id="dash-equity-chart" class="chart-box"><p class="empty">Loading…</p></div>
+            </figure>
+            <figure class="chart-panel">
+              <figcaption class="chart-title">Profit or loss per day</figcaption>
+              <p id="dash-pnl-readout" class="readout"></p>
+              <div id="dash-pnl-chart" class="chart-box"></div>
+            </figure>
+            <figure class="chart-panel">
+              <figcaption class="chart-title">AI cost per day</figcaption>
+              <p id="dash-cost-readout" class="readout"></p>
+              <div id="dash-cost-chart" class="chart-box"></div>
+            </figure>
+          </div>
+          <details class="more mt-12">
+            <summary>Table view</summary>
+            <div id="dash-days-table"></div>
+          </details>
         </section>
 
         <section class="card" aria-labelledby="controls-heading">
