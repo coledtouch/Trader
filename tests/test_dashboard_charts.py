@@ -19,7 +19,7 @@ def _run(script: str) -> dict:
     needle = "\n  start();\n"
     assert source.count(needle) == 1
     source = source.replace(
-        needle, "\n  globalThis.__charts = { dashDays, tickLabel, barPath, nyDate };\n", 1
+        needle, "\n  globalThis.__charts = { dashDays, tickLabel, barPath, nyDate, gutter };\n", 1
     )
     node = shutil.which("node")
     assert node is not None
@@ -71,6 +71,7 @@ console.log(JSON.stringify({
   quarter: [-5, -2.5, 0, 2.5].map((v) => c.tickLabel(v, 2.5)),
   fine: [0, 0.025, 0.05, 0.075].map((v) => c.tickLabel(v, 0.025)),
   drift: c.tickLabel(-1e-12, 0.1),
+  gutters: [c.gutter(['$480', '$510'], 64), c.gutter(['$1,000,002.50', '$999,997.50'], 64)],
   up: c.barPath(10, 12, 100, 60), down: c.barPath(10, 12, 100, 140),
 }));
 """
@@ -79,6 +80,7 @@ console.log(JSON.stringify({
     assert out["quarter"] == ["-$5.00", "-$2.50", "$0.00", "$2.50"]  # not -$2 / $3
     assert out["fine"] == ["$0.000", "$0.025", "$0.050", "$0.075"]
     assert out["drift"] == "$0.00"  # never "-$0.00"
+    assert out["gutters"] == [64, 105]  # a $1M account's $2.50 labels get a wider gutter
     # Up bars: square at the zero line (100), rounded at the top (60); down bars mirror it.
     assert out["up"].startswith("M10,100V64Q10,60 14,60") and out["up"].endswith("V100Z")
     assert out["down"].startswith("M10,100V136Q10,140 14,140") and out["down"].endswith("V100Z")

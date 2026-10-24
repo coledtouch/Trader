@@ -1176,6 +1176,9 @@
     return `${v < 0 ? '-' : ''}${tickFormats.get(digits).format(Math.abs(v))}`;
   }
 
+  /** Left gutter that fits the longest axis label (about 7px a character at 12px). */
+  const gutter = (labels, min) => Math.max(min, 14 + 7 * Math.max(...labels.map((t) => t.length)));
+
   function equityReadout(first, last) {
     const change = last.v - first.v;
     const changePct = first.v ? (change / first.v) * 100 : null;
@@ -1186,13 +1189,14 @@
     ];
   }
 
-  function drawEquity() {
-    state.chartWidth = drawLineChart($('equity-chart'), $('equity-readout'), state.equity || []);
+  function drawEquity(opts) {
+    state.chartWidth = drawLineChart($('equity-chart'), $('equity-readout'), state.equity || [], opts);
   }
 
   /** Equity line with a crosshair readout (pointer, touch and arrow keys). Returns the
-   * width it was drawn at, or 0 when there was nothing to draw. */
-  function drawLineChart(box, readout, points) {
+   * width it was drawn at, or 0 when there was nothing to draw. `keepPlace` (a resize or
+   * background refresh of the same view) keeps the point being read. */
+  function drawLineChart(box, readout, points, { keepPlace = false } = {}) {
     if (points.length < 2) {
       readout.replaceChildren(points.length ? `Latest ${money(points[0].v)}` : '');
       box.replaceChildren(empty(points.length
@@ -1202,17 +1206,19 @@
     }
     const width = Math.max(260, Math.floor(box.clientWidth));
     const height = width < 520 ? 190 : 240;
-    const pad = { left: 64, right: 12, top: 10, bottom: 26 };
     const prev = box.querySelector('svg.chart');
     const hadFocus = Boolean(prev) && prev === document.activeElement;
-    const keptT = prev && prev.dataset.selected ? Number(prev.dataset.selected) : null;
+    const keptT = keepPlace && prev && prev.dataset.selected ? Number(prev.dataset.selected) : null;
+    // Ticks from the full series (downsampling keeps each bucket's low and high anyway),
+    // so the gutter can fit the labels before the plot width is known.
+    const lowV = points.reduce((m, p) => Math.min(m, p.v), Infinity);
+    const highV = points.reduce((m, p) => Math.max(m, p.v), -Infinity);
+    const { ticks, step } = niceTicks(lowV, highV, 4);
+    const tickText = ticks.map((t) => tickLabel(t, step));
+    const pad = { left: gutter(tickText, 64), right: 12, top: 10, bottom: 26 };
     const data = downsample(points, Math.max(30, Math.floor((width - pad.left - pad.right) / 3)));
     const first = data[0];
     const last = data[data.length - 1];
-    const values = data.map((p) => p.v);
-    const lowV = Math.min(...values);
-    const highV = Math.max(...values);
-    const { ticks, step } = niceTicks(lowV, highV, 4);
     const yLo = ticks[0];
     const yHi = ticks[ticks.length - 1];
     const plotW = width - pad.left - pad.right;
@@ -1232,13 +1238,13 @@
         + `${fmtDate.format(new Date(last.t))}; low ${money(lowV)}, high ${money(highV)}. `
         + 'Use the arrow keys to read individual points.',
     });
-    for (const tick of ticks) {
+    ticks.forEach((tick, i) => {
       const ty = y(tick).toFixed(1);
       root.append(svg('line', { class: 'grid', x1: pad.left, x2: width - pad.right, y1: ty, y2: ty }));
       const label = svg('text', { class: 'tick', x: pad.left - 8, y: Number(ty) + 4, 'text-anchor': 'end' });
-      label.textContent = tickLabel(tick, step);
+      label.textContent = tickText[i];
       root.append(label);
-    }
+    });
     const multiDay = span > 36 * 3600 * 1000;
     const xFmt = (t) => (multiDay ? fmtDate : fmtTime).format(new Date(t));
     const xLabels = [[first.t, 'start'], [last.t, 'end']];
@@ -1264,6 +1270,7 @@
 
     const resetReadout = () => readout.replaceChildren(...equityReadout(first, last));
     let index = data.length - 1;
+    let restoring = false; // focus moved here by a redraw, not by the reader
     const show = (i) => {
       index = Math.max(0, Math.min(data.length - 1, i));
       const px = xs[index].toFixed(1);
@@ -1304,7 +1311,7 @@
     root.addEventListener('pointercancel', hide);
     root.addEventListener('focus', () => {
       readout.setAttribute('aria-live', 'polite');
-      show(index);
+      if (!restoring) show(index);
     });
     root.addEventListener('blur', () => {
       if (!root.isConnected) return; // replaced by a redraw, which owns the readout now
@@ -1319,12 +1326,18 @@
     });
     box.replaceChildren(root);
     resetReadout();
-    // A redraw keeps the reader's place: the focused chart and the point being read.
-    if (keptT !== null) {
+    // A redraw keeps focus on the chart, and with keepPlace the point being read (if it
+    // is still in the window).
+    const keep = keptT !== null && keptT >= first.t && keptT <= last.t;
+    if (keep) {
       index = data.reduce((best, p, i) => (Math.abs(p.t - keptT) < Math.abs(data[best].t - keptT) ? i : best), 0);
     }
-    if (hadFocus) root.focus({ preventScroll: true });
-    else if (keptT !== null) show(index);
+    if (hadFocus) {
+      restoring = true;
+      root.focus({ preventScroll: true });
+      restoring = false;
+    }
+    if (keep) show(index);
     return width;
   }
 
@@ -1349,18 +1362,19 @@
    * neutral series from zero. Hover, tap or arrow keys show the day in the readout.
    * Returns the width it was drawn at.
    */
-  function drawBarChart(box, readout, items, { kind, summary, detail }) {
+  function drawBarChart(box, readout, items, { kind, summary, detail, keepPlace = false }) {
     const width = Math.max(260, Math.floor(box.clientWidth));
     const height = width < 520 ? 170 : 200;
-    const pad = { left: 60, right: 8, top: 10, bottom: 26 };
     const prev = box.querySelector('svg.chart');
     const hadFocus = Boolean(prev) && prev === document.activeElement;
-    const keptDay = prev ? prev.dataset.selected : undefined;
+    const keptDay = keepPlace && prev ? prev.dataset.selected : undefined;
     const values = items.map((d) => d.v);
     const lowV = Math.min(0, ...values);
     const highV = Math.max(0, ...values);
     // Costs never go below zero: an all-zero cost period gets a $0-$1 axis, not -$1..$1.
     const { ticks, step } = niceTicks(lowV, kind === 'cost' && highV <= 0 ? 1 : highV, 3);
+    const tickText = ticks.map((t) => tickLabel(t, step));
+    const pad = { left: gutter(tickText, 60), right: 8, top: 10, bottom: 26 };
     const yLo = Math.min(ticks[0], 0);
     const yHi = Math.max(ticks[ticks.length - 1], 0);
     const plotW = width - pad.left - pad.right;
@@ -1380,13 +1394,13 @@
       tabindex: 0,
       'aria-label': `${summary.label}. Use the arrow keys to read each day.`,
     });
-    for (const tick of ticks) {
+    ticks.forEach((tick, i) => {
       const ty = y(tick).toFixed(1);
       root.append(svg('line', { class: tick === 0 ? 'zero' : 'grid', x1: pad.left, x2: width - pad.right, y1: ty, y2: ty }));
       const label = svg('text', { class: 'tick', x: pad.left - 8, y: Number(ty) + 4, 'text-anchor': 'end' });
-      label.textContent = tickLabel(tick, step);
+      label.textContent = tickText[i];
       root.append(label);
-    }
+    });
     if (!ticks.includes(0)) {
       root.append(svg('line', { class: 'zero', x1: pad.left, x2: width - pad.right, y1: yZero.toFixed(1), y2: yZero.toFixed(1) }));
     }
@@ -1415,6 +1429,7 @@
       delete root.dataset.selected;
     };
     let index = items.length - 1;
+    let restoring = false; // focus moved here by a redraw, not by the reader
     const show = (i) => {
       index = Math.max(0, Math.min(items.length - 1, i));
       bars.forEach((bar, j) => {
@@ -1437,7 +1452,7 @@
     root.addEventListener('pointercancel', resetReadout); // the finger scrolled the page
     root.addEventListener('focus', () => {
       readout.setAttribute('aria-live', 'polite');
-      show(index);
+      if (!restoring) show(index);
     });
     root.addEventListener('blur', () => {
       if (!root.isConnected) return; // replaced by a redraw, which owns the readout now
@@ -1452,11 +1467,15 @@
     });
     box.replaceChildren(root);
     resetReadout();
-    // A redraw keeps the reader's place: the focused chart and the day being read.
+    // A redraw keeps focus on the chart, and with keepPlace the day being read.
     const kept = keptDay ? items.findIndex((d) => d.day === keptDay) : -1;
     if (kept >= 0) index = kept;
-    if (hadFocus) root.focus({ preventScroll: true });
-    else if (kept >= 0) show(index);
+    if (hadFocus) {
+      restoring = true;
+      root.focus({ preventScroll: true });
+      restoring = false;
+    }
+    if (kept >= 0) show(index);
     return width;
   }
 
@@ -1508,7 +1527,7 @@
       state.dashPeriod = days;
       // The 60-second background refresh redraws only when the data moved.
       const fresh = changed('dash-charts', [days, state.dashEquity, state.dashDays]);
-      if (fresh || !background) drawDashboardCharts();
+      if (fresh || !background) drawDashboardCharts({ keepPlace: background });
       state.dashChartsLoadedAt = Date.now();
     } catch (err) {
       rendered.delete('dash-charts'); // the next good response replaces the error line
@@ -1523,11 +1542,11 @@
   /** Cents for a dollar or more; up to 4 decimals below that, where AI costs live. */
   const costText = (v) => (Math.abs(v) >= 1 ? usd : usdFine).format(v);
 
-  function drawDashboardCharts() {
+  function drawDashboardCharts({ keepPlace = false } = {}) {
     const days = state.dashPeriod || 30;
     const period = days === 1 ? 'today' : `last ${days} days`;
     setText($('dash-equity-title'), days === 1 ? 'Equity, last 24 hours' : `Equity, ${period}`);
-    state.dashChartsWidth = drawLineChart($('dash-equity-chart'), $('dash-equity-readout'), state.dashEquity || [])
+    state.dashChartsWidth = drawLineChart($('dash-equity-chart'), $('dash-equity-readout'), state.dashEquity || [], { keepPlace })
       || Math.floor($('dash-equity-chart').clientWidth);
     const rows = state.dashDays || [];
     const pnlRows = rows.filter((d) => isNum(d.pnl)).map((d) => ({ ...d, v: d.pnl }));
@@ -1548,6 +1567,7 @@
       const down = pnlRows.filter((d) => d.v < -0.005).length;
       drawBarChart(pnlBox, $('dash-pnl-readout'), pnlRows, {
         kind: 'pnl',
+        keepPlace,
         summary: {
           label: `Profit or loss per day, ${period}: total ${signedMoney(total)}, ${up} up days, ${down} down days`,
           readout: [pnlSpan(total, signedMoney(total)), ` total · ${up} up, ${down} down days`],
@@ -1560,6 +1580,7 @@
       const spent = costRows.reduce((sum, d) => sum + d.v, 0);
       drawBarChart(costBox, $('dash-cost-readout'), costRows, {
         kind: 'cost',
+        keepPlace,
         summary: {
           label: `AI cost per day, ${period}: total ${costText(spent)}`,
           readout: [el('strong', { text: costText(spent) }), ` total · ${costText(spent / costRows.length)} a day on average`],
@@ -2523,12 +2544,12 @@
     });
     new ResizeObserver(() => {
       const width = Math.floor($('equity-chart').clientWidth);
-      if (state.view === 'activity' && state.equity && width && Math.abs(width - state.chartWidth) > 4) drawEquity();
+      if (state.view === 'activity' && state.equity && width && Math.abs(width - state.chartWidth) > 4) drawEquity({ keepPlace: true });
     }).observe($('equity-chart'));
     new ResizeObserver(() => {
       const width = Math.floor($('dash-equity-chart').clientWidth);
       if (state.view === 'dashboard' && state.dashDays && width && Math.abs(width - state.dashChartsWidth) > 4) {
-        drawDashboardCharts();
+        drawDashboardCharts({ keepPlace: true });
       }
     }).observe($('dash-equity-chart'));
   }
