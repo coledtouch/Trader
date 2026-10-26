@@ -2341,3 +2341,23 @@ async def test_notifier_sanitizes_header_values() -> None:
     assert await notifier(handler).send("Ünïcode\r\nInjected: yes", "m", priority="bogus")
     assert seen[0].headers["Title"] == "?n?code  Injected: yes"
     assert seen[0].headers["Priority"] == "default"
+
+
+async def test_quotes_that_tick_during_the_fetch_are_not_from_the_future(db, config) -> None:
+    """On IBKR a quote's timestamp is when its latest tick arrived, so a live quote fetched
+    a few seconds into a round is newer than the round's start. The eligibility check, the
+    send check and the dashboard must judge it by when it arrived, not reject it as a quote
+    from the future (which blocked every entry fetched late in the round)."""
+    h = await harness(db, config)
+    original = h.broker.quote
+
+    async def slow_quote(inst):
+        h.clock.advance(seconds=2)  # other symbols' bars, a fresh subscription...
+        return await original(inst)  # stamped with the arrival time
+
+    h.broker.quote = slow_quote
+    rec = await enter_f(h)
+    assert rec.status == OrderStatus.FILLED
+    assert not any("in the future" in (s.skip_reason or "") for s in db.list_signals())
+    health = h.engine.status().quote_health
+    assert health and all(q.valid for q in health), health

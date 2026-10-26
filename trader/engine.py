@@ -967,7 +967,7 @@ class Engine:
         await self._ensure_connected(now)
         req = rec.request
         quote = await self.broker.quote(req.instrument)
-        self._track_halt(req.instrument.key, quote, now)
+        self._track_halt(req.instrument.key, quote, self._now())
         account = await self.broker.account()
         positions = await self.broker.positions()
         open_orders = await self.broker.open_orders()
@@ -1172,13 +1172,18 @@ class Engine:
         # Held positions are re-quoted every monitor tick, other symbols once per decision
         # cycle (an entry always re-quotes first): only a missed round makes it out of date.
         held = any(p.qty > 0 and p.instrument.key == key for p in self._positions)
-        interval = (
-            self.settings.monitor_seconds
-            if held
-            else max(self.settings.monitor_seconds, self.settings.cycle_seconds)
-        )
+        # The loop waits the interval after a round ends, and a round itself takes time (a
+        # decision cycle up to DECISION_MAX_AGE), so allow for that before calling it missed.
+        if held:
+            allowed = (STALE_QUOTE_INTERVALS + 1) * self.settings.monitor_seconds
+        else:
+            allowed = (
+                STALE_QUOTE_INTERVALS
+                * max(self.settings.monitor_seconds, self.settings.cycle_seconds)
+                + DECISION_MAX_AGE.total_seconds()
+            )
         since = (_aware(now) - _aware(quoted_at)).total_seconds()
-        if problem is None and since > STALE_QUOTE_INTERVALS * interval:
+        if problem is None and since > allowed:
             problem = f"not re-checked for {since:.0f}s"
         cooldown = self.risk.limits.halt_cooldown_minutes
         halted_at = self._last_halt_at.get(key)
@@ -1399,7 +1404,7 @@ class Engine:
         out: dict[str, Quote] = {}
         for key, quote in await asyncio.gather(*(one(i) for i in instruments)):
             if quote is not None:
-                self._track_halt(key, quote, now)
+                self._track_halt(key, quote, self._now())
                 out[key] = quote
         return out
 
@@ -2484,7 +2489,8 @@ class Engine:
             async with sem:
                 try:
                     quote = await self.broker.quote(inst)
-                    self._track_halt(inst.key, quote, now)
+                    # The time it arrived: a live quote can tick after this cycle's `now`.
+                    self._track_halt(inst.key, quote, self._now())
                     bars = await self.broker.bars(inst, self.settings.bar_size, lookback)
                 except Exception as exc:
                     log.warning("market data for %s failed: %s", inst.key, exc)
@@ -2619,8 +2625,10 @@ class Engine:
             for s in reversed(self.db.list_signals(limit=500, since=now - SIGNAL_DEDUPE))
         }
         logged: list[_Logged] = []
+        # After the fetch: quotes that ticked while it ran are not "in the future".
+        checked_at = self._now()
         for cand in candidates:
-            blocked = self._not_actionable(cand, quotes.get(cand.instrument.key), now)
+            blocked = self._not_actionable(cand, quotes.get(cand.instrument.key), checked_at)
             existing = recent.get((cand.instrument.key, cand.setup))
             if existing is not None and existing.id is not None:
                 logged.append(_Logged(cand, existing.id, False, blocked))
@@ -2812,6 +2820,7 @@ class Engine:
                     skip_reason=f"decision too old ({age.total_seconds():.0f}s after its data)",
                 )
             quote = await self.broker.quote(inst)
+            send_now = self._now()  # the risk check must not see the quote as from the future
             self._track_halt(key, quote, send_now)
             account = self._with_day_trades(await self.broker.account(), send_now)
             positions = await self.broker.positions()
