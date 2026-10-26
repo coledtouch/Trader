@@ -58,7 +58,9 @@ PUSH_HOSTS = (
     "notify.windows.com",
     "push.apple.com",
 )
-URGENCY = {"min": "very-low", "low": "low", "high": "high", "max": "high", "urgent": "high"}
+# Every alert is a visible notification and they are rare, so they go out "high" (FCM then
+# delivers at once even to a phone in Doze); only explicitly low ones may wait.
+URGENCY = {"min": "low", "low": "normal"}
 EMOJI = {
     "rotating_light": "🚨",
     "warning": "⚠️",
@@ -186,6 +188,32 @@ def load_vapid_key(
     return key
 
 
+def push_key_matches(config: AppConfig, db: Database) -> bool | None:
+    """None: no key yet (or no TRADER_SECRET_KEY). False: the stored key cannot be read
+    with the current TRADER_SECRET_KEY (it was replaced), so push needs a reset."""
+    try:
+        return None if load_vapid_key(config, db) is None else True
+    except crypto.SecretKeyError:
+        return False
+
+
+def reset_push(db: Database) -> int:
+    """Forget the push key and every device. The next visit to Settings creates a new key;
+    each device turns alerts on again. A browser's old subscription is dropped when it
+    sees the new key, so whoever held the old key can no longer reach it. Returns the
+    number of devices removed."""
+    db.delete_kv(VAPID_KV_KEY)
+    return db.delete_all_push_subscriptions()
+
+
+def reset_if_unreadable(config: AppConfig, db: Database) -> int | None:
+    """After TRADER_SECRET_KEY changed: reset push if its key no longer decrypts. Returns
+    the number of devices removed, or None when nothing needed resetting."""
+    if push_key_matches(config, db) is False:
+        return reset_push(db)
+    return None
+
+
 def public_key_b64(key: ec.EllipticCurvePrivateKey) -> str:
     """The applicationServerKey the browser subscribes with (uncompressed P-256 point)."""
     raw = key.public_key().public_bytes(
@@ -292,9 +320,13 @@ class WebPush:
     def _key(self) -> ec.EllipticCurvePrivateKey | None:
         try:
             return load_vapid_key(self._config, self._db)
-        except crypto.SecretKeyError as exc:
+        except crypto.SecretKeyError:
             if not self._key_error_logged:
-                log.warning("phone push disabled: %s", exc)
+                log.warning(
+                    "phone push disabled: the stored push key does not match TRADER_SECRET_KEY. "
+                    "Run `python -m trader push-reset` (or Reset in Settings > Phone alerts), "
+                    "then turn alerts on again on each device"
+                )
                 self._key_error_logged = True
             return None
 
@@ -324,7 +356,7 @@ class WebPush:
             return False
         headers = {
             "TTL": str(TTL_S),
-            "Urgency": URGENCY.get(priority, "normal"),
+            "Urgency": URGENCY.get(priority, "high"),
             "Content-Encoding": "aes128gcm",
             "Content-Type": "application/octet-stream",
         }

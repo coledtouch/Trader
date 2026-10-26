@@ -273,8 +273,9 @@ test('a push message is shown as a notification, even with no window open', asyn
   const { title, options } = w.shown[0];
   assert.equal(title, '⚠️ Halted');
   assert.equal(options.body, 'Daily loss limit reached');
-  assert.equal(options.icon, '/static/icon-192.png');
-  assert.equal(options.badge, '/static/badge-96.png');
+  const png = (file) => `data:image/png;base64,${fs.readFileSync(path.join(STATIC, file)).toString('base64')}`;
+  assert.equal(options.icon, png('icon-192.png')); // inline: no fetch behind Cloudflare Access
+  assert.match(options.badge, /^data:image\/png;base64,iVBOR/);
   assert.equal(options.requireInteraction, true);
   assert.equal(options.timestamp, Date.parse('2026-10-26T14:00:00Z'));
 });

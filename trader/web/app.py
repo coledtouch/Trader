@@ -828,11 +828,16 @@ def create_app(
     # ------------------------------------------------------------ phone push
     def push_payload(request: Request) -> dict[str, Any]:
         st = state(request)
+        mismatch = False
         try:
             key = webpush.load_vapid_key(st.config, st.db, create=True)
             problem = None if key else "Set TRADER_SECRET_KEY to use phone alerts."
         except crypto.SecretKeyError:
-            key, problem = None, "The stored push key does not match TRADER_SECRET_KEY."
+            key, mismatch = None, True
+            problem = (
+                "The phone-alert key does not match TRADER_SECRET_KEY (it was replaced). "
+                "Reset phone alerts, then turn them on again on each device."
+            )
         devices = [
             {k: d[k] for k in ("id", "label", "created_at", "last_ok_at", "failures")}
             for d in st.db.list_push_subscriptions()
@@ -844,6 +849,7 @@ def create_app(
             "devices": devices,
             "max_devices": webpush.MAX_DEVICES,
             "ntfy": bool((st.config.ntfy_url or "").strip()),
+            "key_mismatch": mismatch,
         }
 
     @app.get("/api/push")
@@ -884,6 +890,13 @@ def create_app(
         if st.db.delete_push_subscription(device):
             audit(request, "push_device_removed", {"device": device})
         return push_payload(request)
+
+    @app.post("/api/push/reset")
+    async def push_reset(request: Request, session: Session = Depends(require_csrf)) -> Any:
+        st = state(request)
+        removed = webpush.reset_push(st.db)
+        audit(request, "push_reset", {"devices": removed, "reason": "settings"})
+        return await run_in_threadpool(push_payload, request)
 
     @app.post("/api/push/test")
     async def push_test(

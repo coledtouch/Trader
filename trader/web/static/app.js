@@ -2439,6 +2439,13 @@
     return Uint8Array.from(text, (ch) => ch.charCodeAt(0));
   }
 
+  /** True when `sub` was made with the server's current key (`key`, bytes). */
+  function sameKey(sub, key) {
+    const current = sub && sub.options && sub.options.applicationServerKey
+      ? new Uint8Array(sub.options.applicationServerKey) : null;
+    return Boolean(current) && current.length === key.length && current.every((b, i) => b === key[i]);
+  }
+
   async function deviceIdOf(endpoint) {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(endpoint));
     return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
@@ -2494,6 +2501,7 @@
     setText($('push-status'), status);
     $('push-enable').hidden = !(pushSupported() && info.available && !mine && !blocked);
     $('push-disable').hidden = !mine;
+    $('push-reset').hidden = !info.key_mismatch;
     $('push-test').hidden = !(info.available && devices.length);
     $('push-test').dataset.device = mine ? myId : '';
     setText($('push-test'), mine || devices.length === 0 ? 'Send a test alert' : 'Send a test alert to all devices');
@@ -2532,9 +2540,7 @@
       const reg = (await navigator.serviceWorker.getRegistration()) || (await navigator.serviceWorker.ready);
       for (let attempt = 0; ; attempt += 1) {
         let sub = await reg.pushManager.getSubscription();
-        const current = sub && sub.options.applicationServerKey
-          ? new Uint8Array(sub.options.applicationServerKey) : null;
-        if (sub && !(current && current.length === key.length && current.every((b, i) => b === key[i]))) {
+        if (sub && !sameKey(sub, key)) {
           await sub.unsubscribe(); // made with another key: the server cannot use it
           sub = null;
         }
@@ -2598,25 +2604,58 @@
     }
   }
 
-  /** A browser can renew its push subscription (new endpoint). If this device had alerts
-   * on, hand the new one to the server; a device removed on purpose stays removed. */
+  async function resetPush() {
+    try {
+      const info = await api('POST', '/api/push/reset');
+      const sub = await pushSubscription();
+      if (sub) await sub.unsubscribe().catch(() => undefined);
+      remember(null);
+      renderPush(info, null);
+      toast('Phone alerts were reset. Turn them on again on each device.');
+    } catch (err) {
+      report(err, 'Could not reset phone alerts: ');
+    }
+  }
+
+  /** On start, keep this device in step with the server. A subscription made with an older
+   * server key (after a reset) is dropped, so its endpoint dies at the push service and the
+   * old key can no longer reach this device; if alerts were on here, a new one replaces it.
+   * A browser can also renew its subscription (new endpoint): hand that one over. A device
+   * removed on purpose stays removed. */
   async function syncPush() {
-    if (!pushSupported() || Notification.permission !== 'granted') return;
+    if (!pushSupported()) return;
     let stored = null;
-    try { stored = localStorage.getItem(PUSH_DEVICE_KEY); } catch { return; }
-    if (!stored) return;
+    try { stored = localStorage.getItem(PUSH_DEVICE_KEY); } catch { /* storage is optional */ }
     const sub = await pushSubscription();
     if (!sub) {
-      remember(null);
+      if (stored) remember(null);
       return;
     }
-    const id = await deviceIdOf(sub.endpoint);
-    if (id === stored) return;
+    const wanted = Boolean(stored) && Notification.permission === 'granted';
     try {
-      const json = sub.toJSON();
-      const info = await api('POST', '/api/push/subscribe', { endpoint: json.endpoint, keys: json.keys }, { background: true });
-      remember(info.device);
-      await api('DELETE', `/api/push/devices/${stored}`, undefined, { background: true });
+      const info = await api('GET', '/api/push', undefined, { background: true });
+      if (!info.available || !info.public_key) return;
+      const key = keyBytes(info.public_key);
+      let current = sub;
+      if (!sameKey(sub, key)) {
+        await sub.unsubscribe().catch(() => undefined);
+        if (!wanted) {
+          remember(null);
+          if (state.view === 'settings') renderPush(info, null);
+          return;
+        }
+        const reg = await navigator.serviceWorker.getRegistration();
+        current = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+      } else if (!wanted || (await deviceIdOf(sub.endpoint)) === stored) {
+        return;
+      }
+      const json = current.toJSON();
+      let latest = await api('POST', '/api/push/subscribe', { endpoint: json.endpoint, keys: json.keys });
+      remember(latest.device);
+      if (stored !== latest.device && asList(info.devices).some((d) => d.id === stored)) {
+        latest = await api('DELETE', `/api/push/devices/${stored}`);
+      }
+      if (state.view === 'settings') renderPush(latest, await deviceIdOf(json.endpoint));
     } catch { /* retried on the next start */ }
   }
 
@@ -2727,6 +2766,7 @@
     $('push-enable').addEventListener('click', () => busy($('push-enable'), enablePush));
     $('push-disable').addEventListener('click', () => busy($('push-disable'), disablePush));
     $('push-test').addEventListener('click', () => busy($('push-test'), testPush));
+    $('push-reset').addEventListener('click', () => busy($('push-reset'), resetPush));
 
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {

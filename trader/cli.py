@@ -28,6 +28,7 @@ from pathlib import Path
 import qrcode
 from pydantic import SecretStr, ValidationError
 
+from trader import webpush
 from trader.config import AppConfig
 from trader.db import Database
 from trader.models import utcnow
@@ -256,9 +257,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
         if step is not None:
             auth.mark_totp_used(step)  # the confirmation code cannot be replayed to log in
         db.audit("setup", actor="cli")
+        push_reset = _reset_unreadable_push(config, db)
     finally:
         db.close()
     print("\nOwner password and 2FA saved; any existing sessions were signed out.")
+    _print_push_reset(push_reset)
     if _in_container():
         # A container keeps the environment it was created with: `docker compose restart`
         # would keep an empty TRADER_SECRET_KEY and every login would fail.
@@ -318,10 +321,42 @@ def cmd_reset_2fa(args: argparse.Namespace) -> int:
             auth.mark_totp_used(step)
         db.audit("reset_2fa", actor="cli")
         was_armed = disarm_live(db, "2FA reset (CLI)")
+        push_reset = _reset_unreadable_push(config, db)
     finally:
         db.close()
     print("2FA secret replaced; all sessions were signed out.")
     _print_disarmed(was_armed)
+    _print_push_reset(push_reset)
+    return 0
+
+
+def _reset_unreadable_push(config: AppConfig, db: Database) -> int | None:
+    """TRADER_SECRET_KEY was replaced: the phone-alert key encrypted with the old one is
+    unreadable, so start phone alerts over (each device turns them on again)."""
+    removed = webpush.reset_if_unreadable(config, db)
+    if removed is not None:
+        db.audit("push_reset", {"devices": removed, "reason": "secret key changed"}, actor="cli")
+    return removed
+
+
+def _print_push_reset(removed: int | None) -> None:
+    if removed is not None:
+        print("Phone alerts were reset for the new TRADER_SECRET_KEY: turn them on again on each")
+        print("device (Settings > Phone alerts).")
+
+
+def cmd_push_reset(args: argparse.Namespace) -> int:
+    """Forget the phone-alert key and every subscribed device (after a suspected server
+    compromise, or when the key no longer matches TRADER_SECRET_KEY)."""
+    config = _config(args)
+    db = Database(config.db_path)
+    try:
+        removed = webpush.reset_push(db)
+        db.audit("push_reset", {"devices": removed, "reason": "cli"}, actor="cli")
+    finally:
+        db.close()
+    print(f"Phone alerts were reset ({removed} device(s) removed) with a new key on next use.")
+    print("Turn them on again on each device you still use (Settings > Phone alerts).")
     return 0
 
 
@@ -330,11 +365,16 @@ def cmd_logout_all(args: argparse.Namespace) -> int:
     db = Database(config.db_path)
     try:
         Authenticator(config, db).logout_all()
-        db.audit("logout_all", actor="cli")
+        # A lost phone keeps getting alerts without a session: stop them everywhere too.
+        devices = db.delete_all_push_subscriptions()
+        db.audit("logout_all", {"push_devices_removed": devices}, actor="cli")
         was_armed = disarm_live(db, "logout-all (CLI)")
     finally:
         db.close()
     print("All sessions were signed out.")
+    if devices:
+        print(f"Phone alerts were turned off on all {devices} device(s): turn them on again on")
+        print("yours (Settings > Phone alerts).")
     _print_disarmed(was_armed)
     return 0
 
@@ -428,7 +468,15 @@ def cmd_status(args: argparse.Namespace) -> int:
                 ("LLM enabled", _yes(settings.llm_enabled)),
                 ("decision mode", settings.decision_mode),
                 ("engine heartbeat", db.get_kv(HEARTBEAT_KEY) or "none"),
-                ("phone push devices", str(db.count_push_subscriptions())),
+                (
+                    "phone push",
+                    f"{db.count_push_subscriptions()} device(s)"
+                    + (
+                        "; key does not match TRADER_SECRET_KEY (run push-reset)"
+                        if webpush.push_key_matches(config, db) is False
+                        else ""
+                    ),
+                ),
             ]
         finally:
             db.close()
@@ -596,8 +644,15 @@ def build_parser() -> argparse.ArgumentParser:
     reset_2fa.set_defaults(func=cmd_reset_2fa)
 
     sub.add_parser(
-        "logout-all", parents=[common], help="sign out every session (also disarms live trading)"
+        "logout-all",
+        parents=[common],
+        help="sign out every session and turn off phone alerts (also disarms live trading)",
     ).set_defaults(func=cmd_logout_all)
+    sub.add_parser(
+        "push-reset",
+        parents=[common],
+        help="forget the phone-alert key and all devices (after a suspected compromise)",
+    ).set_defaults(func=cmd_push_reset)
     sub.add_parser(
         "disarm", parents=[common], help="disarm live trading (re-arming needs a fresh 2FA code)"
     ).set_defaults(func=cmd_disarm)

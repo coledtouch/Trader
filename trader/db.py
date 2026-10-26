@@ -290,6 +290,9 @@ class Database:
             (key, value),
         )
 
+    def delete_kv(self, key: str) -> None:
+        self._exec("DELETE FROM kv WHERE key = ?", (key,))
+
     def add_kv_if_absent(self, key: str, value: str) -> None:
         """Store `value` unless `key` already has one (first writer wins)."""
         self._exec("INSERT OR IGNORE INTO kv(key, value) VALUES(?, ?)", (key, value))
@@ -850,6 +853,9 @@ class Database:
     def count_push_subscriptions(self) -> int:
         row = self._one("SELECT COUNT(*) AS n FROM push_subscriptions")
         return int(row["n"]) if row else 0
+
+    def delete_all_push_subscriptions(self) -> int:
+        return self._exec("DELETE FROM push_subscriptions").rowcount
 
     def delete_push_subscription(self, sub_id: str) -> bool:
         return self._exec("DELETE FROM push_subscriptions WHERE id = ?", (sub_id,)).rowcount > 0

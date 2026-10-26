@@ -320,3 +320,101 @@ async def test_notifier_sends_on_both_channels_once(db: Database) -> None:
     assert await notifier.send("Bought F", "again") is False  # same title within 60 s
     assert sent == []
     assert not Notifier(config()).enabled  # no ntfy, no database: no channel
+
+
+async def test_alerts_are_sent_urgent_unless_marked_low(db: Database) -> None:
+    cfg = config()
+    webpush.load_vapid_key(cfg, db, create=True)
+    subscribe(db, Device())
+    sent, handler = recorder({})
+    push = webpush.WebPush(cfg, db, transport=httpx.MockTransport(handler))
+    for priority in ("default", "min", "low", "urgent"):
+        assert await push.send(f"t-{priority}", "x", priority)
+    # "default" covers approval requests that expire in 10 minutes: never held in Doze.
+    assert [r.headers["Urgency"] for r in sent] == ["high", "low", "normal", "high"]
+
+
+# ---------------------------------------------------------------------- resets
+def test_reset_forgets_the_key_and_every_device(db: Database) -> None:
+    cfg = config()
+    old = webpush.load_vapid_key(cfg, db, create=True)
+    subscribe(db, Device())
+    assert webpush.push_key_matches(cfg, db) is True
+    assert webpush.reset_push(db) == 1
+    assert db.list_push_subscriptions() == [] and db.get_kv(webpush.VAPID_KV_KEY) is None
+    assert webpush.push_key_matches(cfg, db) is None
+    new = webpush.load_vapid_key(cfg, db, create=True)
+    assert new is not None and old is not None
+    assert webpush.public_key_b64(new) != webpush.public_key_b64(old)
+
+
+def test_a_replaced_secret_key_resets_push_instead_of_disabling_it_for_good(db: Database) -> None:
+    old_cfg, new_cfg = config(), config()
+    webpush.load_vapid_key(old_cfg, db, create=True)
+    subscribe(db, Device())
+    assert webpush.reset_if_unreadable(old_cfg, db) is None  # still readable: kept
+    assert webpush.push_key_matches(new_cfg, db) is False
+    assert not webpush.WebPush(new_cfg, db).enabled
+    assert webpush.reset_if_unreadable(new_cfg, db) == 1
+    assert webpush.load_vapid_key(new_cfg, db, create=True) is not None
+
+
+def _cli_env(tmp_path, monkeypatch, key: str):
+    from trader.security.auth import Authenticator, new_totp_secret
+
+    env_file = tmp_path / ".env"
+    env_file.write_text(f"TRADER_SECRET_KEY={key}\n", encoding="utf-8")
+    monkeypatch.delenv("TRADER_SECRET_KEY", raising=False)
+    monkeypatch.setenv("TRADER_DATA_DIR", str(tmp_path / "data"))
+    cfg = AppConfig(_env_file=env_file)
+    database = Database(cfg.db_path)
+    from tests.test_auth import FAST, PASSWORD
+
+    Authenticator(cfg, database, hasher=FAST).set_owner(PASSWORD, new_totp_secret())
+    return env_file, cfg, database
+
+
+def test_cli_logout_all_and_push_reset_stop_alerts_everywhere(tmp_path, monkeypatch, capsys):
+    from trader import cli
+
+    env_file, cfg, database = _cli_env(tmp_path, monkeypatch, crypto.generate_secret_key())
+    try:
+        key = webpush.load_vapid_key(cfg, database, create=True)
+        subscribe(database, Device())
+        # A lost phone keeps getting alerts without any session: logout-all stops them.
+        assert cli.main(["logout-all", "--env-file", str(env_file)]) == 0
+        assert "Phone alerts were turned off on all 1 device" in capsys.readouterr().out
+        assert database.list_push_subscriptions() == []
+        kept = webpush.load_vapid_key(cfg, database)
+        assert kept is not None and key is not None
+        assert webpush.public_key_b64(kept) == webpush.public_key_b64(key)
+
+        subscribe(database, Device())
+        assert cli.main(["push-reset", "--env-file", str(env_file)]) == 0
+        assert "1 device(s) removed" in capsys.readouterr().out
+        assert database.get_kv(webpush.VAPID_KV_KEY) is None
+        assert database.list_push_subscriptions() == []
+        assert database.list_audit(1)[0]["action"] == "push_reset"
+    finally:
+        database.close()
+
+
+def test_cli_reset_2fa_with_a_new_secret_key_resets_push(tmp_path, monkeypatch, capsys):
+    from trader import cli
+
+    env_file, cfg, database = _cli_env(tmp_path, monkeypatch, crypto.generate_secret_key())
+    try:
+        webpush.load_vapid_key(cfg, database, create=True)
+        subscribe(database, Device())
+        env_file.write_text(f"TRADER_SECRET_KEY={crypto.generate_secret_key()}\n", "utf-8")
+        assert cli.main(["status", "--env-file", str(env_file)]) == 0
+        assert "key does not match TRADER_SECRET_KEY (run push-reset)" in capsys.readouterr().out
+        out = tmp_path / "totp.txt"
+        assert (
+            cli.main(["reset-2fa", "--env-file", str(env_file), "--totp-secret-out", str(out)]) == 0
+        )
+        assert "Phone alerts were reset" in capsys.readouterr().out
+        assert database.get_kv(webpush.VAPID_KV_KEY) is None
+        assert database.list_push_subscriptions() == []
+    finally:
+        database.close()

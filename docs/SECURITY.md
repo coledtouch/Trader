@@ -128,16 +128,20 @@ unknown IP or a login you did not make means changing the password and 2FA (belo
 
 ## If you lose your phone
 
-Your phone holds the AI Trader authenticator, IB Key, IBKR Mobile, ntfy, probably your
-e-mail, and possibly a logged-in AI Trader app. Work through this list from your laptop.
+Your phone holds the AI Trader authenticator, IB Key, IBKR Mobile, the app's phone alerts
+(and ntfy, if you use it), probably your e-mail, and possibly a logged-in AI Trader app.
+Work through this list from your laptop.
 
 1. **Sign out every AI Trader session** (PowerShell: `ssh trader@DROPLET_IP`, then):
    ```bash
    cd ~/Trader
    docker compose exec trader python -m trader logout-all
    ```
-   This also **disarms live trading** at once (as do `reset-2fa`, `reset-password` and
-   `python -m trader disarm`): the bot drops to shadow mode and opens nothing new. It keeps
+   This also **turns off phone alerts on every device** (they need no session, so the lost
+   phone would keep showing them on its lock screen; turn them on again on your devices
+   later in **Settings > Phone alerts**) and **disarms live trading** at once (as do
+   `reset-2fa`, `reset-password` and `python -m trader disarm`): the bot drops to shadow
+   mode and opens nothing new. It keeps
    closing the positions it opened (stops, targets, time stops, closing stocks before the
    bell, the daily-loss flatten). Check open positions in IBKR Mobile or the Client Portal
    and close anything else you do not want to hold.
@@ -190,8 +194,10 @@ e-mail, and possibly a logged-in AI Trader app. Work through this list from your
    console (Droplet > **Access** > **Launch Droplet Console**), remove that key's line from
    `/home/trader/.ssh/authorized_keys`, then add the new laptop's key
    (`ssh-keygen -t ed25519` on the new laptop).
-2. Sign out sessions: `docker compose exec trader python -m trader logout-all`, and revoke
-   Cloudflare Access sessions (step 3 above).
+2. Sign out sessions and stop phone alerts on every device:
+   `docker compose exec trader python -m trader logout-all`, and revoke Cloudflare Access
+   sessions (step 3 above). Turn alerts on again on your phone (**Settings > Phone
+   alerts**).
 3. If the laptop stored secrets in plain files, rotate them (step 6 above).
 
 ## If you think the server is compromised
@@ -203,6 +209,11 @@ e-mail, and possibly a logged-in AI Trader app. Work through this list from your
    deploy key (repository > Settings > Deploy keys).
 3. Rebuild on a fresh droplet (DEPLOY.md, Appendix A) and restore `data/` from a backup made
    before the incident.
+4. **Reset phone alerts**: the intruder could read the app's push key and your devices'
+   subscriptions, and so send fake notifications that look like the app's. On the new
+   server run `docker compose exec trader python -m trader push-reset`. Each device drops
+   its old subscription the next time it opens the app (and subscribes again if alerts
+   were on), so the old key can no longer reach it.
 
 ## Reporting a problem
 

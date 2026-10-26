@@ -418,6 +418,7 @@ GET_ROUTES = [
 ]
 POST_ROUTES = [
     "/api/push/subscribe",
+    "/api/push/reset",
     "/api/push/test",
     "/api/auth/logout",
     "/api/bot/start",
@@ -1028,3 +1029,27 @@ def test_phone_push_needs_the_secret_key():
         assert not info["available"] and "TRADER_SECRET_KEY" in info["problem"]
         assert info["public_key"] is None
     ctx.db.close()
+
+
+def test_phone_push_reset_after_the_secret_key_was_replaced(env):
+    from tests.test_webpush import Device
+    from trader import webpush
+
+    headers = login(env)
+    old_key = env.client.get("/api/push").json()["public_key"]
+    phone = Device()
+    p256dh, auth = phone.keys
+    body = {"endpoint": phone.endpoint, "keys": {"p256dh": p256dh, "auth": auth}}
+    assert env.client.post("/api/push/subscribe", json=body, headers=headers).status_code == 200
+    env.app.state.config = env.config.model_copy(
+        update={"secret_key": SecretStr(crypto.generate_secret_key())}
+    )
+    info = env.client.get("/api/push").json()
+    assert info["key_mismatch"] and not info["available"] and "Reset" in info["problem"]
+    reset = env.client.post("/api/push/reset", headers=headers)
+    assert reset.status_code == 200
+    fresh = reset.json()
+    assert fresh["available"] and not fresh["key_mismatch"] and fresh["devices"] == []
+    assert fresh["public_key"] != old_key
+    assert env.db.list_audit(1)[0]["action"] == "push_reset"
+    assert webpush.push_key_matches(env.app.state.config, env.db) is True
