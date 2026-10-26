@@ -2361,3 +2361,20 @@ async def test_quotes_that_tick_during_the_fetch_are_not_from_the_future(db, con
     assert not any("in the future" in (s.skip_reason or "") for s in db.list_signals())
     health = h.engine.status().quote_health
     assert health and all(q.valid for q in health), health
+
+
+async def test_a_slow_fetch_of_another_symbol_does_not_make_a_quote_stale(db, config) -> None:
+    """Review finding on the fix above: judging every quote at the end of the whole fetch
+    made an early quote look stale when another symbol's bars were slow."""
+    h = await harness(db, config)
+    original = h.broker.bars
+
+    async def slow_bars(inst, *args, **kwargs):
+        if inst.symbol == "T":
+            h.clock.advance(seconds=35)  # one slow historical-data request
+        return await original(inst, *args, **kwargs)
+
+    h.broker.bars = slow_bars
+    rec = await enter_f(h)
+    assert rec.status == OrderStatus.FILLED
+    assert not any("stale" in (s.skip_reason or "") for s in db.list_signals())

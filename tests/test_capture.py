@@ -118,3 +118,35 @@ async def test_compact_and_raw_bar_captures_have_same_production_rules_and_exits
     assert actual.ending_equity == expected.ending_equity
     assert "historical rescanning is unavailable" in " ".join(result.assumptions)
     db.close()
+
+
+async def test_live_quotes_newer_than_the_round_start_replay_as_usable():
+    """On IBKR a quote is stamped with its latest tick, often a few seconds after the
+    round's start. The frame takes the time its data was all in, so the replay neither
+    rejects those quotes as from the future nor finds them unusable."""
+    config = settings()
+    late = timedelta(seconds=3)
+    raw = [
+        frame(candidates=[candidate()], quote_ts=NOW + late),
+        frame(1, price=19.9, decision=False, quote_ts=NOW + timedelta(minutes=1) + late),
+        frame(2, price=21, decision=False, quote_ts=NOW + timedelta(minutes=2) + late),
+        frame(3, price=19.8, decision=False, quote_ts=NOW + timedelta(minutes=3) + late),
+    ]
+    db = Database(":memory:")
+    for observed in raw:
+        observed.market = {F.key: {"price": observed.quotes[F.key].last, "atr14": 0.5}}
+        capture_cycle(
+            db,
+            context(observed, config),
+            observed.quotes,
+            {},
+            DecisionBatch(ts=observed.ts, maker="rules"),
+            config,
+        )
+    compact = [ReplayFrame.model_validate(p) for p in db.list_research_frames()]
+    assert all(f.ts == f.quotes[F.key].ts for f in compact)
+    for old, new in zip(raw, compact, strict=True):
+        new.decision_cycle = old.decision_cycle
+    result = await replay_experiment(compact, config, arms=("rules",), slippage_bps=0)
+    assert result.arms["rules"].fills  # traded on them
+    db.close()

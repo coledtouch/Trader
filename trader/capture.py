@@ -5,11 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+from datetime import UTC, datetime
 
 from trader.db import Database
 from trader.models import Bar, BotSettings, DecisionBatch, DecisionContext, Quote
 
 log = logging.getLogger(__name__)
+
+
+def _aware(ts: datetime) -> datetime:
+    return ts if ts.tzinfo else ts.replace(tzinfo=UTC)
 
 
 def capture_cycle(
@@ -29,6 +34,11 @@ def capture_cycle(
     never interrupt position protection.
     """
     try:
+        # The frame's time is when its data was all in: on IBKR a quote is stamped with its
+        # latest tick, which can come after the round started (ctx.now). A replay pinned to
+        # an earlier time would treat those quotes as from the future.
+        stamps = [_aware(q.ts) for q in quotes.values() if q is not None]
+        frame_ts = max([_aware(ctx.now), *stamps])
         encoded = settings.model_dump(mode="json")
         cohort_data = {
             "account": ctx.account.account_id,
@@ -39,7 +49,7 @@ def capture_cycle(
         }
         cohort = hashlib.sha256(json.dumps(cohort_data, sort_keys=True).encode()).hexdigest()
         payload = {
-            "ts": ctx.now.isoformat(),
+            "ts": frame_ts.isoformat(),
             "source": "captured",
             "capture_format": "scanner_snapshot_v1",
             "decision_cycle": True,

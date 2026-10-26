@@ -2625,10 +2625,15 @@ class Engine:
             for s in reversed(self.db.list_signals(limit=500, since=now - SIGNAL_DEDUPE))
         }
         logged: list[_Logged] = []
-        # After the fetch: quotes that ticked while it ran are not "in the future".
+        # Judge each quote as of when it arrived: not before it (a live quote ticks after the
+        # round's `now`, which is not "the future"), and not after the whole round either (a
+        # slow fetch of another symbol does not make it stale).
         checked_at = self._now()
         for cand in candidates:
-            blocked = self._not_actionable(cand, quotes.get(cand.instrument.key), checked_at)
+            key = cand.instrument.key
+            blocked = self._not_actionable(
+                cand, quotes.get(key), self._quoted_at.get(key, checked_at)
+            )
             existing = recent.get((cand.instrument.key, cand.setup))
             if existing is not None and existing.id is not None:
                 logged.append(_Logged(cand, existing.id, False, blocked))
