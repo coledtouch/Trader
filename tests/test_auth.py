@@ -578,7 +578,7 @@ def test_cli_notify_test(tmp_path, monkeypatch, capsys, caplog):
     saved = {name: logging.getLogger(name).level for name in cli.QUIET_LOGGERS}
     try:
         assert cli.main(["notify-test", "--env-file", str(env_file)]) == 1
-        assert "TRADER_NTFY_URL is not set" in capsys.readouterr().err
+        assert "No phone alerts are set up" in capsys.readouterr().err
 
         env_file.write_text(f"TRADER_NTFY_URL={topic}\n", encoding="utf-8")
         status = [200]
@@ -589,7 +589,9 @@ def test_cli_notify_test(tmp_path, monkeypatch, capsys, caplog):
             return httpx.Response(status[0])
 
         monkeypatch.setattr(
-            cli, "Notifier", lambda config: Notifier(config, transport=httpx.MockTransport(handler))
+            cli,
+            "Notifier",
+            lambda config, db=None: Notifier(config, db, transport=httpx.MockTransport(handler)),
         )
         with caplog.at_level(logging.INFO):
             assert cli.main(["notify-test", "--env-file", str(env_file)]) == 0
@@ -601,7 +603,7 @@ def test_cli_notify_test(tmp_path, monkeypatch, capsys, caplog):
             status[0] = 403
             assert cli.main(["notify-test", "--env-file", str(env_file)]) == 1
             err = capsys.readouterr().err
-            assert "did not accept the test alert" in err
+            assert "No channel accepted the test alert" in err
         assert "supersecret-topic-abc123" not in out.out + out.err + err + caplog.text
     finally:
         for name, level in saved.items():

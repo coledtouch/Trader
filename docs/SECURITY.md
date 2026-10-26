@@ -70,6 +70,8 @@ Anthropic (Claude Console), xAI (console.x.ai) and your e-mail.
 | App 2FA secret | `data/trader.db` | Encrypted with `TRADER_SECRET_KEY`. |
 | Login sessions | `data/trader.db` | Only a SHA-256 hash of each session token is stored. |
 | ntfy topic | `.env` | Mode 600. Alerts contain trading events, not secrets. |
+| App push key (VAPID) | `data/trader.db` | Created on first use, encrypted with `TRADER_SECRET_KEY`. Whoever has it could send notifications to subscribed devices, nothing more. |
+| Push subscriptions | `data/trader.db` | Each device's endpoint at its browser's push service and its message keys. The server only posts to known push services (Google, Mozilla, Microsoft, Apple), so a subscription cannot point it at another address. Endpoints are never logged or returned by the API. Messages are encrypted end to end (RFC 8291): the push service cannot read them. |
 | Dead-man's switch ping URL | `.env` (`TRADER_HEALTHCHECK_URL`) | Mode 600, never logged. Whoever has it can fake pings (hide an outage), not read anything. |
 | Database backups | `data/backups/` | Directory 700, files 600. Same contents as `data/trader.db` (journal, password hash, the 2FA secret encrypted with `TRADER_SECRET_KEY`). Keep laptop copies private too. |
 

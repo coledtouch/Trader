@@ -40,6 +40,9 @@ function worker(network = async () => response('fresh')) {
   const stores = new Map();
   const requests = [];
   const lifecycleCalls = [];
+  const shown = [];
+  const opened = [];
+  const windows = [];
   let quotaFailure = false;
   let storageFailure = false;
   let readFailure = false;
@@ -64,7 +67,18 @@ function worker(network = async () => response('fresh')) {
       location: { origin: ORIGIN },
       addEventListener(name, fn) { listeners.set(name, fn); },
       async skipWaiting() { lifecycleCalls.push('skipWaiting'); },
-      clients: { async claim() { lifecycleCalls.push('claim'); } },
+      clients: {
+        async claim() { lifecycleCalls.push('claim'); },
+        async matchAll(options) {
+          assert.equal(options.type, 'window'); // objects from the worker's own realm
+          assert.equal(options.includeUncontrolled, true);
+          return windows;
+        },
+        async openWindow(url) { opened.push(url); },
+      },
+      registration: {
+        async showNotification(title, options) { shown.push({ title, options }); },
+      },
     },
     caches: {
       async open(name) {
@@ -83,7 +97,12 @@ function worker(network = async () => response('fresh')) {
     },
   });
   return {
-    requests, stores, lifecycleCalls,
+    requests, stores, lifecycleCalls, shown, opened, windows,
+    async dispatch(name, event) {
+      const pending = [];
+      listeners.get(name)({ ...event, waitUntil(task) { pending.push(task); } });
+      await Promise.all(pending);
+    },
     setQuotaFailure() { quotaFailure = true; },
     setStorageFailure() { storageFailure = true; },
     setReadFailure() { readFailure = true; },
@@ -238,4 +257,52 @@ test('offline navigation stays an offline page with the current stylesheet versi
   assert.match(html, /You are offline/);
   assert.ok(html.includes(`/static/styles.css?v=${RELEASE}`));
   assert.ok(!html.includes('/static/app.js'));
+});
+
+const pushData = (value) => ({
+  json() { return typeof value === 'string' ? JSON.parse(value) : value; },
+  text() { return typeof value === 'string' ? value : JSON.stringify(value); },
+});
+
+test('a push message is shown as a notification, even with no window open', async () => {
+  const w = worker();
+  await w.dispatch('push', {
+    data: pushData({ title: '⚠️ Halted', body: 'Daily loss limit reached', priority: 'urgent', ts: '2026-10-26T14:00:00Z' }),
+  });
+  assert.equal(w.shown.length, 1);
+  const { title, options } = w.shown[0];
+  assert.equal(title, '⚠️ Halted');
+  assert.equal(options.body, 'Daily loss limit reached');
+  assert.equal(options.icon, '/static/icon-192.png');
+  assert.equal(options.badge, '/static/badge-96.png');
+  assert.equal(options.requireInteraction, true);
+  assert.equal(options.timestamp, Date.parse('2026-10-26T14:00:00Z'));
+});
+
+test('an odd push message still shows something sensible', async () => {
+  const w = worker();
+  await w.dispatch('push', { data: pushData('plain text, not JSON') });
+  await w.dispatch('push', { data: null });
+  await w.dispatch('push', { data: pushData({ title: 42, body: { x: 1 } }) });
+  assert.deepEqual(w.shown.map((n) => [n.title, n.options.body, n.options.requireInteraction]), [
+    ['AI Trader', 'plain text, not JSON', false],
+    ['AI Trader', '', false],
+    ['AI Trader', '', false],
+  ]);
+});
+
+test('tapping a notification focuses the open app, or opens it', async () => {
+  const w = worker();
+  let closed = 0;
+  const notification = { close() { closed += 1; } };
+  let focused = 0;
+  w.windows.push({ url: 'https://elsewhere.example/', focus() { throw new Error('wrong origin'); } });
+  w.windows.push({ url: `${ORIGIN}/#activity`, focus() { focused += 1; } });
+  await w.dispatch('notificationclick', { notification });
+  assert.equal(focused, 1);
+  assert.deepEqual(w.opened, []);
+  w.windows.length = 0;
+  await w.dispatch('notificationclick', { notification });
+  assert.deepEqual(w.opened, ['/']);
+  assert.equal(closed, 2);
 });

@@ -4,6 +4,8 @@
  * - other static cache first, refreshed in the background
  * - /api/*       network only, never cached (live trading data, authenticated)
  * - navigations  network first; offline -> a short offline page
+ * - push         phone alerts from the server (trader/webpush.py), shown even when no
+ *                window is open; tapping one opens or focuses the app
  *
  * Bump VERSION and the HTML's JS/CSS query version together on each shell release.
  * Query versions also bypass caches of an older worker that still controls the first
@@ -11,7 +13,7 @@
  */
 'use strict';
 
-const VERSION = 'v15';
+const VERSION = 'v16';
 const ASSET_VERSION = VERSION.slice(1);
 const CACHE = `trader-shell-${VERSION}`;
 const SHELL = [
@@ -21,6 +23,7 @@ const SHELL = [
   '/static/icon.svg',
   '/static/icon-192.png',
   '/static/icon-512.png',
+  '/static/badge-96.png',
   '/static/manifest.webmanifest',
 ];
 
@@ -144,4 +147,43 @@ self.addEventListener('fetch', (event) => {
       ? networkFirstCode(request)
       : cacheFirst(event));
   }
+});
+
+// ------------------------------------------------------------------ phone alerts
+const alertFrom = (event) => {
+  let data = {};
+  try {
+    data = event.data ? event.data.json() : {};
+  } catch {
+    try { data = { body: event.data.text() }; } catch { data = {}; }
+  }
+  if (!data || typeof data !== 'object') data = {};
+  const text = (value, limit) => (typeof value === 'string' ? value.slice(0, limit) : '');
+  const ts = Date.parse(data.ts);
+  return {
+    title: text(data.title, 120) || 'AI Trader',
+    options: {
+      body: text(data.body, 1500),
+      icon: '/static/icon-192.png',
+      badge: '/static/badge-96.png', // Android status bar: white glyph on transparent
+      timestamp: Number.isFinite(ts) ? ts : Date.now(),
+      requireInteraction: data.priority === 'urgent' || data.priority === 'max',
+      data: { url: '/' },
+    },
+  };
+};
+
+self.addEventListener('push', (event) => {
+  const { title, options } = alertFrom(event);
+  event.waitUntil(self.registration.showNotification(title, options));
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  event.waitUntil((async () => {
+    const windows = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    const open = windows.find((client) => new URL(client.url).origin === self.location.origin);
+    if (open && 'focus' in open) return open.focus();
+    return self.clients.openWindow('/');
+  })());
 });

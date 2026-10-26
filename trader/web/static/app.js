@@ -42,6 +42,7 @@
     researchTimer: null,
     researchRequest: 0,
     researchFrames: null,
+    push: null, // last /api/push payload
   };
 
   // ------------------------------------------------------------------ DOM helpers
@@ -2422,7 +2423,201 @@
 
   function loadSettingsView() {
     renderLiveCard();
-    return Promise.all([state.settingsDirty ? null : loadSettings(), loadAudit()]);
+    return Promise.all([state.settingsDirty ? null : loadSettings(), loadAudit(), loadPush()]);
+  }
+
+  // ------------------------------------------------------------------ phone alerts
+  // Web Push: the browser subscribes at its push service with the server's public key; the
+  // server keeps the subscription and sends each alert there (trader/webpush.py). The
+  // service worker shows it. Devices are named by a hash of their endpoint, as on the server.
+  const PUSH_DEVICE_KEY = 'trader-push-device';
+  const pushSupported = () => window.isSecureContext && 'serviceWorker' in navigator
+    && 'PushManager' in window && 'Notification' in window;
+
+  function keyBytes(base64url) {
+    const text = atob(base64url.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (base64url.length % 4)) % 4));
+    return Uint8Array.from(text, (ch) => ch.charCodeAt(0));
+  }
+
+  async function deviceIdOf(endpoint) {
+    const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(endpoint));
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('').slice(0, 16);
+  }
+
+  async function pushSubscription() {
+    if (!pushSupported()) return null;
+    try {
+      const reg = await navigator.serviceWorker.getRegistration();
+      return reg ? await reg.pushManager.getSubscription() : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function remember(deviceId) {
+    try {
+      if (deviceId) localStorage.setItem(PUSH_DEVICE_KEY, deviceId);
+      else localStorage.removeItem(PUSH_DEVICE_KEY);
+    } catch { /* storage is optional */ }
+  }
+
+  async function loadPush() {
+    let info;
+    try {
+      info = await api('GET', '/api/push');
+    } catch (err) {
+      if (!err.fatal) setText($('push-status'), `Could not load phone alerts: ${err.message}`);
+      return;
+    }
+    const sub = await pushSubscription();
+    const myId = sub ? await deviceIdOf(sub.endpoint) : null;
+    renderPush(info, myId);
+  }
+
+  function renderPush(info, myId) {
+    state.push = info;
+    const devices = asList(info.devices);
+    const mine = Boolean(myId) && devices.some((d) => d.id === myId);
+    const blocked = pushSupported() && Notification.permission === 'denied';
+    let status;
+    if (!pushSupported()) {
+      status = 'This browser cannot show app alerts. On Android, use Chrome (installing the app to the home screen works best).';
+    } else if (!info.available) {
+      status = info.problem || 'Phone alerts are not available on this server.';
+    } else if (mine) {
+      status = 'Alerts are on for this device.';
+    } else if (blocked) {
+      status = 'Alerts are blocked for this site. Allow notifications in the browser’s site settings, then reload.';
+    } else {
+      status = 'Alerts are off on this device.';
+    }
+    setText($('push-status'), status);
+    $('push-enable').hidden = !(pushSupported() && info.available && !mine && !blocked);
+    $('push-disable').hidden = !mine;
+    $('push-test').hidden = !(info.available && devices.length);
+    $('push-test').dataset.device = mine ? myId : '';
+    setText($('push-test'), mine || devices.length === 0 ? 'Send a test alert' : 'Send a test alert to all devices');
+    $('push-devices').replaceChildren(devices.length ? table([
+      { label: 'Device', head: true, value: (d) => (d.id === myId ? [d.label || 'Device', ' ', chipNode('This device', 'ok')] : d.label || 'Device') },
+      { label: 'Added', value: (d) => when(d.created_at) },
+      { label: 'Last alert', value: (d) => (d.last_ok_at ? when(d.last_ok_at) : d.failures ? `${d.failures} failed` : 'none yet') },
+      {
+        label: '',
+        value: (d) => {
+          const button = el('button', { class: 'btn btn-sm', type: 'button', text: 'Remove' });
+          button.setAttribute('aria-label', `Remove ${d.label || 'device'}`);
+          button.addEventListener('click', () => busy(button, () => removePushDevice(d.id, d.id === myId)));
+          return button;
+        },
+      },
+    ], devices) : []);
+    const note = $('push-note');
+    note.hidden = !info.ntfy;
+    setText(note, info.ntfy
+      ? 'ntfy alerts are on too (TRADER_NTFY_URL in .env). Remove that line and restart if you only want app alerts.'
+      : '');
+  }
+
+  async function enablePush() {
+    try {
+      const permission = await Notification.requestPermission(); // first: needs the tap
+      if (permission !== 'granted') {
+        toast(permission === 'denied'
+          ? 'Alerts are blocked for this site. Allow notifications in the browser’s site settings.'
+          : 'Alerts were not allowed.', 'error');
+        return;
+      }
+      if (!state.push || !state.push.public_key) await loadPush();
+      const key = keyBytes(state.push.public_key);
+      const reg = (await navigator.serviceWorker.getRegistration()) || (await navigator.serviceWorker.ready);
+      for (let attempt = 0; ; attempt += 1) {
+        let sub = await reg.pushManager.getSubscription();
+        const current = sub && sub.options.applicationServerKey
+          ? new Uint8Array(sub.options.applicationServerKey) : null;
+        if (sub && !(current && current.length === key.length && current.every((b, i) => b === key[i]))) {
+          await sub.unsubscribe(); // made with another key: the server cannot use it
+          sub = null;
+        }
+        if (!sub) sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
+        const json = sub.toJSON();
+        const info = await api('POST', '/api/push/subscribe', { endpoint: json.endpoint, keys: json.keys });
+        remember(info.device);
+        renderPush(info, info.device);
+        const test = await api('POST', '/api/push/test', { device: info.device });
+        const kept = asList(test.devices).some((d) => d.id === info.device);
+        if (!test.sent && !kept && attempt === 0) {
+          // The push service no longer knows this subscription (the server dropped it):
+          // start over once with a fresh one.
+          await sub.unsubscribe().catch(() => undefined);
+          continue;
+        }
+        if (!kept) remember(null);
+        toast(test.sent
+          ? 'Alerts are on. A test alert is on its way.'
+          : kept
+            ? 'Alerts are on, but the test alert was not delivered. Try “Send a test alert”.'
+            : 'The push service refused this device. Try again later.', test.sent ? 'info' : 'error');
+        renderPush(test, kept ? info.device : null);
+        return;
+      }
+    } catch (err) {
+      report(err, 'Could not turn on alerts: ');
+    }
+  }
+
+  async function removePushDevice(deviceId, isThisDevice) {
+    try {
+      const info = await api('DELETE', `/api/push/devices/${deviceId}`);
+      if (isThisDevice) {
+        const sub = await pushSubscription();
+        if (sub) await sub.unsubscribe().catch(() => undefined);
+        remember(null);
+      }
+      const sub = isThisDevice ? null : await pushSubscription();
+      renderPush(info, sub ? await deviceIdOf(sub.endpoint) : null);
+    } catch (err) {
+      report(err, 'Could not remove the device: ');
+    }
+  }
+
+  async function disablePush() {
+    const sub = await pushSubscription();
+    if (!sub) return loadPush();
+    return removePushDevice(await deviceIdOf(sub.endpoint), true);
+  }
+
+  async function testPush() {
+    try {
+      const device = $('push-test').dataset.device || null;
+      const info = await api('POST', '/api/push/test', device ? { device } : {});
+      toast(info.sent ? 'Test alert sent.' : 'The test alert was not delivered. Check the devices list.', info.sent ? 'info' : 'error');
+      const sub = await pushSubscription();
+      renderPush(info, sub ? await deviceIdOf(sub.endpoint) : null);
+    } catch (err) {
+      report(err, 'Could not send a test alert: ');
+    }
+  }
+
+  /** A browser can renew its push subscription (new endpoint). If this device had alerts
+   * on, hand the new one to the server; a device removed on purpose stays removed. */
+  async function syncPush() {
+    if (!pushSupported() || Notification.permission !== 'granted') return;
+    let stored = null;
+    try { stored = localStorage.getItem(PUSH_DEVICE_KEY); } catch { return; }
+    if (!stored) return;
+    const sub = await pushSubscription();
+    if (!sub) {
+      remember(null);
+      return;
+    }
+    const id = await deviceIdOf(sub.endpoint);
+    if (id === stored) return;
+    try {
+      const json = sub.toJSON();
+      const info = await api('POST', '/api/push/subscribe', { endpoint: json.endpoint, keys: json.keys }, { background: true });
+      remember(info.device);
+      await api('DELETE', `/api/push/devices/${stored}`, undefined, { background: true });
+    } catch { /* retried on the next start */ }
   }
 
   async function logout() {
@@ -2529,6 +2724,9 @@
     $('disarm-btn').addEventListener('click', disarmLive);
     $('audit-refresh').addEventListener('click', () => busy($('audit-refresh'), loadAudit));
     $('logout-btn').addEventListener('click', logout);
+    $('push-enable').addEventListener('click', () => busy($('push-enable'), enablePush));
+    $('push-disable').addEventListener('click', () => busy($('push-disable'), disablePush));
+    $('push-test').addEventListener('click', () => busy($('push-test'), testPush));
 
     document.addEventListener('visibilitychange', () => {
       if (document.hidden) {
@@ -2567,6 +2765,7 @@
     }
     refreshStatus();
     if (state.view !== 'settings') loadSettings(); // the settings view already loaded them
+    syncPush();
   }
 
   start();

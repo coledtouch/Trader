@@ -167,7 +167,27 @@ With only one of the two keys the bot falls back to that model alone and the das
 says so ("Consensus mode needs both API keys..."); with neither it makes rules-only
 decisions. Nothing pretends to be a consensus that is not one.
 
-### 8. Phone alerts with ntfy (optional, recommended)
+### 8. Phone alerts (recommended)
+
+The app sends alerts itself, as notifications from the installed app (Web Push). Nothing to
+install or configure on the server:
+
+- [ ] On the phone, open the app in **Chrome** and install it (menu > **Add to Home
+  screen** / **Install app**). Open it from the home screen.
+- [ ] **Settings > Phone alerts > Turn on alerts on this device**, then allow
+  notifications. A test alert arrives within seconds. Repeat on the laptop if you want
+  alerts there too; each device is listed with a **Remove** button.
+- [ ] If Android puts the app to sleep, alerts can arrive late: in Android **Settings >
+  Apps > (the app) > Battery**, choose **Unrestricted**.
+
+Alerts cover each buy and each closed trade (with its P&L), halts and the kill switch,
+broker disconnects longer than a minute, positions left without a working stop, balance
+changes, and orders waiting for your approval. The alerts come from the app, so they stop
+if the droplet or the app dies: the dead-man's switch ([DEPLOY.md](DEPLOY.md#dead-mans-switch-alert-when-the-bot-goes-silent))
+covers that by e-mail.
+
+**ntfy instead of, or as well as, app alerts (optional).** If `TRADER_NTFY_URL` is set,
+every alert also goes to that ntfy topic:
 
 - [ ] Install **ntfy** from the Google Play Store (or F-Droid).
 - [ ] Make a topic name nobody can guess. On the droplet run `openssl rand -hex 16` and copy
@@ -179,10 +199,8 @@ decisions. Nothing pretends to be a consensus that is not one.
   should show on the phone within a few seconds.
 
 The Google Play version delivers ntfy.sh messages instantly through Google's push service
-([ntfy docs: phone app](https://docs.ntfy.sh/subscribe/phone)). Alerts cover each buy and
-each closed trade (with its P&L), halts and the kill switch, broker disconnects longer than
-a minute, positions left without a working stop, balance changes, and orders waiting for
-your approval.
+([ntfy docs: phone app](https://docs.ntfy.sh/subscribe/phone)). To stop ntfy alerts, empty
+`TRADER_NTFY_URL` in `.env` and run `docker compose up -d`.
 
 ### 9. An authenticator app for the AI Trader login
 

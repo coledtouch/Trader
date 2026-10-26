@@ -1,8 +1,10 @@
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pyotp
 import pytest
 from argon2 import PasswordHasher
@@ -199,7 +201,7 @@ def test_healthz_and_no_docs(env):
         assert env.client.get(path).status_code == 404
 
 
-@pytest.mark.parametrize("asset", ["app.js?v=15", "login.js?v=15", "styles.css?v=15", "sw.js"])
+@pytest.mark.parametrize("asset", ["app.js?v=16", "login.js?v=16", "styles.css?v=16", "sw.js"])
 def test_executable_shell_assets_revalidate_on_deploy(env, asset):
     response = env.client.get(f"/static/{asset}")
     assert response.status_code == 200
@@ -412,8 +414,11 @@ GET_ROUTES = [
     "/api/settings",
     "/api/signals",
     "/api/signals/stats",
+    "/api/push",
 ]
 POST_ROUTES = [
+    "/api/push/subscribe",
+    "/api/push/test",
     "/api/auth/logout",
     "/api/bot/start",
     "/api/bot/stop",
@@ -935,3 +940,91 @@ def test_equity_chart_covers_the_whole_window_thinned(env, monkeypatch):
     assert len(curve) <= 2 * 200 + 1
     assert min(p["equity"] for p in curve) == 100.0  # the dip survives thinning
     assert [p["ts"] for p in curve] == sorted(p["ts"] for p in curve)
+
+
+def test_phone_push_devices_can_be_added_tested_and_removed(env, monkeypatch):
+    from tests.test_webpush import Device
+    from trader import webpush
+
+    headers = login(env)
+    info = env.client.get("/api/push").json()
+    assert info["available"] and info["devices"] == [] and not info["ntfy"]
+    assert len(webpush.b64url_decode(info["public_key"])) == 65
+
+    phone = Device()
+    p256dh, auth = phone.keys
+    body = {"endpoint": phone.endpoint, "keys": {"p256dh": p256dh, "auth": auth}}
+    android = "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 Chrome/141.0 Mobile Safari"
+    added = env.client.post(
+        "/api/push/subscribe", json=body, headers={**headers, "User-Agent": android}
+    )
+    assert added.status_code == 200, added.text
+    device = added.json()["device"]
+    assert device == webpush.subscription_id(phone.endpoint)
+    assert [(d["id"], d["label"]) for d in added.json()["devices"]] == [
+        (device, "Android · Chrome")
+    ]
+    assert "endpoint" not in json.dumps(added.json())  # the capability URL is never returned
+    again = env.client.post("/api/push/subscribe", json=body, headers=headers)
+    assert len(again.json()["devices"]) == 1  # the same device is refreshed, not duplicated
+    assert env.db.list_audit(5)[0]["action"] == "push_device_added"
+
+    bad = {**body, "endpoint": "https://169.254.169.254/latest"}
+    refused = env.client.post("/api/push/subscribe", json=bad, headers=headers)
+    assert refused.status_code == 422 and "169.254" not in refused.text
+    no_csrf = env.client.post("/api/push/subscribe", json=body, headers={"Origin": ORIGIN})
+    assert no_csrf.status_code == 403
+
+    for i in range(webpush.MAX_DEVICES - 1):
+        other = Device(f"{phone.endpoint}{i}")
+        p, a = other.keys
+        ok = env.client.post(
+            "/api/push/subscribe",
+            json={"endpoint": other.endpoint, "keys": {"p256dh": p, "auth": a}},
+            headers=headers,
+        )
+        assert ok.status_code == 200
+    extra = Device(phone.endpoint + "extra")
+    p, a = extra.keys
+    full = env.client.post(
+        "/api/push/subscribe",
+        json={"endpoint": extra.endpoint, "keys": {"p256dh": p, "auth": a}},
+        headers=headers,
+    )
+    assert full.status_code == 409
+
+    delivered = []
+
+    def handler(request):
+        delivered.append(json.loads(phone.decrypt(request.content)))
+        return httpx.Response(201)
+
+    real = webpush.WebPush
+    monkeypatch.setattr(
+        webpush,
+        "WebPush",
+        lambda config, db: real(config, db, transport=httpx.MockTransport(handler)),
+    )
+    test = env.client.post("/api/push/test", json={"device": device}, headers=headers)
+    assert test.status_code == 200 and test.json()["sent"] is True
+    assert len(delivered) == 1 and delivered[0]["title"].endswith("AI Trader test alert")
+    bad_id = env.client.post("/api/push/test", json={"device": "../../x"}, headers=headers)
+    assert bad_id.status_code == 422
+
+    removed = env.client.delete(f"/api/push/devices/{device}", headers=headers)
+    assert removed.status_code == 200
+    assert device not in [d["id"] for d in removed.json()["devices"]]
+    assert env.db.list_audit(1)[0]["action"] == "push_device_removed"
+    assert env.client.delete("/api/push/devices/nothex", headers=headers).status_code == 422
+
+
+def test_phone_push_needs_the_secret_key():
+    ctx = build()
+    with TestClient(ctx.app) as client:
+        ctx.client = client
+        login(ctx)
+        ctx.app.state.config = ctx.config.model_copy(update={"secret_key": SecretStr("")})
+        info = client.get("/api/push").json()
+        assert not info["available"] and "TRADER_SECRET_KEY" in info["problem"]
+        assert info["public_key"] is None
+    ctx.db.close()

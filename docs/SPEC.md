@@ -90,7 +90,8 @@ trader/
   indicators.py        # pure-python indicators
   risk.py              # RiskManager (sizing + checks + halts)
   engine.py            # Engine: loops, orchestration, journal, reconciliation; build_engine()
-  notify.py            # Notifier (ntfy) - optional
+  notify.py            # Notifier: app Web Push and/or ntfy - optional
+  webpush.py           # Web Push: VAPID key, subscriptions, RFC 8291 messages
   backtest.py          # backtester for the rule-based strategy (CLI entry)
   capture.py           # bounded local decision-cycle observations for research
   research.py          # offline paired portfolios through the production Engine

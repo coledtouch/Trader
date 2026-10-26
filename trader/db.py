@@ -166,6 +166,16 @@ CREATE TABLE IF NOT EXISTS research_frames (
     data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_research_frames_ts ON research_frames(ts);
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id TEXT PRIMARY KEY,
+    endpoint TEXT NOT NULL UNIQUE,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    label TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    last_ok_at TEXT,
+    failures INTEGER NOT NULL DEFAULT 0
+);
 """
 
 
@@ -279,6 +289,10 @@ class Database:
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+    def add_kv_if_absent(self, key: str, value: str) -> None:
+        """Store `value` unless `key` already has one (first writer wins)."""
+        self._exec("INSERT OR IGNORE INTO kv(key, value) VALUES(?, ?)", (key, value))
 
     def get_flag(self, name: str, default: bool = False) -> bool:
         value = self.get_kv(f"flag:{name}")
@@ -815,6 +829,41 @@ class Database:
             params.append(limit)
         rows = self._all(sql, params)
         return [{"ts": r["ts"], "equity": r["equity"]} for r in reversed(rows)]
+
+    # ------------------------------------------------------------------ push subscriptions
+    def save_push_subscription(
+        self, sub_id: str, endpoint: str, p256dh: str, auth: str, label: str
+    ) -> None:
+        """Add a device, or refresh its keys and label (same endpoint)."""
+        self._exec(
+            "INSERT INTO push_subscriptions(id, endpoint, p256dh, auth, label, created_at) "
+            "VALUES(?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET "
+            "p256dh = excluded.p256dh, auth = excluded.auth, label = excluded.label, "
+            "failures = 0",
+            (sub_id, endpoint, p256dh, auth, label, _iso(utcnow())),
+        )
+
+    def list_push_subscriptions(self) -> list[dict[str, Any]]:
+        rows = self._all("SELECT * FROM push_subscriptions ORDER BY created_at, id")
+        return [dict(r) for r in rows]
+
+    def count_push_subscriptions(self) -> int:
+        row = self._one("SELECT COUNT(*) AS n FROM push_subscriptions")
+        return int(row["n"]) if row else 0
+
+    def delete_push_subscription(self, sub_id: str) -> bool:
+        return self._exec("DELETE FROM push_subscriptions WHERE id = ?", (sub_id,)).rowcount > 0
+
+    def note_push_result(self, sub_id: str, ok: bool) -> None:
+        if ok:
+            self._exec(
+                "UPDATE push_subscriptions SET last_ok_at = ?, failures = 0 WHERE id = ?",
+                (_iso(utcnow()), sub_id),
+            )
+        else:
+            self._exec(
+                "UPDATE push_subscriptions SET failures = failures + 1 WHERE id = ?", (sub_id,)
+            )
 
     # ------------------------------------------------------------------ signal ledger
     def add_research_frame(self, payload: dict[str, Any]) -> None:

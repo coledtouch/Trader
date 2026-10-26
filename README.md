@@ -135,7 +135,8 @@ Two posts on Reddit's r/ai_trading shaped the design.
   breach shows on two checks in a row (IBKR's own stop orders are not affected).
 - Account switch guard: when the broker account changes (simulator, paper, live), the bot
   starts a fresh journal and never manages positions it did not open on that account.
-- Phone alerts through [ntfy](https://ntfy.sh) (optional): buys, closed trades with P&L,
+- Phone alerts as notifications from the installed app (Web Push, turned on per device in
+  Settings), and/or through [ntfy](https://ntfy.sh): buys, closed trades with P&L,
   disconnects, halts, orders waiting for approval. `python -m trader notify-test` sends a
   test alert. Failed deliveries can retry immediately; concurrent duplicate titles are
   suppressed, and the 60-second dedupe window starts only after successful acceptance.

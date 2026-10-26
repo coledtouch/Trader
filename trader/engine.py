@@ -3084,7 +3084,7 @@ def build_engine(config: AppConfig, db: Database) -> Engine:
         from trader.strategy.consensus import ConsensusDecisionMaker
 
         makers["consensus"] = ConsensusDecisionMaker(makers["claude"], makers["grok"])
-    engine = Engine(config, db, broker, rules, notifier=Notifier(config), makers=makers)
+    engine = Engine(config, db, broker, rules, notifier=Notifier(config, db), makers=makers)
     _, warning = engine._resolve_decider()
     if warning:
         log.warning("decision mode: %s", warning)

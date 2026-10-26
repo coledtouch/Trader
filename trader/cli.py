@@ -428,6 +428,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 ("LLM enabled", _yes(settings.llm_enabled)),
                 ("decision mode", settings.decision_mode),
                 ("engine heartbeat", db.get_kv(HEARTBEAT_KEY) or "none"),
+                ("phone push devices", str(db.count_push_subscriptions())),
             ]
         finally:
             db.close()
@@ -440,28 +441,39 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 
 def cmd_notify_test(args: argparse.Namespace) -> int:
-    """Send one alert through the configured ntfy topic, to check the phone receives it."""
+    """Send one alert to every phone-alert channel (app push and/or ntfy)."""
     config = _config(args)
     configure_logging(config.log_level)  # shows the notifier's warning; never the topic URL
-    notifier = Notifier(config)
-    if not notifier.enabled:
-        raise CLIError(
-            "TRADER_NTFY_URL is not set: add it to .env, then run `docker compose up -d`"
+    db = Database(config.db_path) if config.db_path.exists() else None
+    try:
+        notifier = Notifier(config, db)
+        if not notifier.enabled:
+            raise CLIError(
+                "No phone alerts are set up. Turn them on in the app (Settings > Phone "
+                "alerts), or set TRADER_NTFY_URL in .env and run `docker compose up -d`"
+            )
+        channels = [
+            name
+            for name, on in (("app push", notifier.push_enabled), ("ntfy", notifier.ntfy_enabled))
+            if on
+        ]
+        sent = asyncio.run(
+            notifier.send(
+                "AI Trader test alert",
+                "Phone alerts work. You will get one when the bot buys, closes a trade, halts "
+                "or loses the broker connection.",
+                tags=["white_check_mark"],
+            )
         )
-    sent = asyncio.run(
-        notifier.send(
-            "AI Trader test alert",
-            "Phone alerts work. You will get one when the bot buys, closes a trade, halts or "
-            "loses the broker connection.",
-            tags=["white_check_mark"],
-        )
-    )
+    finally:
+        if db is not None:
+            db.close()
     if not sent:
         raise CLIError(
-            "ntfy did not accept the test alert (see the warning above). Check that "
-            "TRADER_NTFY_URL looks like https://ntfy.sh/<your-topic>"
+            f"No channel accepted the test alert ({', '.join(channels)}; see the warnings "
+            "above). For ntfy, check that TRADER_NTFY_URL looks like https://ntfy.sh/<topic>"
         )
-    print("Test alert sent. It should show on your phone within a few seconds.")
+    print(f"Test alert sent ({', '.join(channels)}). It should show within a few seconds.")
     return 0
 
 
@@ -492,7 +504,7 @@ def cmd_watchdog(args: argparse.Namespace) -> int:
         HEARTBEAT_KEY,
     )
     try:
-        asyncio.run(run_watchdog(config, db, broker, Notifier(config)))
+        asyncio.run(run_watchdog(config, db, broker, Notifier(config, db)))
     finally:
         db.close()
     return 0
@@ -593,7 +605,7 @@ def build_parser() -> argparse.ArgumentParser:
         func=cmd_status
     )
     sub.add_parser(
-        "notify-test", parents=[common], help="send a test alert to your phone (ntfy)"
+        "notify-test", parents=[common], help="send a test alert to your phone"
     ).set_defaults(func=cmd_notify_test)
     paper_test = sub.add_parser(
         "paper-test",

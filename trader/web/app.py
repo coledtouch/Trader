@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, SecretStr
 from starlette.concurrency import run_in_threadpool
@@ -25,6 +26,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.staticfiles import StaticFiles
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from trader import webpush
 from trader.config import AppConfig, get_config
 from trader.db import Database, thin_curve
 from trader.models import (
@@ -218,6 +220,20 @@ class SettingsBody(BaseModel):
 
 class ResearchBody(BaseModel):
     days: int = Field(default=30, ge=1, le=90)
+
+
+class PushKeys(BaseModel):
+    p256dh: str = Field(max_length=256)
+    auth: str = Field(max_length=64)
+
+
+class PushSubscribeBody(BaseModel):
+    endpoint: str = Field(max_length=webpush.MAX_ENDPOINT)
+    keys: PushKeys
+
+
+class PushTestBody(BaseModel):
+    device: str | None = Field(default=None, pattern=r"^[0-9a-f]{16}$")
 
 
 # ---------------------------------------------------------------------- helpers
@@ -808,6 +824,80 @@ def create_app(
             {"changed": settings_diff(old, new), "loosened": loosened},
         )
         return settings_payload(request)
+
+    # ------------------------------------------------------------ phone push
+    def push_payload(request: Request) -> dict[str, Any]:
+        st = state(request)
+        try:
+            key = webpush.load_vapid_key(st.config, st.db, create=True)
+            problem = None if key else "Set TRADER_SECRET_KEY to use phone alerts."
+        except crypto.SecretKeyError:
+            key, problem = None, "The stored push key does not match TRADER_SECRET_KEY."
+        devices = [
+            {k: d[k] for k in ("id", "label", "created_at", "last_ok_at", "failures")}
+            for d in st.db.list_push_subscriptions()
+        ]
+        return {
+            "available": key is not None,
+            "problem": problem,
+            "public_key": webpush.public_key_b64(key) if key else None,
+            "devices": devices,
+            "max_devices": webpush.MAX_DEVICES,
+            "ntfy": bool((st.config.ntfy_url or "").strip()),
+        }
+
+    @app.get("/api/push")
+    async def push_info(request: Request, session: Session = Depends(require_session)) -> Any:
+        return await run_in_threadpool(push_payload, request)
+
+    @app.post("/api/push/subscribe")
+    async def push_subscribe(
+        body: PushSubscribeBody, request: Request, session: Session = Depends(require_csrf)
+    ) -> Any:
+        st = state(request)
+        try:
+            endpoint, p256dh, auth_secret = webpush.validate_subscription(
+                body.endpoint, body.keys.p256dh, body.keys.auth
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from None
+        sub_id = webpush.subscription_id(endpoint)
+        known = {d["id"] for d in st.db.list_push_subscriptions()}
+        if sub_id not in known and len(known) >= webpush.MAX_DEVICES:
+            raise HTTPException(
+                status_code=409,
+                detail=f"At most {webpush.MAX_DEVICES} devices: remove one first",
+            )
+        label = webpush.device_label(request.headers.get("user-agent"))
+        st.db.save_push_subscription(sub_id, endpoint, p256dh, auth_secret, label)
+        if sub_id not in known:
+            audit(request, "push_device_added", {"device": sub_id, "label": label})
+        return {**push_payload(request), "device": sub_id}
+
+    @app.delete("/api/push/devices/{device}")
+    async def push_remove(
+        request: Request,
+        device: str = PathParam(pattern=r"^[0-9a-f]{16}$"),
+        session: Session = Depends(require_csrf),
+    ) -> Any:
+        st = state(request)
+        if st.db.delete_push_subscription(device):
+            audit(request, "push_device_removed", {"device": device})
+        return push_payload(request)
+
+    @app.post("/api/push/test")
+    async def push_test(
+        body: PushTestBody, request: Request, session: Session = Depends(require_csrf)
+    ) -> Any:
+        st = state(request)
+        sent = await webpush.WebPush(st.config, st.db).send(
+            "AI Trader test alert",
+            "Phone alerts work on this device. You will get one when the bot buys, closes a "
+            "trade, halts or loses the broker connection.",
+            tags=["white_check_mark"],
+            only=body.device,
+        )
+        return {"sent": sent, **push_payload(request)}
 
     # ------------------------------------------------------------ bot control
     @app.post("/api/bot/start")

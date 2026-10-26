@@ -380,7 +380,7 @@ All of these start with `cd ~/Trader`.
 | App log, last 100 lines | `docker compose logs --tail 100 trader` |
 | Follow a log live (`Ctrl+C` to stop) | `docker compose logs -f trader` (or `ib-gateway`, `cloudflared`) |
 | Settings check (no secrets shown) | `docker compose exec trader python -m trader status` |
-| Send a test phone alert (ntfy) | `docker compose exec trader python -m trader notify-test` |
+| Send a test phone alert (app push and ntfy) | `docker compose exec trader python -m trader notify-test`, or **Settings > Phone alerts > Send a test alert** |
 | Check the bot's orders reach IBKR with their stop-loss (paper only, cannot fill) | `docker compose exec trader python -m trader paper-test` |
 | Back up the database now (also done every night) | `docker compose exec trader python -m trader backup` |
 | Restart only the app (gateway stays logged in) | `docker compose restart trader` (keeps the old `.env` values) |
@@ -514,8 +514,9 @@ Phone alerts come from the app itself, so they stop if the droplet or the app di
 
 1. Sign up, then **Add Check**. Set **Period** 5 minutes and **Grace** 15 minutes (IB
    Gateway restarts every night for a minute or two).
-2. **Integrations > ntfy**: enter your ntfy topic URL (the value of `TRADER_NTFY_URL`), so
-   the alert arrives in the same ntfy app.
+2. **Integrations**: keep **Email** (on by default, free). If you use ntfy, you can add
+   **ntfy** with your topic URL (the value of `TRADER_NTFY_URL`) as well. App alerts cannot
+   cover this case: they are sent by the app that just went silent.
 3. Copy the check's **ping URL** (`https://hc-ping.com/...`). It is a secret: anyone with
    it can fake pings. On the droplet:
 
@@ -555,8 +556,8 @@ The app is set up to make this predictable (`TWS_COLD_RESTART=10:00` in `.env`):
 4. Still stuck: `docker compose restart ib-gateway` sends a fresh push.
 
 The same approval is needed after anything that restarts the gateway: a droplet reboot
-(security updates), an update, or a `.env` change to a gateway setting. If you turned on
-ntfy, you get an alert when the broker connection has been down for over a minute.
+(security updates), an update, or a `.env` change to a gateway setting. With phone alerts on,
+you get one when the broker connection has been down for over a minute.
 
 ---
 

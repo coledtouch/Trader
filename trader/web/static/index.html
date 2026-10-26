@@ -11,8 +11,8 @@
   <link rel="manifest" href="/static/manifest.webmanifest" crossorigin="use-credentials">
   <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
-  <link rel="stylesheet" href="/static/styles.css?v=15">
-  <script src="/static/app.js?v=15" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=16">
+  <script src="/static/app.js?v=16" defer></script>
 </head>
 <body data-mode="unknown">
   <a class="skip-link" href="#main">Skip to content</a>
@@ -312,6 +312,20 @@
           <button id="arm-btn" class="btn btn-danger" type="button" aria-haspopup="dialog">Arm live trading…</button>
           <button id="disarm-btn" class="btn" type="button">Disarm</button>
         </div>
+      </section>
+
+      <section id="push-card" class="card" aria-labelledby="push-heading">
+        <h2 id="push-heading" class="card-title">Phone alerts</h2>
+        <p class="small muted">The app alerts you when the bot buys, closes a trade, halts or loses
+          the broker connection, even while it is closed. Turn alerts on for each phone or computer.</p>
+        <p id="push-status" class="mt-8" role="status"></p>
+        <div class="btn-row mt-12">
+          <button id="push-enable" class="btn btn-primary" type="button" hidden>Turn on alerts on this device</button>
+          <button id="push-test" class="btn" type="button" hidden>Send a test alert</button>
+          <button id="push-disable" class="btn" type="button" hidden>Turn off on this device</button>
+        </div>
+        <div id="push-devices" class="mt-12"></div>
+        <p id="push-note" class="small muted mt-8" hidden></p>
       </section>
 
       <form id="settings-form" class="card" novalidate aria-labelledby="settings-heading">
