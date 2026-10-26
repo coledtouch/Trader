@@ -86,6 +86,9 @@ class ReplayFrame(BaseModel):
 
     ts: datetime
     quotes: dict[str, Quote] = Field(default_factory=dict)
+    # When each quote arrived in production. A round's quotes arrive over its fetch, so
+    # each is judged as old as it was on arrival, not as old as at the round's last one.
+    quoted_at: dict[str, datetime] = Field(default_factory=dict)
     bars: dict[str, list[Bar]] = Field(default_factory=dict)
     candidates: list[Candidate] | None = None
     batch: DecisionBatch | None = None
@@ -117,6 +120,8 @@ class ReplayFrame(BaseModel):
                 raise ValueError(f"quote key {key!r} differs from its instrument")
             if quote.ts.tzinfo is None:
                 raise ValueError("quote timestamps must include a timezone")
+        if any(t.tzinfo is None or t > self.ts for t in self.quoted_at.values()):
+            raise ValueError("quote arrival times must include a timezone, at or before frame")
         for key, bars in self.bars.items():
             Instrument.from_key(key)
             if any(bar.ts.tzinfo is None for bar in bars):
@@ -134,6 +139,15 @@ class ReplayFrame(BaseModel):
                 "captured votes must have timezone-aware timestamps at or before frame"
             )
         return self
+
+    def replay_quotes(self) -> dict[str, Quote]:
+        """Quotes as the frame's clock sees them: each as old as it was when it arrived."""
+        quotes = {}
+        for key, quote in self.quotes.items():
+            arrived = self.quoted_at.get(key)
+            later = self.ts - arrived if arrived is not None else timedelta(0)
+            quotes[key] = quote.model_copy(update={"ts": quote.ts + later}) if later else quote
+        return quotes
 
 
 class EquityObservation(BaseModel):
@@ -313,6 +327,7 @@ class _ReplayBroker(Broker):
         self.cash = cash
         self.plan, self.slippage = commission_plan, slippage_bps / 10_000
         self.frame: ReplayFrame | None = None
+        self._quotes: dict[str, Quote] = {}
         self._connected = False
         self._positions: dict[str, Position] = {}
         self._orders: dict[str, OrderRecord] = {}
@@ -353,12 +368,13 @@ class _ReplayBroker(Broker):
 
     def advance(self, frame: ReplayFrame) -> None:
         self.frame = frame
+        self._quotes = frame.replay_quotes()
         self.clock.ts = frame.ts
         if stock_market_open(frame.ts):
             today = trading_day(frame.ts)
             self._unsettled = [(d, amount) for d, amount in self._unsettled if d >= today]
         bad = False
-        for key, quote in frame.quotes.items():
+        for key, quote in self._quotes.items():
             if self._usable(quote):
                 assert quote.bid is not None
                 self._marks[key] = quote.bid
@@ -377,7 +393,7 @@ class _ReplayBroker(Broker):
                 if record.created_at >= frame.ts:
                     continue
                 req = record.request
-                quote = frame.quotes.get(req.instrument.key)
+                quote = self._quotes.get(req.instrument.key)
                 if not self._usable(quote):
                     continue
                 assert quote is not None and quote.bid is not None and quote.ask is not None
@@ -423,9 +439,9 @@ class _ReplayBroker(Broker):
         ]
 
     async def quote(self, instrument: Instrument) -> Quote:
-        if self.frame is None or instrument.key not in self.frame.quotes:
+        if instrument.key not in self._quotes:
             raise BrokerError(f"no captured quote for {instrument.key}")
-        return self.frame.quotes[instrument.key].model_copy(deep=True)
+        return self._quotes[instrument.key].model_copy(deep=True)
 
     async def bars(
         self, instrument: Instrument, bar_size: str = "5 mins", lookback: str = "2 D"
@@ -463,7 +479,7 @@ class _ReplayBroker(Broker):
         return rec
 
     async def place_order(self, req: OrderRequest) -> OrderRecord:
-        quote = None if self.frame is None else self.frame.quotes.get(req.instrument.key)
+        quote = self._quotes.get(req.instrument.key)
         if not self._usable(quote):
             return OrderRecord(
                 request=req,

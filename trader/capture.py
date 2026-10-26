@@ -24,6 +24,7 @@ def capture_cycle(
     bars: dict[str, list[Bar]],
     batch: DecisionBatch,
     settings: BotSettings,
+    quoted_at: dict[str, datetime] | None = None,
 ) -> None:
     """Persist what was observed, not revised history or fabricated historical AI votes.
 
@@ -36,9 +37,13 @@ def capture_cycle(
     try:
         # The frame's time is when its data was all in: on IBKR a quote is stamped with its
         # latest tick, which can come after the round started (ctx.now). A replay pinned to
-        # an earlier time would treat those quotes as from the future.
+        # an earlier time would treat those quotes as from the future. Each quote's own
+        # arrival is kept too, so the replay judges it as old as it was then.
+        arrived = {
+            key: _aware(t) for key, t in (quoted_at or {}).items() if quotes.get(key) is not None
+        }
         stamps = [_aware(q.ts) for q in quotes.values() if q is not None]
-        frame_ts = max([_aware(ctx.now), *stamps])
+        frame_ts = max([_aware(ctx.now), *stamps, *arrived.values()])
         encoded = settings.model_dump(mode="json")
         cohort_data = {
             "account": ctx.account.account_id,
@@ -64,6 +69,7 @@ def capture_cycle(
                 for key, quote in quotes.items()
                 if quote is not None
             },
+            "quoted_at": {key: t.isoformat() for key, t in arrived.items()},
             "bars": {},
             "candidates": [c.model_dump(mode="json") for c in ctx.candidates],
             "batch": batch.model_dump(mode="json"),

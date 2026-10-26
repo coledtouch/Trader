@@ -7,10 +7,18 @@ from datetime import timedelta
 
 import pytest
 
-from tests.test_research import NOW, F, candidate, frame, settings
+from tests.test_research import NOW, F, T, candidate, frame, settings
 from trader.capture import capture_cycle
 from trader.db import Database
-from trader.models import AccountSnapshot, Bar, DayStats, DecisionBatch, DecisionContext, Mode
+from trader.models import (
+    AccountSnapshot,
+    Bar,
+    DayStats,
+    DecisionBatch,
+    DecisionContext,
+    Mode,
+    Quote,
+)
 from trader.research import ReplayFrame, replay_experiment
 
 
@@ -150,3 +158,52 @@ async def test_live_quotes_newer_than_the_round_start_replay_as_usable():
     result = await replay_experiment(compact, config, arms=("rules",), slippage_bps=0)
     assert result.arms["rules"].fills  # traded on them
     db.close()
+
+
+async def test_a_quote_that_arrived_early_in_a_slow_round_replays_as_usable():
+    """Review finding: a round's quotes arrive over its fetch. Judging every quote at the
+    round's last arrival made an early quote stale in the replay though production, which
+    judges each quote when it arrived, traded on it."""
+    config = settings()
+    gap = timedelta(seconds=config.monitor_seconds * 2 + 10)  # beyond the replay's max age
+    raw = [
+        frame(candidates=[candidate()], instruments=(F, T)),
+        frame(1, price=19.9, decision=False, instruments=(F, T)),
+        frame(2, price=21, decision=False, instruments=(F, T)),
+        frame(3, price=19.8, decision=False, instruments=(F, T)),
+    ]
+    db = Database(":memory:")
+    for observed in raw:
+        late = observed.ts + gap  # T's quote arrived (and last ticked) later in the round
+        observed.quotes[T.key] = Quote(instrument=T, bid=17, ask=17, last=17, ts=late)
+        observed.market = {F.key: {"price": observed.quotes[F.key].last, "atr14": 0.5}}
+        capture_cycle(
+            db,
+            context(observed, config),
+            observed.quotes,
+            {},
+            DecisionBatch(ts=observed.ts, maker="rules"),
+            config,
+            {F.key: observed.ts, T.key: late},
+        )
+    compact = [ReplayFrame.model_validate(p) for p in db.list_research_frames()]
+    assert all(f.ts == f.quotes[T.key].ts for f in compact)
+    assert all(f.ts - f.replay_quotes()[F.key].ts == timedelta(0) for f in compact)
+    for old, new in zip(raw, compact, strict=True):
+        new.decision_cycle = old.decision_cycle
+    result = await replay_experiment(compact, config, arms=("rules",), slippage_bps=0)
+    arm = result.arms["rules"]
+    assert arm.invalid_quote_frames == 0
+    assert len(arm.fills) == 2  # the entry and its exit, as without T
+    db.close()
+
+
+def test_quote_arrival_after_the_frame_is_rejected():
+    observed = frame()
+    with pytest.raises(ValueError, match="arrival"):
+        ReplayFrame.model_validate(
+            {
+                **observed.model_dump(mode="json"),
+                "quoted_at": {F.key: (observed.ts + timedelta(seconds=1)).isoformat()},
+            }
+        )

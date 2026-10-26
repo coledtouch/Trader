@@ -996,6 +996,8 @@ from the stop or target when this client has no order row for that perm id.
   with observed quotes, all scanner candidates, original indicator features, actual batch/votes,
   decision-time settings, account/mode provenance and a cohort fingerprint. No API
   credentials are captured. Failure to capture never interrupts trading protection.
+  A frame's time is when its data was all in; `quoted_at` keeps each quote's arrival, and
+  the replay judges each quote as old as it was then, as production did.
   Each frame's `bars` is empty; scanner-snapshot replay consumes the original candidates
   and features directly and cannot rescan historical bars. The CSV route performs rescans.
   `DecisionBatch.vote_costs` and `vote_failures` preserve available per-model economics.

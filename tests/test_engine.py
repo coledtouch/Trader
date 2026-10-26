@@ -42,6 +42,7 @@ from trader.models import (
     TradeAction,
 )
 from trader.notify import Notifier
+from trader.research import ReplayFrame
 from trader.strategy.decide import RuleBasedDecisionMaker
 from trader.watchdog import HEARTBEAT_KEY
 
@@ -2378,3 +2379,24 @@ async def test_a_slow_fetch_of_another_symbol_does_not_make_a_quote_stale(db, co
     rec = await enter_f(h)
     assert rec.status == OrderStatus.FILLED
     assert not any("stale" in (s.skip_reason or "") for s in db.list_signals())
+
+
+async def test_research_replays_a_round_quote_as_old_as_it_was_on_arrival(db, config) -> None:
+    """Review finding: the captured frame takes the round's last arrival as its time, so
+    the replay must not judge an earlier quote as if it had arrived then too."""
+    h = await harness(db, config)
+    original = h.broker.quote
+
+    async def late_quote(inst):
+        if inst.symbol == "T":
+            h.clock.advance(seconds=35)  # T's quote arrives late in the round
+        return await original(inst)
+
+    h.broker.quote = late_quote
+    rec = await enter_f(h)
+    assert rec.status == OrderStatus.FILLED
+    frame = ReplayFrame.model_validate(db.list_research_frames()[-1])
+    assert frame.ts - frame.quoted_at["STK:F"] >= timedelta(seconds=35)
+    seen = frame.replay_quotes()["STK:F"]
+    assert frame.ts - seen.ts == frame.quoted_at["STK:F"] - frame.quotes["STK:F"].ts
+    assert frame.ts - seen.ts <= timedelta(seconds=2 * h.engine.settings.monitor_seconds)

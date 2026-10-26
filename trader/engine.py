@@ -2699,6 +2699,7 @@ class Engine:
                 {inst.key: bars for inst, _, bars in data},
                 batch,
                 cycle_settings,
+                {key: self._quoted_at[key] for key in quotes if key in self._quoted_at},
             )
         day.llm_cost = round(day.llm_cost + batch.cost_usd, 6)
         self._save_day()
