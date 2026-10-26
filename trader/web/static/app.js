@@ -2539,7 +2539,8 @@
           : 'Alerts were not allowed.', 'error');
         return;
       }
-      if (!state.push || !state.push.public_key) await loadPush();
+      await loadPush(); // the server's current key, not the one this card last rendered
+      if (!state.push || !state.push.public_key) return;
       const key = keyBytes(state.push.public_key);
       const reg = (await navigator.serviceWorker.getRegistration()) || (await navigator.serviceWorker.ready);
       for (let attempt = 0; ; attempt += 1) {

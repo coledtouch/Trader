@@ -1053,6 +1053,10 @@ def test_phone_push_reset_after_the_secret_key_was_replaced(env):
     assert fresh["public_key"] != old_key
     assert fresh["resubscribe"] == [webpush.subscription_id(phone.endpoint)]
     assert env.db.list_audit(1)[0]["action"] == "push_reset"
+    # A second tap from a card left open: the new key works, so nothing is reset again.
+    assert env.client.post("/api/push/subscribe", json=body, headers=headers).status_code == 200
+    again = env.client.post("/api/push/reset", headers=headers).json()
+    assert again["public_key"] == fresh["public_key"] and len(again["devices"]) == 1
     assert webpush.push_key_matches(env.app.state.config, env.db) is True
 
 

@@ -911,7 +911,11 @@ def create_app(
     @app.post("/api/push/reset")
     async def push_reset(request: Request, session: Session = Depends(require_csrf)) -> Any:
         st = state(request)
-        if webpush.push_key_matches(st.config, st.db) is False and not secret_key_is_right(request):
+        if webpush.push_key_matches(st.config, st.db) is not False:
+            # The Settings button exists for an unreadable key only; a card left open from
+            # before must not wipe a key (and devices) that works. CLI push-reset forces it.
+            return await run_in_threadpool(push_payload, request)
+        if not secret_key_is_right(request):
             # A reset would throw away a push key the original TRADER_SECRET_KEY still reads.
             raise HTTPException(status_code=409, detail=WRONG_KEY_MESSAGE)
         removed = webpush.reset_push(st.db)
