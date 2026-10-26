@@ -850,6 +850,7 @@ def create_app(
             "max_devices": webpush.MAX_DEVICES,
             "ntfy": bool((st.config.ntfy_url or "").strip()),
             "key_mismatch": mismatch,
+            "resubscribe": webpush.resubscribe_ids(st.db),
         }
 
     @app.get("/api/push")

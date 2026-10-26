@@ -338,10 +338,13 @@ async def test_alerts_are_sent_urgent_unless_marked_low(db: Database) -> None:
 def test_reset_forgets_the_key_and_every_device(db: Database) -> None:
     cfg = config()
     old = webpush.load_vapid_key(cfg, db, create=True)
-    subscribe(db, Device())
+    sub_id = subscribe(db, Device())
     assert webpush.push_key_matches(cfg, db) is True
+    assert webpush.resubscribe_ids(db) == []
     assert webpush.reset_push(db) == 1
     assert db.list_push_subscriptions() == [] and db.get_kv(webpush.VAPID_KV_KEY) is None
+    # The devices subscribed at the reset subscribe again on their own; others stay off.
+    assert webpush.resubscribe_ids(db) == [sub_id]
     assert webpush.push_key_matches(cfg, db) is None
     new = webpush.load_vapid_key(cfg, db, create=True)
     assert new is not None and old is not None
@@ -374,26 +377,35 @@ def _cli_env(tmp_path, monkeypatch, key: str):
     return env_file, cfg, database
 
 
-def test_cli_logout_all_and_push_reset_stop_alerts_everywhere(tmp_path, monkeypatch, capsys):
+def test_cli_removes_one_lost_device_and_resets_all(tmp_path, monkeypatch, capsys):
     from trader import cli
 
     env_file, cfg, database = _cli_env(tmp_path, monkeypatch, crypto.generate_secret_key())
     try:
-        key = webpush.load_vapid_key(cfg, database, create=True)
-        subscribe(database, Device())
-        # A lost phone keeps getting alerts without any session: logout-all stops them.
+        webpush.load_vapid_key(cfg, database, create=True)
+        phone = subscribe(database, Device(FCM + "phone"), "Android · Chrome")
+        laptop = subscribe(database, Device(FCM + "laptop"), "Windows · Edge")
+        # logout-all signs out sessions only: the laptop must keep its alerts while the
+        # lost phone's 2FA cannot be replaced yet. It points at the per-device commands.
         assert cli.main(["logout-all", "--env-file", str(env_file)]) == 0
-        assert "Phone alerts were turned off on all 1 device" in capsys.readouterr().out
-        assert database.list_push_subscriptions() == []
-        kept = webpush.load_vapid_key(cfg, database)
-        assert kept is not None and key is not None
-        assert webpush.public_key_b64(kept) == webpush.public_key_b64(key)
+        assert "push-remove" in capsys.readouterr().out
+        assert len(database.list_push_subscriptions()) == 2
 
-        subscribe(database, Device())
+        assert cli.main(["push-devices", "--env-file", str(env_file)]) == 0
+        listed = capsys.readouterr().out
+        assert phone in listed and "Android · Chrome" in listed and laptop in listed
+        assert FCM not in listed  # endpoints are never printed
+        assert cli.main(["push-remove", phone, "--env-file", str(env_file)]) == 0
+        assert [d["id"] for d in database.list_push_subscriptions()] == [laptop]
+        assert database.list_audit(1)[0]["action"] == "push_device_removed"
+        assert cli.main(["push-remove", phone, "--env-file", str(env_file)]) == 1
+        assert "no device" in capsys.readouterr().err
+
         assert cli.main(["push-reset", "--env-file", str(env_file)]) == 0
         assert "1 device(s) removed" in capsys.readouterr().out
         assert database.get_kv(webpush.VAPID_KV_KEY) is None
         assert database.list_push_subscriptions() == []
+        assert webpush.resubscribe_ids(database) == [laptop]
         assert database.list_audit(1)[0]["action"] == "push_reset"
     finally:
         database.close()
@@ -407,8 +419,10 @@ def test_cli_reset_2fa_with_a_new_secret_key_resets_push(tmp_path, monkeypatch, 
         webpush.load_vapid_key(cfg, database, create=True)
         subscribe(database, Device())
         env_file.write_text(f"TRADER_SECRET_KEY={crypto.generate_secret_key()}\n", "utf-8")
+        # A wrong key (2FA does not decrypt either): restore it, do not reset anything.
         assert cli.main(["status", "--env-file", str(env_file)]) == 0
-        assert "key does not match TRADER_SECRET_KEY (run push-reset)" in capsys.readouterr().out
+        status = capsys.readouterr().out
+        assert "restore the original TRADER_SECRET_KEY" in status and "push-reset" not in status
         out = tmp_path / "totp.txt"
         assert (
             cli.main(["reset-2fa", "--env-file", str(env_file), "--totp-secret-out", str(out)]) == 0
@@ -416,5 +430,20 @@ def test_cli_reset_2fa_with_a_new_secret_key_resets_push(tmp_path, monkeypatch, 
         assert "Phone alerts were reset" in capsys.readouterr().out
         assert database.get_kv(webpush.VAPID_KV_KEY) is None
         assert database.list_push_subscriptions() == []
+    finally:
+        database.close()
+
+
+def test_cli_status_suggests_push_reset_only_when_the_key_is_right(tmp_path, monkeypatch, capsys):
+    from trader import cli
+
+    old_key = crypto.generate_secret_key()
+    env_file, cfg, database = _cli_env(tmp_path, monkeypatch, crypto.generate_secret_key())
+    try:
+        # 2FA decrypts with the current key; the push key was made under an older one.
+        old = config(secret_key=SecretStr(old_key))
+        webpush.load_vapid_key(old, database, create=True)
+        assert cli.main(["status", "--env-file", str(env_file)]) == 0
+        assert "older TRADER_SECRET_KEY (run push-reset)" in capsys.readouterr().out
     finally:
         database.close()

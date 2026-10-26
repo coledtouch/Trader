@@ -330,6 +330,15 @@ def cmd_reset_2fa(args: argparse.Namespace) -> int:
     return 0
 
 
+def _push_status(config: AppConfig, db: Database, twofa_decrypts: str) -> str:
+    text = f"{db.count_push_subscriptions()} device(s) (list: push-devices)"
+    if webpush.push_key_matches(config, db) is not False:
+        return text
+    if twofa_decrypts == "yes":  # the key is right: push's own key is from an older one
+        return f"{text}; its key is from an older TRADER_SECRET_KEY (run push-reset)"
+    return f"{text}; key unreadable: restore the original TRADER_SECRET_KEY"
+
+
 def _reset_unreadable_push(config: AppConfig, db: Database) -> int | None:
     """TRADER_SECRET_KEY was replaced: the phone-alert key encrypted with the old one is
     unreadable, so start phone alerts over (each device turns them on again)."""
@@ -365,17 +374,50 @@ def cmd_logout_all(args: argparse.Namespace) -> int:
     db = Database(config.db_path)
     try:
         Authenticator(config, db).logout_all()
-        # A lost phone keeps getting alerts without a session: stop them everywhere too.
-        devices = db.delete_all_push_subscriptions()
-        db.audit("logout_all", {"push_devices_removed": devices}, actor="cli")
+        db.audit("logout_all", actor="cli")
         was_armed = disarm_live(db, "logout-all (CLI)")
+        devices = db.count_push_subscriptions()
     finally:
         db.close()
     print("All sessions were signed out.")
     if devices:
-        print(f"Phone alerts were turned off on all {devices} device(s): turn them on again on")
-        print("yours (Settings > Phone alerts).")
+        print(f"Phone alerts stay on for {devices} device(s). A lost device still gets them:")
+        print("list them with `push-devices` and remove it with `push-remove <id>`.")
     _print_disarmed(was_armed)
+    return 0
+
+
+def cmd_push_devices(args: argparse.Namespace) -> int:
+    """List the devices that get phone alerts (no endpoints or keys)."""
+    config = _config(args)
+    db = Database(config.db_path)
+    try:
+        devices = db.list_push_subscriptions()
+    finally:
+        db.close()
+    if not devices:
+        print("No device gets phone alerts.")
+        return 0
+    for d in devices:
+        last = d["last_ok_at"] or ("never" if not d["failures"] else f"{d['failures']} failed")
+        label = d["label"] or "device"
+        print(f"{d['id']}  {label:<24}  added {d['created_at'][:16]}  last alert {last}")
+    print("Remove one with `python -m trader push-remove <id>`.")
+    return 0
+
+
+def cmd_push_remove(args: argparse.Namespace) -> int:
+    """Stop phone alerts to one device (a lost phone or laptop)."""
+    config = _config(args)
+    device = args.device.strip().lower()
+    db = Database(config.db_path)
+    try:
+        if not db.delete_push_subscription(device):
+            raise CLIError(f"no device with id {device!r}: see `python -m trader push-devices`")
+        db.audit("push_device_removed", {"device": device}, actor="cli")
+    finally:
+        db.close()
+    print(f"Device {device} no longer gets phone alerts.")
     return 0
 
 
@@ -468,15 +510,7 @@ def cmd_status(args: argparse.Namespace) -> int:
                 ("LLM enabled", _yes(settings.llm_enabled)),
                 ("decision mode", settings.decision_mode),
                 ("engine heartbeat", db.get_kv(HEARTBEAT_KEY) or "none"),
-                (
-                    "phone push",
-                    f"{db.count_push_subscriptions()} device(s)"
-                    + (
-                        "; key does not match TRADER_SECRET_KEY (run push-reset)"
-                        if webpush.push_key_matches(config, db) is False
-                        else ""
-                    ),
-                ),
+                ("phone push", _push_status(config, db, decrypts)),
             ]
         finally:
             db.close()
@@ -644,10 +678,16 @@ def build_parser() -> argparse.ArgumentParser:
     reset_2fa.set_defaults(func=cmd_reset_2fa)
 
     sub.add_parser(
-        "logout-all",
-        parents=[common],
-        help="sign out every session and turn off phone alerts (also disarms live trading)",
+        "logout-all", parents=[common], help="sign out every session (also disarms live trading)"
     ).set_defaults(func=cmd_logout_all)
+    sub.add_parser(
+        "push-devices", parents=[common], help="list the devices that get phone alerts"
+    ).set_defaults(func=cmd_push_devices)
+    push_remove = sub.add_parser(
+        "push-remove", parents=[common], help="stop phone alerts to one device (lost phone)"
+    )
+    push_remove.add_argument("device", help="the device id shown by push-devices")
+    push_remove.set_defaults(func=cmd_push_remove)
     sub.add_parser(
         "push-reset",
         parents=[common],

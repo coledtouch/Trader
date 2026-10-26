@@ -1051,5 +1051,6 @@ def test_phone_push_reset_after_the_secret_key_was_replaced(env):
     fresh = reset.json()
     assert fresh["available"] and not fresh["key_mismatch"] and fresh["devices"] == []
     assert fresh["public_key"] != old_key
+    assert fresh["resubscribe"] == [webpush.subscription_id(phone.endpoint)]
     assert env.db.list_audit(1)[0]["action"] == "push_reset"
     assert webpush.push_key_matches(env.app.state.config, env.db) is True

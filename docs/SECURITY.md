@@ -137,24 +137,31 @@ Work through this list from your laptop.
    cd ~/Trader
    docker compose exec trader python -m trader logout-all
    ```
-   This also **turns off phone alerts on every device** (they need no session, so the lost
-   phone would keep showing them on its lock screen; turn them on again on your devices
-   later in **Settings > Phone alerts**) and **disarms live trading** at once (as do
-   `reset-2fa`, `reset-password` and `python -m trader disarm`): the bot drops to shadow
-   mode and opens nothing new. It keeps
+   This also **disarms live trading** at once (as do `reset-2fa`, `reset-password` and
+   `python -m trader disarm`): the bot drops to shadow mode and opens nothing new. It keeps
    closing the positions it opened (stops, targets, time stops, closing stocks before the
    bell, the daily-loss flatten). Check open positions in IBKR Mobile or the Client Portal
    and close anything else you do not want to hold.
-2. **Lock the server gate** so nobody can arm again (the phone holds your 2FA codes): set
+2. **Stop alerts to the lost phone.** They need no session, so it would keep showing them
+   on its lock screen. Your other devices keep getting them:
+   ```bash
+   docker compose exec trader python -m trader push-devices
+   docker compose exec trader python -m trader push-remove THE-PHONE-ID
+   ```
+   (`push-devices` lists each device's id with a name such as `Android · Chrome`.) If you
+   use **ntfy**, make a new topic now too: `openssl rand -hex 16`, put it in
+   `TRADER_NTFY_URL` in `.env`, `docker compose up -d`, and subscribe to it on the new
+   phone. The old topic would keep reaching the lost phone's ntfy app.
+3. **Lock the server gate** so nobody can arm again (the phone holds your 2FA codes): set
    `TRADER_ALLOW_LIVE=false` in `.env` (`nano .env`), then `docker compose up -d`. Starting
    with the gate off also clears any stored arm, so when you later set it back to `true`,
    real orders start only after you press **Arm** again with a fresh 2FA code.
-3. **Revoke Cloudflare Access sessions**: Zero Trust > **Access** > **Applications** >
+4. **Revoke Cloudflare Access sessions**: Zero Trust > **Access** > **Applications** >
    **desk** > **Revoke existing tokens**
    ([Cloudflare: session management](https://developers.cloudflare.com/cloudflare-one/identity/users/session-management/)).
    If the phone's e-mail app was signed in, sign it out from your e-mail provider's
    security page and change the e-mail password: the Access PIN goes to that mailbox.
-4. **New AI Trader 2FA** on the replacement phone (or an authenticator restored from its
+5. **New AI Trader 2FA** on the replacement phone (or an authenticator restored from its
    backup):
    ```bash
    docker compose exec trader python -m trader reset-2fa
@@ -162,7 +169,7 @@ Work through this list from your laptop.
    Scan the QR code, type the code. This also signs out all sessions. No new phone yet?
    Skip this step: nobody can log in without a valid code, and the bot keeps running
    inside its limits.
-5. **IBKR**: move IB Key to the new phone. In IBKR Mobile on the new phone, choose the
+6. **IBKR**: move IB Key to the new phone. In IBKR Mobile on the new phone, choose the
    option to migrate or reactivate IB Key, log in, and enter the code IBKR texts to your
    registered mobile number ([IBKR: reactivate or transfer IB Key](https://ibkb.interactivebrokers.com/es/node/3073),
    [IBKR: migrate IB Key to a new smartphone](https://ibkb.interactivebrokers.com/article/3283)).
@@ -170,7 +177,7 @@ Work through this list from your laptop.
    IBKR Client Services. **Verify on IBKR's site.** Until IB Key works again, the gateway's
    weekly login (live username) cannot be approved and the bot loses its connection at the
    next full login; stock stops stay active at IBKR.
-6. **If the phone held copies of secrets** (screenshots, notes, a password manager without
+7. **If the phone held copies of secrets** (screenshots, notes, a password manager without
    a strong lock), rotate them:
    - **Tunnel token**: Cloudflare dashboard > **Networking** > **Tunnels** > **desk** >
      **Rotate token** (older dashboards: **Refresh token**), copy the new `eyJ...` token
@@ -185,7 +192,7 @@ Work through this list from your laptop.
    - **ntfy**: make a new topic (`openssl rand -hex 16`), update `TRADER_NTFY_URL`,
      `docker compose up -d`, subscribe on the new phone, and check it with
      `docker compose exec trader python -m trader notify-test`.
-7. **Check what happened**: the app's audit log, and trades and account activity in the
+8. **Check what happened**: the app's audit log, and trades and account activity in the
    IBKR Client Portal.
 
 ## If you lose your laptop
@@ -194,19 +201,19 @@ Work through this list from your laptop.
    console (Droplet > **Access** > **Launch Droplet Console**), remove that key's line from
    `/home/trader/.ssh/authorized_keys`, then add the new laptop's key
    (`ssh-keygen -t ed25519` on the new laptop).
-2. Sign out sessions and stop phone alerts on every device:
-   `docker compose exec trader python -m trader logout-all`, and revoke Cloudflare Access
-   sessions (step 3 above). Turn alerts on again on your phone (**Settings > Phone
-   alerts**).
-3. If the laptop stored secrets in plain files, rotate them (step 6 above).
+2. Sign out sessions: `docker compose exec trader python -m trader logout-all`, and revoke
+   Cloudflare Access sessions (step 4 above).
+3. Stop alerts to the lost laptop: `docker compose exec trader python -m trader
+   push-devices`, then `push-remove` with the laptop's id (a name such as `Windows · Edge`).
+4. If the laptop stored secrets in plain files, rotate them (step 7 above).
 
 ## If you think the server is compromised
 
 1. In the app: **KILL** (disarm alone only blocks new entries, see the table above).
    Then in IBKR Mobile or the Client Portal, check that all orders are cancelled and close
    what you want closed.
-2. Change the IBKR password and rotate every secret in step 6 above. Delete the GitHub
-   deploy key (repository > Settings > Deploy keys).
+2. Change the IBKR password and rotate every secret in step 7 of "If you lose your phone".
+   Delete the GitHub deploy key (repository > Settings > Deploy keys).
 3. Rebuild on a fresh droplet (DEPLOY.md, Appendix A) and restore `data/` from a backup made
    before the incident.
 4. **Reset phone alerts**: the intruder could read the app's push key and your devices'

@@ -381,7 +381,9 @@ All of these start with `cd ~/Trader`.
 | Follow a log live (`Ctrl+C` to stop) | `docker compose logs -f trader` (or `ib-gateway`, `cloudflared`) |
 | Settings check (no secrets shown) | `docker compose exec trader python -m trader status` |
 | Send a test phone alert (app push and ntfy) | `docker compose exec trader python -m trader notify-test`, or **Settings > Phone alerts > Send a test alert** |
-| Reset phone alerts (new key, forget every device) | `docker compose exec trader python -m trader push-reset` |
+| List the devices that get phone alerts | `docker compose exec trader python -m trader push-devices` |
+| Stop phone alerts to one device (lost phone) | `docker compose exec trader python -m trader push-remove DEVICE-ID` |
+| Reset phone alerts (new key; devices subscribe again on their next start) | `docker compose exec trader python -m trader push-reset` |
 | Check the bot's orders reach IBKR with their stop-loss (paper only, cannot fill) | `docker compose exec trader python -m trader paper-test` |
 | Back up the database now (also done every night) | `docker compose exec trader python -m trader backup` |
 | Restart only the app (gateway stays logged in) | `docker compose restart trader` (keeps the old `.env` values) |

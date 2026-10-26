@@ -2431,6 +2431,9 @@
   // server keeps the subscription and sends each alert there (trader/webpush.py). The
   // service worker shows it. Devices are named by a hash of their endpoint, as on the server.
   const PUSH_DEVICE_KEY = 'trader-push-device';
+  // Set while this device swaps its subscription for one with the server's new key, so a
+  // failed subscribe() between the two steps is retried on the next start.
+  const PUSH_PENDING_KEY = 'trader-push-resubscribe';
   const pushSupported = () => window.isSecureContext && 'serviceWorker' in navigator
     && 'PushManager' in window && 'Notification' in window;
 
@@ -2465,6 +2468,7 @@
     try {
       if (deviceId) localStorage.setItem(PUSH_DEVICE_KEY, deviceId);
       else localStorage.removeItem(PUSH_DEVICE_KEY);
+      localStorage.removeItem(PUSH_PENDING_KEY);
     } catch { /* storage is optional */ }
   }
 
@@ -2617,45 +2621,64 @@
     }
   }
 
-  /** On start, keep this device in step with the server. A subscription made with an older
-   * server key (after a reset) is dropped, so its endpoint dies at the push service and the
-   * old key can no longer reach this device; if alerts were on here, a new one replaces it.
-   * A browser can also renew its subscription (new endpoint): hand that one over. A device
-   * removed on purpose stays removed. */
+  /** On start, keep this device in step with the server.
+   * - After a reset (new server key) a subscription made with the old key is dropped, so its
+   *   endpoint dies at the push service and the old key cannot reach this device. If this
+   *   device was subscribed at the reset, it subscribes again with the new key.
+   * - A browser can renew its subscription (new endpoint): hand the new one over.
+   * - A device removed on the server (from another device, the CLI, or by the push service)
+   *   remembers that it is off and stays off. */
   async function syncPush() {
     if (!pushSupported()) return;
     let stored = null;
-    try { stored = localStorage.getItem(PUSH_DEVICE_KEY); } catch { /* storage is optional */ }
-    const sub = await pushSubscription();
-    if (!sub) {
-      if (stored) remember(null);
+    let pending = false;
+    try {
+      stored = localStorage.getItem(PUSH_DEVICE_KEY);
+      pending = localStorage.getItem(PUSH_PENDING_KEY) === '1';
+    } catch { /* storage is optional */ }
+    const wanted = Boolean(stored) && Notification.permission === 'granted';
+    let sub = await pushSubscription();
+    if (!sub && !(pending && wanted)) {
+      if (stored || pending) remember(null);
       return;
     }
-    const wanted = Boolean(stored) && Notification.permission === 'granted';
+    const refresh = (info, id) => { if (state.view === 'settings') renderPush(info, id); };
     try {
       const info = await api('GET', '/api/push', undefined, { background: true });
       if (!info.available || !info.public_key) return;
+      const devices = asList(info.devices);
       const key = keyBytes(info.public_key);
-      let current = sub;
-      if (!sameKey(sub, key)) {
-        await sub.unsubscribe().catch(() => undefined);
-        if (!wanted) {
-          remember(null);
-          if (state.view === 'settings') renderPush(info, null);
+      if (sub && sameKey(sub, key)) {
+        if (!wanted) return;
+        const id = await deviceIdOf(sub.endpoint);
+        const listed = devices.some((d) => d.id === stored);
+        if (id === stored || !listed) {
+          if (!listed) {
+            remember(null);
+            refresh(info, null);
+          }
           return;
         }
+        // Same key, new endpoint: the browser renewed the subscription.
+      } else {
+        if (!(wanted && asList(info.resubscribe).includes(stored))) {
+          if (sub) await sub.unsubscribe().catch(() => undefined);
+          remember(null);
+          refresh(info, null);
+          return;
+        }
+        try { localStorage.setItem(PUSH_PENDING_KEY, '1'); } catch { /* best effort */ }
+        if (sub) await sub.unsubscribe().catch(() => undefined);
         const reg = await navigator.serviceWorker.getRegistration();
-        current = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
-      } else if (!wanted || (await deviceIdOf(sub.endpoint)) === stored) {
-        return;
+        sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key });
       }
-      const json = current.toJSON();
+      const json = sub.toJSON();
       let latest = await api('POST', '/api/push/subscribe', { endpoint: json.endpoint, keys: json.keys });
       remember(latest.device);
-      if (stored !== latest.device && asList(info.devices).some((d) => d.id === stored)) {
+      if (stored !== latest.device && devices.some((d) => d.id === stored)) {
         latest = await api('DELETE', `/api/push/devices/${stored}`);
       }
-      if (state.view === 'settings') renderPush(latest, await deviceIdOf(json.endpoint));
+      refresh(latest, latest.device);
     } catch { /* retried on the next start */ }
   }
 

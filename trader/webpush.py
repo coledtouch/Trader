@@ -41,6 +41,9 @@ from trader.security import crypto
 log = logging.getLogger(__name__)
 
 VAPID_KV_KEY = "push_vapid_private"
+# Devices subscribed when the key was last reset: each of them subscribes again with the new
+# key on its next start. A device removed before the reset stays removed.
+RESUBSCRIBE_KV_KEY = "push_resubscribe"
 MAX_DEVICES = 10
 TIMEOUT_S = 10.0
 TTL_S = 12 * 3600  # an alert older than this is not worth waking the phone for
@@ -198,12 +201,23 @@ def push_key_matches(config: AppConfig, db: Database) -> bool | None:
 
 
 def reset_push(db: Database) -> int:
-    """Forget the push key and every device. The next visit to Settings creates a new key;
-    each device turns alerts on again. A browser's old subscription is dropped when it
-    sees the new key, so whoever held the old key can no longer reach it. Returns the
-    number of devices removed."""
+    """Forget the push key and every device. The next visit to the app creates a new key.
+    Each browser drops its old subscription when it sees the new key, so whoever held the
+    old key can no longer reach it; the devices subscribed now subscribe again by
+    themselves (resubscribe_ids). Returns the number of devices removed."""
+    removed = [d["id"] for d in db.list_push_subscriptions()]
     db.delete_kv(VAPID_KV_KEY)
-    return db.delete_all_push_subscriptions()
+    db.delete_all_push_subscriptions()
+    db.set_kv(RESUBSCRIBE_KV_KEY, json.dumps(removed))
+    return len(removed)
+
+
+def resubscribe_ids(db: Database) -> list[str]:
+    try:
+        ids = json.loads(db.get_kv(RESUBSCRIBE_KV_KEY) or "[]")
+    except ValueError:
+        return []
+    return [i for i in ids if isinstance(i, str)] if isinstance(ids, list) else []
 
 
 def reset_if_unreadable(config: AppConfig, db: Database) -> int | None:
@@ -323,9 +337,10 @@ class WebPush:
         except crypto.SecretKeyError:
             if not self._key_error_logged:
                 log.warning(
-                    "phone push disabled: the stored push key does not match TRADER_SECRET_KEY. "
-                    "Run `python -m trader push-reset` (or Reset in Settings > Phone alerts), "
-                    "then turn alerts on again on each device"
+                    "phone push disabled: the stored push key cannot be read with "
+                    "TRADER_SECRET_KEY. If that key is wrong, put the original back. If it was "
+                    "replaced on purpose and logins work, reset phone alerts (Settings > Phone "
+                    "alerts, or `python -m trader push-reset`)"
                 )
                 self._key_error_logged = True
             return None
