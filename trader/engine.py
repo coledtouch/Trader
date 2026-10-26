@@ -2479,23 +2479,28 @@ class Engine:
 
     async def _fetch(
         self, universe: list[Instrument], now: datetime
-    ) -> list[tuple[Instrument, Quote, list[Bar]]]:
-        """Fetch quotes and bars so every emitted setup reaches the signal ledger."""
+    ) -> list[tuple[Instrument, Quote, list[Bar], datetime]]:
+        """Fetch quotes and bars so every emitted setup reaches the signal ledger.
+
+        Each result carries when its quote arrived. The monitor can re-quote a held symbol
+        while the round goes on, so the round keeps its own arrival times.
+        """
         assert self._account is not None
         lookback = BAR_LOOKBACK.get(self.settings.bar_size, "5 D")
         sem = asyncio.Semaphore(FETCH_CONCURRENCY)
 
-        async def one(inst: Instrument) -> tuple[Instrument, Quote, list[Bar]] | None:
+        async def one(inst: Instrument) -> tuple[Instrument, Quote, list[Bar], datetime] | None:
             async with sem:
                 try:
                     quote = await self.broker.quote(inst)
                     # The time it arrived: a live quote can tick after this cycle's `now`.
-                    self._track_halt(inst.key, quote, self._now())
+                    arrived = self._now()
+                    self._track_halt(inst.key, quote, arrived)
                     bars = await self.broker.bars(inst, self.settings.bar_size, lookback)
                 except Exception as exc:
                     log.warning("market data for %s failed: %s", inst.key, exc)
                     return None
-                return inst, quote, bars
+                return inst, quote, bars, arrived
 
         results = await asyncio.gather(*(one(i) for i in universe))
         return [r for r in results if r is not None]
@@ -2607,10 +2612,11 @@ class Engine:
         assert self._account is not None
         data = await self._fetch(universe, now)
         self._note_data_warning()
-        quotes = {inst.key: quote for inst, quote, _ in data}
+        quotes = {inst.key: quote for inst, quote, _, _ in data}
+        quoted_at = {inst.key: arrived for inst, _, _, arrived in data}
         market: dict[str, dict[str, float]] = {}
         candidates: list[Candidate] = []
-        for inst, quote, bars in data:
+        for inst, quote, bars, _ in data:
             try:
                 market[inst.key] = self.scanner.snapshot(inst, bars, quote)
                 candidates.extend(self.scanner.scan(inst, bars, quote, now))
@@ -2631,9 +2637,7 @@ class Engine:
         checked_at = self._now()
         for cand in candidates:
             key = cand.instrument.key
-            blocked = self._not_actionable(
-                cand, quotes.get(key), self._quoted_at.get(key, checked_at)
-            )
+            blocked = self._not_actionable(cand, quotes.get(key), quoted_at.get(key, checked_at))
             existing = recent.get((cand.instrument.key, cand.setup))
             if existing is not None and existing.id is not None:
                 logged.append(_Logged(cand, existing.id, False, blocked))
@@ -2696,10 +2700,10 @@ class Engine:
                 self.db,
                 ctx.model_copy(update={"candidates": candidates}),
                 quotes,
-                {inst.key: bars for inst, _, bars in data},
+                {inst.key: bars for inst, _, bars, _ in data},
                 batch,
                 cycle_settings,
-                {key: self._quoted_at[key] for key in quotes if key in self._quoted_at},
+                quoted_at,
             )
         day.llm_cost = round(day.llm_cost + batch.cost_usd, 6)
         self._save_day()

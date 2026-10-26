@@ -2400,3 +2400,22 @@ async def test_research_replays_a_round_quote_as_old_as_it_was_on_arrival(db, co
     seen = frame.replay_quotes()["STK:F"]
     assert frame.ts - seen.ts == frame.quoted_at["STK:F"] - frame.quotes["STK:F"].ts
     assert frame.ts - seen.ts <= timedelta(seconds=2 * h.engine.settings.monitor_seconds)
+
+
+async def test_a_monitor_requote_during_the_decision_keeps_the_round_arrival(db, config) -> None:
+    """Review finding: the monitor runs beside the round and can re-quote a symbol while
+    the AI decides. The captured frame keeps when the round's own quote arrived."""
+    h = await harness(db, config)
+    original = h.decider.decide
+
+    async def slow_decide(ctx):
+        h.clock.advance(seconds=40)  # a long AI call; the monitor re-quotes T meanwhile
+        quote = await h.broker.quote(Instrument(symbol="T"))
+        h.engine._track_halt("STK:T", quote, h.clock())
+        return await original(ctx)
+
+    h.decider.decide = slow_decide  # type: ignore[method-assign]
+    await enter_f(h)
+    frame = ReplayFrame.model_validate(db.list_research_frames()[-1])
+    assert frame.quoted_at["STK:T"] == NOW
+    assert frame.ts - frame.replay_quotes()["STK:T"].ts == timedelta(0)
