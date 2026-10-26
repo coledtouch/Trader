@@ -7,6 +7,7 @@ in Node, which is what the browser page uses for render and collect.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -120,7 +121,7 @@ def _run_form(settings: dict) -> dict:
     script = (
         _form_script()
         + """
-const payload = JSON.parse(process.argv[1]);
+const payload = JSON.parse(process.env.SETTINGS_PAYLOAD);
 const api = globalThis.__settingsForm;
 api.state.settings = {
   settings: payload.settings,
@@ -156,8 +157,12 @@ console.log(JSON.stringify({
     )
     node = shutil.which("node")
     assert node is not None
+    # The script goes in on stdin: app.js alone is close to the 128 KiB limit for one
+    # command-line argument.
     result = subprocess.run(  # noqa: S603
-        [node, "--input-type=module", "-e", script, json.dumps({"settings": settings})],
+        [node, "--input-type=module", "-"],
+        input=script,
+        env={**os.environ, "SETTINGS_PAYLOAD": json.dumps({"settings": settings})},
         check=False,
         capture_output=True,
         text=True,

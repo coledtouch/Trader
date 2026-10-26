@@ -24,7 +24,8 @@ def _run(script: str) -> dict:
     node = shutil.which("node")
     assert node is not None
     result = subprocess.run(  # noqa: S603
-        [node, "--input-type=module", "-e", _DOM + source + script],
+        [node, "--input-type=module", "-"],  # on stdin: too long for one argument
+        input=_DOM + source + script,
         check=False,
         capture_output=True,
         text=True,
