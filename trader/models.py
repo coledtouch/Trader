@@ -551,7 +551,9 @@ class QuoteHealth(BaseModel):
     symbol: str
     age_seconds: float | None = None
     delayed: bool = False
+    has_price: bool = True
     valid: bool = False
+    problem: str | None = None  # why the bot would not enter on it (None when usable)
 
 
 class EngineStatus(BaseModel):

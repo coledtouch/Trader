@@ -780,11 +780,16 @@
     box.replaceChildren(table([
       { label: 'Symbol', head: true, value: (q) => q.symbol || DASH },
       { label: 'Age', num: true, value: (q) => isNum(q.age_seconds) ? `${Math.max(0, Math.round(q.age_seconds))} sec` : 'Unknown' },
-      { label: 'Feed', value: (q) => state.data.status.broker === 'sim' ? chipNode('Synthetic', null) : q.delayed ? chipNode('Delayed', 'warn') : chipNode('Real-time', null) },
+      { label: 'Feed', value: (q) => {
+        if (state.data.status.broker === 'sim') return chipNode('Synthetic', null);
+        if (q.has_price === false) return chipNode('No data', 'warn');
+        return q.delayed ? chipNode('Delayed', 'warn') : chipNode('Real-time', null);
+      } },
       { label: 'Freshness check', value: (q) => {
         if (q.valid && !q.delayed) return chipNode('Usable', 'ok');
         if (q.valid && state.data.status.delayed_paper_entries) return chipNode('Delayed: paper entries allowed', 'warn');
-        return chipNode('Blocked', 'warn');
+        const why = q.valid ? 'delayed data' : q.problem;
+        return why ? [chipNode('Blocked', 'warn'), el('div', { class: 'small muted', text: why })] : chipNode('Blocked', 'warn');
       } },
     ], quotes));
   }

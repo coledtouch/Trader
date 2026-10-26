@@ -73,7 +73,7 @@ from trader.risk import (
     HALT_DAILY_LOSS,
     RiskManager,
     is_soft_halt,
-    quote_problem,
+    quote_block_reason,
     sane_exit_price,
 )
 from trader.strategy.consensus import PREFIX as CONSENSUS_PREFIX
@@ -1128,6 +1128,7 @@ class Engine:
             baseline = self._halt_eval_day(day).start_equity or start
             floor = baseline * (1 - self.risk.limits.max_daily_loss_pct / 100)
             loss_limit = round(max(0.0, start - floor), 2)
+        quotes = sorted(self._latest_quotes.values(), key=lambda q: q.instrument.key)
         return EngineStatus(
             running=self._running,
             mode=self.broker.mode,
@@ -1156,34 +1157,22 @@ class Engine:
             decision_warning=warning if self.settings.llm_enabled else None,
             data_warning=self._data_warning(),
             delayed_paper_entries=self._delayed_paper_entries_allowed(),
-            quote_health=[
-                {
-                    "symbol": quote.instrument.symbol,
-                    "age_seconds": max(0.0, (_aware(now) - _aware(quote.ts)).total_seconds()),
-                    "delayed": quote.delayed
-                    or (
-                        self.broker.data_delayed
-                        and quote.instrument.asset_class == AssetClass.STOCK
-                    ),
-                    "valid": quote.price is not None
-                    and math.isfinite(quote.price)
-                    and quote_problem(quote) is None
-                    and not quote.halted
-                    and -1
-                    <= (_aware(now) - _aware(quote.ts)).total_seconds()
-                    <= 2 * self.settings.monitor_seconds
-                    and (
-                        quote.instrument.asset_class != AssetClass.STOCK
-                        or quote.spread_pct is not None
-                    )
-                    and (
-                        quote.spread_pct is None
-                        or quote.spread_pct <= self.risk.limits.max_spread_pct
-                    ),
-                }
-                for quote in sorted(self._latest_quotes.values(), key=lambda q: q.instrument.key)
-            ],
+            quote_health=[self._quote_health(quote, now) for quote in quotes],
         )
+
+    def _quote_health(self, quote: Quote, now: datetime) -> dict[str, object]:
+        problem = quote_block_reason(
+            quote, now, self.settings.monitor_seconds, self.risk.limits.max_spread_pct
+        )
+        return {
+            "symbol": quote.instrument.symbol,
+            "age_seconds": max(0.0, (_aware(now) - _aware(quote.ts)).total_seconds()),
+            "delayed": quote.delayed
+            or (self.broker.data_delayed and quote.instrument.asset_class == AssetClass.STOCK),
+            "has_price": quote.price is not None and math.isfinite(quote.price),
+            "valid": problem is None,
+            "problem": problem,
+        }
 
     def _prune_quote_cache(self, now: datetime) -> None:
         """Keep health warnings scoped to configured, held and recent dynamic symbols."""

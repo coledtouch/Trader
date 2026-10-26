@@ -105,6 +105,34 @@ def quote_problem(quote: Quote) -> str | None:
     return None
 
 
+def quote_block_reason(
+    quote: Quote, now: datetime, monitor_seconds: float, max_spread_pct: float
+) -> str | None:
+    """Why the bot would not enter on this quote, in a few words for the dashboard, or None
+    when it is usable. The same market-data checks as RiskManager's entry check."""
+    if quote.price is None or not math.isfinite(quote.price):
+        return "no price received"
+    if quote.halted:
+        return "halted"
+    max_age = timedelta(seconds=STALE_QUOTE_INTERVALS * monitor_seconds)
+    if quote.delayed:
+        max_age += DELAYED_QUOTE_GRACE
+    age = _aware(now) - _aware(quote.ts)
+    if age > max_age:
+        return f"no update for {age.total_seconds():.0f}s (max {max_age.total_seconds():.0f}s)"
+    if age < timedelta(seconds=-1):
+        return "timestamp in the future"
+    problem = quote_problem(quote)
+    if problem is not None:
+        return f"looks wrong: {problem}"
+    spread = quote.spread_pct
+    if spread is None:
+        return None if quote.instrument.asset_class != AssetClass.STOCK else "no bid/ask"
+    if spread > max_spread_pct:
+        return f"spread {spread:.2f}% (max {max_spread_pct:g}%)"
+    return None
+
+
 def sane_exit_price(quote: Quote | None) -> float | None:
     """What a long could be sold for (the bid, else last/mid), or None when there is no
     quote or it fails `quote_problem`."""
