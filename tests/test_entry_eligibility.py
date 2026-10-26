@@ -465,7 +465,28 @@ async def test_crypto_trades_on_a_delayed_feed_are_not_tagged(db, config) -> Non
         await h.engine.monitor_tick()
     [trade] = db.list_trades(limit=5)
     assert trade.delayed_data is False
-    assert h.engine.status().delayed_paper_entries is False  # the switch is off
+    status = h.engine.status()
+    assert status.delayed_paper_entries is False  # the switch is off
+    # Delayed crypto is not blocked, so the dashboard must not say it is.
+    [btc] = [q for q in status.quote_health if q.symbol == "BTC"]
+    assert btc.delayed and btc.valid and not btc.delay_blocks_entry
+
+
+async def test_symbols_quoted_once_per_cycle_are_not_called_stale_between_cycles(
+    db, config
+) -> None:
+    h = await harness(db, config)
+    await h.engine.run_cycle()
+    for _ in range(4):  # a minute of monitor ticks: only held positions are re-quoted
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    health = h.engine.status().quote_health
+    assert health and all(q.valid for q in health), health
+    h.clock.advance(minutes=11)  # two missed decision cycles: now it is out of date
+    assert any(
+        not q.valid and "not re-checked" in (q.problem or "")
+        for q in h.engine.status().quote_health
+    )
 
 
 def test_quote_block_reason_names_the_failed_check() -> None:

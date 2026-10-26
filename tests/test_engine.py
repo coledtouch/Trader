@@ -721,6 +721,9 @@ async def test_halted_symbol_not_entered_and_cooldown(db, config) -> None:
     batch = await h.engine.run_cycle()
     assert batch is not None and batch.candidates == []
     assert not [r for r in h.broker.placed if r.side == Side.BUY]
+    # The dashboard says why, instead of calling the fresh quote usable.
+    [f] = [q for q in h.engine.status().quote_health if q.symbol == "F"]
+    assert not f.valid and f.problem == "halted 5 min ago (cooldown 15 min)"
 
     h.clock.advance(minutes=16)
     await h.engine.run_cycle()

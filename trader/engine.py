@@ -71,6 +71,7 @@ from trader.models import (
 from trader.notify import Notifier
 from trader.risk import (
     HALT_DAILY_LOSS,
+    STALE_QUOTE_INTERVALS,
     RiskManager,
     is_soft_halt,
     quote_block_reason,
@@ -395,6 +396,7 @@ class Engine:
         self._open_orders: list[OrderRecord] = []
         self._market: dict[str, dict[str, float]] = {}
         self._latest_quotes: dict[str, Quote] = {}
+        self._quoted_at: dict[str, datetime] = {}  # when each cached quote was fetched
         self._cycle_quote_scope: set[str] = set()
         self._cycle_quote_scope_at: datetime | None = None
         self._day: DayStats | None = None
@@ -1161,14 +1163,41 @@ class Engine:
         )
 
     def _quote_health(self, quote: Quote, now: datetime) -> dict[str, object]:
+        key = quote.instrument.key
+        # The quote as the bot saw it when it last fetched it (what an entry check sees).
+        quoted_at = self._quoted_at.get(key, now)
         problem = quote_block_reason(
-            quote, now, self.settings.monitor_seconds, self.risk.limits.max_spread_pct
+            quote, quoted_at, self.settings.monitor_seconds, self.risk.limits.max_spread_pct
         )
+        # Held positions are re-quoted every monitor tick, other symbols once per decision
+        # cycle (an entry always re-quotes first): only a missed round makes it out of date.
+        held = any(p.qty > 0 and p.instrument.key == key for p in self._positions)
+        interval = (
+            self.settings.monitor_seconds
+            if held
+            else max(self.settings.monitor_seconds, self.settings.cycle_seconds)
+        )
+        since = (_aware(now) - _aware(quoted_at)).total_seconds()
+        if problem is None and since > STALE_QUOTE_INTERVALS * interval:
+            problem = f"not re-checked for {since:.0f}s"
+        cooldown = self.risk.limits.halt_cooldown_minutes
+        halted_at = self._last_halt_at.get(key)
+        if problem is None and halted_at is not None and cooldown > 0:
+            since = _aware(now) - _aware(halted_at)
+            if since < timedelta(minutes=cooldown):
+                problem = (
+                    f"halted {since.total_seconds() / 60:.0f} min ago (cooldown {cooldown} min)"
+                )
+        is_stock = quote.instrument.asset_class == AssetClass.STOCK
+        delayed = quote.delayed or (self.broker.data_delayed and is_stock)
         return {
             "symbol": quote.instrument.symbol,
             "age_seconds": max(0.0, (_aware(now) - _aware(quote.ts)).total_seconds()),
-            "delayed": quote.delayed
-            or (self.broker.data_delayed and quote.instrument.asset_class == AssetClass.STOCK),
+            "delayed": delayed,
+            # As the entry check: delayed data blocks stock entries unless paper allows them.
+            "delay_blocks_entry": is_stock
+            and delayed
+            and not self._delayed_paper_entries_allowed(),
             "has_price": quote.price is not None and math.isfinite(quote.price),
             "valid": problem is None,
             "problem": problem,
@@ -1199,6 +1228,7 @@ class Engine:
         ):
             active.update(self._cycle_quote_scope)
         self._latest_quotes = {k: q for k, q in self._latest_quotes.items() if k in active}
+        self._quoted_at = {k: t for k, t in self._quoted_at.items() if k in active}
 
     def _delayed_paper_entries_allowed(self) -> bool:
         return self.broker.mode == Mode.PAPER and self.risk.limits.allow_delayed_paper_entries
@@ -1490,6 +1520,7 @@ class Engine:
 
     def _track_halt(self, key: str, quote: Quote, now: datetime) -> None:
         self._latest_quotes[key] = quote
+        self._quoted_at[key] = now
         if quote.halted:
             if key not in self._last_halt_at or now - self._last_halt_at[key] > CLOSE_RETRY:
                 log.info("%s is halted", key)

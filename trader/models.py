@@ -552,6 +552,7 @@ class QuoteHealth(BaseModel):
     age_seconds: float | None = None
     delayed: bool = False
     has_price: bool = True
+    delay_blocks_entry: bool = False
     valid: bool = False
     problem: str | None = None  # why the bot would not enter on it (None when usable)
 

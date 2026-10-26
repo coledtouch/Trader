@@ -787,7 +787,9 @@
       } },
       { label: 'Freshness check', value: (q) => {
         if (q.valid && !q.delayed) return chipNode('Usable', 'ok');
-        if (q.valid && state.data.status.delayed_paper_entries) return chipNode('Delayed: paper entries allowed', 'warn');
+        if (q.valid && !q.delay_blocks_entry) {
+          return chipNode(state.data.status.delayed_paper_entries ? 'Delayed: paper entries allowed' : 'Delayed: entries allowed', 'warn');
+        }
         const why = q.valid ? 'delayed data' : q.problem;
         return why ? [chipNode('Blocked', 'warn'), el('div', { class: 'small muted', text: why })] : chipNode('Blocked', 'warn');
       } },
