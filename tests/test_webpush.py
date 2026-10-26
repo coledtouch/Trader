@@ -345,6 +345,12 @@ def test_reset_forgets_the_key_and_every_device(db: Database) -> None:
     assert db.list_push_subscriptions() == [] and db.get_kv(webpush.VAPID_KV_KEY) is None
     # The devices subscribed at the reset subscribe again on their own; others stay off.
     assert webpush.resubscribe_ids(db) == [sub_id]
+    # A second reset before that device came back keeps it on the list (merged, no dups).
+    other = subscribe(db, Device(FCM + "other"))
+    assert webpush.reset_push(db) == 1
+    assert webpush.resubscribe_ids(db) == [sub_id, other]
+    webpush.reset_push(db)
+    assert webpush.resubscribe_ids(db) == [sub_id, other]
     assert webpush.push_key_matches(cfg, db) is None
     new = webpush.load_vapid_key(cfg, db, create=True)
     assert new is not None and old is not None

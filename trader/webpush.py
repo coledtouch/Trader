@@ -208,7 +208,11 @@ def reset_push(db: Database) -> int:
     removed = [d["id"] for d in db.list_push_subscriptions()]
     db.delete_kv(VAPID_KV_KEY)
     db.delete_all_push_subscriptions()
-    db.set_kv(RESUBSCRIBE_KV_KEY, json.dumps(removed))
+    # Keep the devices of earlier resets that have not been back since: a second reset must
+    # not switch them off. A device removed on purpose after re-subscribing has a new id,
+    # in neither list, so it stays removed.
+    again = list(dict.fromkeys([*resubscribe_ids(db), *removed]))
+    db.set_kv(RESUBSCRIBE_KV_KEY, json.dumps(again))
     return len(removed)
 
 

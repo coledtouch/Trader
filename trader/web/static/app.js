@@ -2652,14 +2652,15 @@
         if (!wanted) return;
         const id = await deviceIdOf(sub.endpoint);
         const listed = devices.some((d) => d.id === stored);
-        if (id === stored || !listed) {
+        if (id === stored || (!listed && !pending)) {
           if (!listed) {
             remember(null);
             refresh(info, null);
           }
           return;
         }
-        // Same key, new endpoint: the browser renewed the subscription.
+        // Same key, new endpoint: the browser renewed the subscription, or a swap to a new
+        // key stopped before the server heard of it (pending). Register it now.
       } else {
         if (!(wanted && asList(info.resubscribe).includes(stored))) {
           if (sub) await sub.unsubscribe().catch(() => undefined);

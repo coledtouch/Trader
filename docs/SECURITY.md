@@ -151,7 +151,9 @@ Work through this list from your laptop.
    (`push-devices` lists each device's id with a name such as `Android · Chrome`.) If you
    use **ntfy**, make a new topic now too: `openssl rand -hex 16`, put it in
    `TRADER_NTFY_URL` in `.env`, `docker compose up -d`, and subscribe to it on the new
-   phone. The old topic would keep reaching the lost phone's ntfy app.
+   phone. The old topic would keep reaching the lost phone's ntfy app. If healthchecks.io
+   sends to ntfy too (DEPLOY.md, dead-man's switch), change its **Integrations > ntfy** to
+   the new topic URL.
 3. **Lock the server gate** so nobody can arm again (the phone holds your 2FA codes): set
    `TRADER_ALLOW_LIVE=false` in `.env` (`nano .env`), then `docker compose up -d`. Starting
    with the gate off also clears any stored arm, so when you later set it back to `true`,
@@ -169,6 +171,8 @@ Work through this list from your laptop.
    Scan the QR code, type the code. This also signs out all sessions. No new phone yet?
    Skip this step: nobody can log in without a valid code, and the bot keeps running
    inside its limits.
+   On the new phone, install the app, sign in, and turn alerts on: **Settings > Phone
+   alerts > Turn on alerts on this device** (a test alert follows).
 6. **IBKR**: move IB Key to the new phone. In IBKR Mobile on the new phone, choose the
    option to migrate or reactivate IB Key, log in, and enter the code IBKR texts to your
    registered mobile number ([IBKR: reactivate or transfer IB Key](https://ibkb.interactivebrokers.com/es/node/3073),
@@ -190,7 +194,8 @@ Work through this list from your laptop.
    - **IBKR password**: change it in the Client Portal, update `TWS_PASSWORD`, then
      `docker compose up -d` (the gateway logs in again).
    - **ntfy**: make a new topic (`openssl rand -hex 16`), update `TRADER_NTFY_URL`,
-     `docker compose up -d`, subscribe on the new phone, and check it with
+     `docker compose up -d`, subscribe on the new phone, point healthchecks.io's ntfy
+     integration at the new topic if you use it, and check it with
      `docker compose exec trader python -m trader notify-test`.
 8. **Check what happened**: the app's audit log, and trades and account activity in the
    IBKR Client Portal.
@@ -220,7 +225,9 @@ Work through this list from your laptop.
    subscriptions, and so send fake notifications that look like the app's. On the new
    server run `docker compose exec trader python -m trader push-reset`. Each device drops
    its old subscription the next time it opens the app (and subscribes again if alerts
-   were on), so the old key can no longer reach it.
+   were on), so the old key can no longer reach it. Then open the app on each of your
+   devices and check **Settings > Phone alerts** says "Alerts are on for this device"
+   (turn them on if not: the restored backup may predate it), and send a test alert.
 
 ## Reporting a problem
 
