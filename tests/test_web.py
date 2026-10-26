@@ -1054,3 +1054,19 @@ def test_phone_push_reset_after_the_secret_key_was_replaced(env):
     assert fresh["resubscribe"] == [webpush.subscription_id(phone.endpoint)]
     assert env.db.list_audit(1)[0]["action"] == "push_reset"
     assert webpush.push_key_matches(env.app.state.config, env.db) is True
+
+
+def test_phone_push_offers_no_reset_when_the_secret_key_is_just_wrong(env):
+    """A damaged or swapped TRADER_SECRET_KEY (2FA does not decrypt either) must be put
+    back, not answered with a reset that would throw away the still-good push key."""
+    headers = login(env)
+    env.client.get("/api/push")
+    wrong = env.config.model_copy(update={"secret_key": SecretStr(crypto.generate_secret_key())})
+    env.app.state.config = wrong
+    env.app.state.auth.config = wrong
+    info = env.client.get("/api/push").json()
+    assert not info["available"] and not info["key_mismatch"]
+    assert "Put the original key back" in info["problem"]
+    refused = env.client.post("/api/push/reset", headers=headers)
+    assert refused.status_code == 409 and "original key" in refused.json()["detail"]
+    assert env.db.get_kv("push_vapid_private") is not None  # nothing was thrown away

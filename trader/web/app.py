@@ -62,6 +62,10 @@ log = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY_BYTES = 64 * 1024
 MAX_UNIVERSE = 50
+WRONG_KEY_MESSAGE = (
+    "TRADER_SECRET_KEY looks wrong: 2FA codes cannot be checked with it either, so the next "
+    "login will fail. Put the original key back in .env, then run docker compose up -d."
+)
 # /api/equity returns at most about twice this many points (the low and high of each bucket).
 EQUITY_CHART_BUCKETS = 1000
 _SYMBOL = re.compile(r"^[A-Z0-9][A-Z0-9.\-]{0,11}$")
@@ -826,6 +830,14 @@ def create_app(
         return settings_payload(request)
 
     # ------------------------------------------------------------ phone push
+    def secret_key_is_right(request: Request) -> bool:
+        """The 2FA secret decrypts: TRADER_SECRET_KEY is the owner's current key."""
+        try:
+            state(request).auth.check_secret_key()
+        except crypto.SecretKeyError:
+            return False
+        return True
+
     def push_payload(request: Request) -> dict[str, Any]:
         st = state(request)
         mismatch = False
@@ -833,11 +845,15 @@ def create_app(
             key = webpush.load_vapid_key(st.config, st.db, create=True)
             problem = None if key else "Set TRADER_SECRET_KEY to use phone alerts."
         except crypto.SecretKeyError:
-            key, mismatch = None, True
-            problem = (
-                "The phone-alert key does not match TRADER_SECRET_KEY (it was replaced). "
-                "Reset phone alerts, then turn them on again on each device."
-            )
+            key = None
+            if secret_key_is_right(request):
+                mismatch = True  # replaced on purpose: push's key is from the old one
+                problem = (
+                    "The phone-alert key does not match TRADER_SECRET_KEY (it was replaced). "
+                    "Reset phone alerts, then turn them on again on each device."
+                )
+            else:
+                problem = WRONG_KEY_MESSAGE
         devices = [
             {k: d[k] for k in ("id", "label", "created_at", "last_ok_at", "failures")}
             for d in st.db.list_push_subscriptions()
@@ -895,6 +911,9 @@ def create_app(
     @app.post("/api/push/reset")
     async def push_reset(request: Request, session: Session = Depends(require_csrf)) -> Any:
         st = state(request)
+        if webpush.push_key_matches(st.config, st.db) is False and not secret_key_is_right(request):
+            # A reset would throw away a push key the original TRADER_SECRET_KEY still reads.
+            raise HTTPException(status_code=409, detail=WRONG_KEY_MESSAGE)
         removed = webpush.reset_push(st.db)
         audit(request, "push_reset", {"devices": removed, "reason": "settings"})
         return await run_in_threadpool(push_payload, request)
