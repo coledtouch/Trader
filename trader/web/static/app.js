@@ -239,8 +239,11 @@
       const value = c.value(row);
       const cls = [c.num ? 'num' : '', c.head ? 'cell-head' : '', c.note ? 'cell-note' : '']
         .filter(Boolean).join(' ');
+      // On phones a cell is a flex row (label | value): a value made of several nodes stays
+      // in one box, or its parts spread across the row and a chip stretches to the note.
+      const content = Array.isArray(value) ? el('div', { class: 'cell-value' }, value) : value;
       return el('td', { role: 'cell', 'data-label': c.label, class: cls || null },
-        value === null || value === undefined || value === '' ? [] : value);
+        content === null || content === undefined || content === '' ? [] : content);
     })));
     return el('div', { class: 'table-wrap' }, el('table', { class: 'table', role: 'table' }, [
       el('thead', { role: 'rowgroup' }, head),
@@ -785,13 +788,13 @@
         if (q.has_price === false) return chipNode('No data', 'warn');
         return q.delayed ? chipNode('Delayed', 'warn') : chipNode('Real-time', null);
       } },
-      { label: 'Freshness check', value: (q) => {
+      { label: 'Entry check', value: (q) => {
         if (q.valid && !q.delayed) return chipNode('Usable', 'ok');
         if (q.valid && !q.delay_blocks_entry) {
           return chipNode(state.data.status.delayed_paper_entries ? 'Delayed: paper entries allowed' : 'Delayed: entries allowed', 'warn');
         }
         const why = q.valid ? 'delayed data' : q.problem;
-        return why ? [chipNode('Blocked', 'warn'), el('div', { class: 'small muted', text: why })] : chipNode('Blocked', 'warn');
+        return why ? [chipNode('Blocked', 'warn'), el('span', { class: 'cell-sub', text: why })] : chipNode('Blocked', 'warn');
       } },
     ], quotes));
   }

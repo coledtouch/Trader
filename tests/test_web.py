@@ -201,7 +201,7 @@ def test_healthz_and_no_docs(env):
         assert env.client.get(path).status_code == 404
 
 
-@pytest.mark.parametrize("asset", ["app.js?v=16", "login.js?v=16", "styles.css?v=16", "sw.js"])
+@pytest.mark.parametrize("asset", ["app.js?v=17", "login.js?v=17", "styles.css?v=17", "sw.js"])
 def test_executable_shell_assets_revalidate_on_deploy(env, asset):
     response = env.client.get(f"/static/{asset}")
     assert response.status_code == 200

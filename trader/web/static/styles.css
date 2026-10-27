@@ -1000,6 +1000,10 @@ main:focus {
   font-weight: 400;
 }
 
+.status + .cell-sub {
+  margin-top: 4px;
+}
+
 .cell-note {
   max-width: 40ch;
   color: var(--text-2);
@@ -1047,6 +1051,10 @@ main:focus {
     padding: 3px 0;
     border: 0;
     text-align: right;
+  }
+
+  .table td > .cell-value {
+    min-width: 0;
   }
 
   .table td::before {
