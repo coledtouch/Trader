@@ -42,7 +42,7 @@ secrets live, what gets logged, and what to do when a device is lost.
 
 | Threat | Controls |
 |---|---|
-| A stranger finds `desk.kaxo.dev` | Cloudflare Access shows a PIN page and only sends PINs to your address. Behind it, the app needs your password **and** a 2FA code. Failed logins: 5 per IP per 15 minutes, then all logins lock after 10 failures in 15 minutes. Every attempt is audited. |
+| A stranger finds `desk.kaxo.dev` | Cloudflare Access shows a PIN page and only sends PINs to your address. Behind it, the app needs your password **and** a 2FA code (only the code with code-only sign-in, below). Failed logins: 5 per IP per 15 minutes, then all logins lock after 10 failures in 15 minutes. Every attempt is audited. |
 | Someone reaches the droplet directly, skipping Cloudflare | Nothing listens on the internet except SSH: ufw allows only SSH, the tunnel is an outbound connection, and the app's port is published on `127.0.0.1` only. With `TRADER_CF_ACCESS_TEAM_DOMAIN`/`TRADER_CF_ACCESS_AUD` set, the app also refuses any request without a valid, signed Cloudflare Access token for your application (checked against your team's public keys, audience, issuer and expiry). Those two values are required when `TRADER_ALLOW_LIVE=true`: the app will not start without them. Paper and simulator mode can leave them empty. Login rate limits use `CF-Connecting-IP` only; a missing header falls back to the socket peer, not `X-Forwarded-For`. |
 | Your password leaks | Useless without the 2FA code. Each code works only once (replay protection). |
 | Another website tries to act with your logged-in browser | Session cookie is `HttpOnly`, `Secure`, `SameSite=Strict` with the `__Host-` prefix; every change needs a CSRF token and a matching `Origin`. Sessions end after 30 minutes without you using the app (the dashboard's automatic refresh does not count, so an unattended open tab signs out too) or after 12 hours. |
@@ -53,7 +53,7 @@ secrets live, what gets logged, and what to do when a device is lost.
 | Attacks on SSH | Keys only, no root login, `AllowUsers trader`, fail2ban, automatic security updates (DEPLOY.md, Appendix A). |
 | Secrets leaking through Git or images | `.env` and `data/` are in `.gitignore`; the Docker build context is an allow-list (only `requirements.txt` and `trader/`); the app never logs secrets, tokens or codes (the HTTP client's request log, which would show the secret ntfy topic URL, is switched off). |
 | Tampered dependencies or images | Python packages pinned to exact versions; Docker images pinned to version tags; CI runs lint and the offline test suite on every push. |
-| Someone takes over your e-mail | Cloudflare Access trusts whoever reads the PIN e-mail, so **your e-mail account is the front door**: give it a strong password and 2FA. The app's own password + 2FA still stand behind it. |
+| Someone takes over your e-mail | Cloudflare Access trusts whoever reads the PIN e-mail, so **your e-mail account is the front door**: give it a strong password and 2FA. The app's own password + 2FA still stand behind it. With code-only sign-in (`TRADER_LOGIN_PASSWORD_REQUIRED=false`) only the 6-digit code does, capped by `TRADER_LOGIN_DAILY_FAILURES`. |
 
 Also turn on 2FA for the accounts around the app: Cloudflare, DigitalOcean, GitHub,
 Anthropic (Claude Console), xAI (console.x.ai) and your e-mail.
@@ -187,6 +187,9 @@ Work through this list from your laptop.
    closing the positions it opened (stops, targets, time stops, closing stocks before the
    bell, the daily-loss flatten). Check open positions in IBKR Mobile or the Client Portal
    and close anything else you do not want to hold.
+   **With code-only sign-in on**, the lost phone's authenticator alone signs straight back
+   in. Also set `TRADER_LOGIN_PASSWORD_REQUIRED=true` in `.env` and run
+   `docker compose up -d` now (or do step 5 at once).
 2. **Stop alerts to the lost phone.** They need no session, so it would keep showing them
    on its lock screen. Your other devices keep getting them:
    ```bash
@@ -214,8 +217,9 @@ Work through this list from your laptop.
    docker compose exec trader python -m trader reset-2fa
    ```
    Scan the QR code, type the code. This also signs out all sessions. No new phone yet?
-   Skip this step: nobody can log in without a valid code, and the bot keeps running
-   inside its limits.
+   Skip this step only while the password is required (the default, or set back in step 1):
+   the lost phone's codes alone do not sign in, and the bot keeps running inside its
+   limits. Keep `TRADER_LOGIN_PASSWORD_REQUIRED=true` until you have run `reset-2fa`.
    On the new phone, install the app, sign in, and turn alerts on: **Settings > Phone
    alerts > Turn on alerts on this device** (a test alert follows).
 6. **IBKR**: move IB Key to the new phone. In IBKR Mobile on the new phone, choose the
