@@ -842,3 +842,19 @@ async def test_a_refused_sell_never_marks_the_position_sold(db: Database) -> Non
     await watchdog.tick()
     assert sells(broker)[-1].qty == pytest.approx(0.02)
     assert len(sells(broker)) == 2
+
+
+async def test_kill_then_resume_never_reports_a_restored_heartbeat(db: Database) -> None:
+    """Review finding: a kill-switch poll counted as an outage, so pressing Resume after
+    KILL sent "app heartbeat restored" although the heartbeat was never stale."""
+    clock = Clock()
+    broker = FakeBroker()
+    beat(db, clock, age=5)
+    arm_kill(db)
+    watchdog, notes = make(db, broker, clock)
+    await watchdog.tick()
+    db.upsert_day(DayStats(day="2026-10-21", halted=False, halt_reason=None))
+    clock.advance(seconds=10)
+    beat(db, clock, age=5)
+    await watchdog.tick()
+    assert notes.sent == []

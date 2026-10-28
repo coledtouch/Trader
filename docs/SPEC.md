@@ -855,7 +855,20 @@ Contracts changed by the confirmed review findings (each has a regression test).
   to a later tick. A stop is placed only after a fresh read of the position and its orders,
   under the broker's per-instrument close lock (`Broker.close_lock`: no close half-done).
 - **Breach spacing** (ENG-5): see 7.4 (`BREACH_MIN_SPACING`).
-- **Entry TTL** (ENG-6): measured from when the order was sent (7.3).
+- **Entry TTL** (ENG-6): measured from when the order was sent (7.3). It cancels only an
+  open BUY entry; a journal row is matched to a broker order by its tag only when the two
+  are of the same kind (side; stop or not), since a bracket's stop and target carry the
+  entry's tag.
+- **Engine closes** (ENG-7): a monitor exit the broker refuses alerts "Close X FAILED"
+  (urgent when no stop is working; at most every `CLOSE_FAILED_ALERT_EVERY`, 15 min, while
+  the 60 s retries go on), not "Closing X". An approved close whose broker call raised
+  drops its marker, so the owner can approve it again.
+- **Unreported exits** (ENG-8): IBKR reports only the current day's executions. A bot
+  stock position read flat for `UNREPORTED_EXIT_GRACE` (15 min) whose fills journal still
+  holds shares, last filled on an earlier day, gets its exit journaled at an estimate (the
+  stop, else the entry price; exit reason "closed at broker (fill not reported; price
+  estimated)"), dated just after that fill, and the owner is told to check the real price.
+  Otherwise its meta would block entries in the symbol for good.
 - **IBKR 1101** (BRK-1): `connected` is False and data/order calls raise `BrokerError` until
   `connect()` has disconnected and reconnected (re-running ib_async's startup syncs);
   1102 needs no reconnect.

@@ -123,6 +123,7 @@ BROKER_DOWN_NOTIFY_AFTER = timedelta(seconds=60)
 BACKUP_STOP_BREACH = 0.005  # stocks: engine sells only 0.5% beyond a stop the broker lacks
 FLATTEN_BEFORE_CLOSE_MIN = 10.0
 CLOSE_RETRY = timedelta(seconds=60)  # do not resend an engine close sooner than this
+CLOSE_FAILED_ALERT_EVERY = timedelta(minutes=15)  # a refused engine close alerts this often
 # A BUY decided on market data older than this is dropped instead of sent (the decision
 # maker took too long: the setup is stale). Younger ones are re-checked on fresh data.
 DECISION_MAX_AGE = timedelta(minutes=3)
@@ -135,6 +136,9 @@ ORDER_FORGET_AFTER = timedelta(days=1)
 FILL_LOOKBACK = timedelta(days=2)
 FIRST_FILL_LOOKBACK = timedelta(days=7)
 TRADE_LOOKBACK = timedelta(days=30)
+# A stock read flat this long, its last fill on an earlier day: its exit fill was lost.
+UNREPORTED_EXIT_GRACE = timedelta(minutes=15)
+UNREPORTED_EXIT = "unreported-exit"  # broker_order_id of the estimated exit fill
 FILL_QUERY_LIMIT = 5000
 SIGNAL_DEDUPE = timedelta(minutes=30)  # one ledger row per instrument+setup per window
 LEDGER_EVERY = timedelta(minutes=5)
@@ -435,9 +439,11 @@ class Engine:
         # in flight, though _closing still throttles the monitor's next try.
         self._close_refused: set[str] = set()
         self._close_seq: dict[str, int] = {}  # close attempts per instrument (latest wins)
+        self._close_failed_at: dict[str, datetime] = {}  # last "Close X FAILED" alert
         self._last_halt_at: dict[str, datetime] = {}
         self._skip_logged: set[tuple[str, str]] = set()
-        self._mismatch_logged: set[str] = set()
+        # instrument -> when the broker first read flat while the fills journal did not
+        self._mismatch_logged: dict[str, datetime] = {}
         self._ledger_retry: dict[str, datetime] = {}  # instrument -> no bar requests until
         self._fallback_logged: str | None = None
         self._last_ledger_at: datetime | None = None
@@ -1170,9 +1176,15 @@ class Engine:
                     )
                     return self._get_order(order_id)
                 seq = self._mark_closing(key, order.reason, self._now())
-                placed = await self.broker.close_position(
-                    order.instrument, order.reason, trace_id=order.trace_id
-                )
+                try:
+                    placed = await self.broker.close_position(
+                        order.instrument, order.reason, trace_id=order.trace_id
+                    )
+                except BrokerError:
+                    # Nothing was sold (a broker error comes before the sell goes out): the
+                    # owner may approve again. A stop it cancelled is put back (re-protect).
+                    self._unmark_closing(key, seq)
+                    raise
                 self._note_close(key, placed, seq)
                 if placed is None:
                     self.db.update_order(
@@ -1919,7 +1931,27 @@ class Engine:
         if rec is not None:
             self._journal_order(rec, now)
         self.db.audit("engine_close", {"instrument": inst.key, "reason": reason}, actor="engine")
-        await self._notify(f"Closing {inst.symbol}", reason)
+        if rec is None:
+            return  # nothing sold here: already flat, or another close's sell is working
+        refused = _refused_exits([rec])
+        if not refused:
+            self._close_failed_at.pop(inst.key, None)
+            await self._notify(f"Closing {inst.symbol}", reason)
+            return
+        log.error("engine close (%s): the broker refused to close %s", reason, refused)
+        last = self._close_failed_at.get(inst.key)
+        if last is not None and now - last < CLOSE_FAILED_ALERT_EVERY:
+            return  # retried every CLOSE_RETRY: one alert per stretch, not one a minute
+        self._close_failed_at[inst.key] = now
+        restored = "protective stop re-placed at" in (rec.message or "")
+        await self._notify(
+            f"Close {inst.symbol} FAILED",
+            f"{reason}: the broker refused the sell ({_short(refused)}). "
+            + ("The stop was put back. " if restored else "No stop is working at IBKR. ")
+            + "The bot retries; check IBKR.",
+            priority="high" if restored else "urgent",
+            tags=["warning"] if restored else ["rotating_light"],
+        )
 
     def _native_stops(self, open_orders: list[OrderRecord]) -> dict[str, float]:
         """Highest working broker-side protective stop of this app per instrument. An
@@ -2307,17 +2339,22 @@ class Engine:
         await self._cleanup_meta(now, positions, open_orders)
 
     async def _sync_orders(self, now: datetime) -> None:
-        traced: dict[str, OrderRecord] | None = None
+        traced: dict[tuple[str, Side, bool], OrderRecord] | None = None
 
-        async def by_trace(trace: str | None) -> OrderRecord | None:
-            """Working broker order whose tag matches, fetched once per sync.
+        def kind(req: OrderRequest) -> tuple[Side, bool]:
+            return req.side, req.side == Side.SELL and req.stop_loss is not None
+
+        async def by_trace(req: OrderRequest) -> OrderRecord | None:
+            """Working broker order whose tag matches, fetched once per sync, of the same
+            kind as the journal row: a bracket's stop and target carry the entry's tag,
+            and a close's put-back stop carries the close's.
 
             Watchdog closes use ai-trader-wd-... and belong to the other process.
             Adopting one of those onto an app order would point the journal at the
             wrong broker id.
             """
             nonlocal traced
-            trace = _app_order_trace(trace)
+            trace = _app_order_trace(req.trace_id)
             if not trace:
                 return None
             if traced is None:
@@ -2325,15 +2362,15 @@ class Engine:
                 for live in await self.broker.open_orders():
                     live_trace = _app_order_trace(live.request.trace_id)
                     if live_trace and live.broker_order_id:
-                        traced.setdefault(live_trace, live)
-            return traced.get(trace)
+                        traced.setdefault((live_trace, *kind(live.request)), live)
+            return traced.get((trace, *kind(req)))
 
         for rec in self.db.list_orders(limit=200, statuses=OPEN_ORDER_STATUSES):
             if rec.id is None or not rec.broker_order_id:
                 continue
             latest = await self.broker.order_status(rec.broker_order_id)
             if latest is None:
-                adopted = await by_trace(rec.request.trace_id)
+                adopted = await by_trace(rec.request)
                 if adopted is not None:
                     self.db.update_order(
                         rec.id,
@@ -2389,7 +2426,13 @@ class Engine:
             ):
                 continue
             latest = await self.broker.order_status(rec.broker_order_id)
-            if latest is None or latest.status not in OPEN_ORDER_STATUSES or latest.filled_qty > 0:
+            if (
+                latest is None
+                or latest.status not in OPEN_ORDER_STATUSES
+                or latest.filled_qty > 0
+                or latest.request.side != Side.BUY  # never an exit the row points at
+                or latest.request.is_exit
+            ):
                 continue
             await self.broker.cancel_order(rec.broker_order_id)
             final = await self.broker.order_status(rec.broker_order_id) or latest
@@ -2565,6 +2608,8 @@ class Engine:
     def _exit_reason(self, key: str, trip: _Trip, meta: dict[str, Any] | None) -> str:
         sell = trip.last_sell
         reason = self._close_reasons.pop(key, None)
+        if sell is not None and sell.broker_order_id == UNREPORTED_EXIT:
+            return "closed at broker (fill not reported; price estimated)"
         if sell is not None:
             rec = self.db.get_order_by_broker_id(sell.broker_order_id)
             if rec is not None and rec.request.side == Side.SELL and rec.request.reason:
@@ -2578,6 +2623,54 @@ class Engine:
             if stop and sell.price <= stop * 1.002:
                 return "stop-loss"
         return "closed at broker"
+
+    async def _close_unreported_exit(
+        self, key: str, meta: dict[str, Any], since: datetime, now: datetime
+    ) -> bool:
+        """A bot stock position the broker reads flat whose exit fill the journal never got:
+        it filled while the app was down on an earlier day, and IBKR reports only today's
+        executions. Without it the meta (which blocks new entries in the symbol) would stay
+        for good. After UNREPORTED_EXIT_GRACE of flat reads, journal the exit at an estimate
+        (the stop, else the entry), dated just after the last fill so it lands on that
+        earlier day, and tell the owner. Returns True when the position is closed now."""
+        if not key.startswith(f"{AssetClass.STOCK.value}:") or now - since < UNREPORTED_EXIT_GRACE:
+            return False
+        fills = [
+            f
+            for f in self.db.list_fills(since=now - TRADE_LOOKBACK, limit=FILL_QUERY_LIMIT)
+            if f.instrument.key == key
+        ]
+        if not fills:
+            return False
+        last = max(fills, key=lambda f: _aware(f.ts))
+        if _aware(last.ts) >= trading_day_start(trading_day(now)):
+            return False  # today's executions would still report the exit: wait for it
+        qty = self._open_qty.get(key, 0.0)
+        price = meta.get("stop_loss") or meta.get("entry_price") or last.price
+        exit_fill = Fill(
+            exec_id=f"{UNREPORTED_EXIT}:{key}:{now.isoformat()}",
+            broker_order_id=UNREPORTED_EXIT,
+            instrument=last.instrument,
+            side=Side.SELL,
+            qty=qty,
+            price=float(price),
+            ts=_aware(last.ts) + timedelta(seconds=1),
+        )
+        self.db.insert_fill(exit_fill)
+        await self._reconstruct(key, now)
+        symbol = last.instrument.symbol
+        log.warning("%s: exit fill never reported; journaled %g at %g (estimate)", key, qty, price)
+        self.db.audit("unreported_exit", {"instrument": key, "qty": qty, "price": price})
+        await self._notify(
+            f"Exit of {symbol} not reported",
+            f"IBKR shows no {symbol} position, but its exit filled while the app was down "
+            f"on an earlier day and IBKR no longer reports it. The trade is journaled at "
+            f"{price:g} as an estimate: check the real price in IBKR's statements. "
+            f"{symbol} can be traded again.",
+            priority="high",
+            tags=["warning"],
+        )
+        return self._open_qty.get(key, 0.0) <= EPS and key not in self._pending_trades
 
     async def _cleanup_meta(
         self, now: datetime, positions: list[Position], open_orders: list[OrderRecord]
@@ -2603,11 +2696,12 @@ class Engine:
                 if key in self._pending_trades:
                     continue
             if self._open_qty.get(key, 0.0) > EPS and not sold:
-                if key not in self._mismatch_logged:
-                    self._mismatch_logged.add(key)
+                since = self._mismatch_logged.setdefault(key, now)
+                if since == now:
                     log.warning("%s: broker shows no position but the fills journal does", key)
-                continue
-            self._mismatch_logged.discard(key)
+                if not await self._close_unreported_exit(key, meta, since, now):
+                    continue
+            self._mismatch_logged.pop(key, None)
             for order in open_orders:
                 req = order.request
                 if (

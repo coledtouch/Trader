@@ -3116,6 +3116,147 @@ async def test_crypto_the_watchdog_sold_is_not_managed_after_a_restart(db, confi
     assert not db.get_kv(WATCHDOG_CLOSED_PREFIX + key)
 
 
+async def test_an_entry_row_never_adopts_its_own_bracket_stop(db, config) -> None:
+    """Review finding: an entry filled while the app was down and the app came back on a
+    later day, when IBKR no longer reported the filled parent. The journal row was matched
+    by its tag to a working order: the bracket's stop, which carries the same tag. The
+    stale-entry timer then cancelled that stop as an unfilled entry."""
+    from tests.test_ibkr import DONE, av, connected_broker, entry, hold, stock
+
+    day1 = datetime(2026, 10, 22, 18, 0, tzinfo=UTC)  # Thursday 14:00 New York
+    broker, fake = await connected_broker()
+    fake.summary = [av("NetLiquidation", "10000"), av("TotalCashValue", "7000")]
+    engine = Engine(
+        config, db, broker, FakeDecisionMaker(), notifier=RecordingNotifier(),
+        clock=FakeClock(day1),
+    )  # fmt: skip
+    req = entry()
+    row_id = db.insert_order(
+        OrderRecord(
+            request=req, status=OrderStatus.PENDING_APPROVAL, created_at=day1, updated_at=day1
+        )
+    )
+    traced = engine._traced(req, row_id)
+    placed = await engine._send_entry(traced, day1)
+    db.update_order(
+        row_id, request=traced, status=placed.status, broker_order_id=placed.broker_order_id
+    )
+    db.set_position_meta(
+        "STK:AAPL", stop_loss=98.11, take_profit=104.0, entry_price=100.23, opened_at=day1
+    )
+    parent, stop, target = fake.trade_list
+    # The entry filled while the app was down. Next day IBKR reports the parent only as a
+    # completed order (no orderId or clientId) and no executions; its children work.
+    parent.order.permId, parent.order.orderId, parent.order.clientId = 555, 0, 0
+    parent.orderStatus.status, parent.orderStatus.filled = "Filled", 3
+    stop.orderStatus.status = target.orderStatus.status = "Submitted"
+    hold(fake, stock(), 3)
+    fake.ticker_values[stock().conId] = {"bid": 101.0, "ask": 101.05, "last": 101.0}
+    broker, _ = await connected_broker(fake)
+    clock = FakeClock(datetime(2026, 10, 23, 15, 0, tzinfo=UTC))  # Friday 11:00
+    engine = Engine(
+        config, db, broker, FakeDecisionMaker(), notifier=RecordingNotifier(), clock=clock
+    )
+    for _ in range(44):  # 11 minutes: past the stale-entry timer
+        await engine.monitor_tick()
+        clock.advance(seconds=15)
+    assert stop.order.orderId not in fake.cancelled
+    assert stop.orderStatus.status not in DONE
+    assert db.get_order(row_id).broker_order_id != str(stop.order.orderId)
+
+
+async def test_an_approved_close_that_failed_can_be_approved_again(db, config) -> None:
+    """Review finding: an IBKR timeout during an approved close left its marker, so
+    approving it again within a minute cancelled it as "already being closed" while
+    nothing was selling."""
+    h = await harness(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.engine.settings.autopilot = False
+    h.clock.advance(minutes=5)
+    h.decider.decisions = [
+        hold("F").model_copy(update={"action": TradeAction.CLOSE, "rationale": "fading"})
+    ]
+    await h.engine.run_cycle()
+    [waiting] = h.orders(OrderStatus.PENDING_APPROVAL)
+    read, reads = h.broker.open_orders, 0
+
+    async def flaky():
+        nonlocal reads
+        reads += 1
+        if reads == 2:  # the read inside the broker's close, before anything is sent
+            raise BrokerError("IBKR open orders timed out after 10s")
+        return await read()
+
+    h.broker.open_orders = flaky
+    with pytest.raises(BrokerError):
+        await h.engine.approve_order(waiting.id)
+    h.broker.open_orders = read
+    h.clock.advance(seconds=10)
+    rec = await h.engine.approve_order(waiting.id)
+    assert rec.status in (OrderStatus.SUBMITTED, OrderStatus.FILLED)
+    assert "STK:F" not in h.broker.pos
+
+
+async def test_a_refused_engine_exit_alerts_failed_not_closing(db, config) -> None:
+    """Review finding: a refused flatten-before-close sent "Closing F" every minute and
+    never a failure alert, and the position stayed open overnight."""
+    h = await harness(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.clock.t = datetime(2026, 10, 21, 19, 51, tzinfo=UTC)  # 15:51 New York
+    h.broker.reject_exits = True
+    for _ in range(9):
+        await h.engine.monitor_tick()
+        h.clock.advance(minutes=1)
+    titles = h.notes.titles()
+    assert "Closing F" not in titles
+    assert titles.count("Close F FAILED") == 1  # retried every minute, alerted once
+
+
+async def test_an_exit_ibkr_no_longer_reports_frees_the_symbol(db, config) -> None:
+    """Review finding: a stop filled while the app was down, and the app came back on a
+    later day, when IBKR reports only that day's executions. The fills journal still
+    showed the shares, so the position's meta stayed for good and blocked every new
+    entry in the symbol. After UNREPORTED_EXIT_GRACE the exit is journaled at an
+    estimate, on the day of the entry, and the owner is told."""
+    tuesday = datetime(2026, 10, 20, 15, 0, tzinfo=UTC)  # 11:00 New York
+    h = await harness(
+        db, config, mode=Mode.PAPER, now=tuesday, flatten_stocks_before_close=False,
+        exits={"time_stop_minutes": 0},
+    )  # fmt: skip
+    today_only = h.broker.fills_since
+
+    async def fills_since(since):  # IB Gateway: only executions since midnight
+        midnight = h.clock().replace(hour=0, minute=0, second=0, microsecond=0)
+        return [f for f in await today_only(since) if f.ts >= midnight]
+
+    h.broker.fills_since = fills_since
+    await enter_f(h)
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    h.clock.t = datetime(2026, 10, 20, 18, 0, tzinfo=UTC)  # the app is down: the stop fills
+    h.broker.set_price("F", 9.70)
+    assert h.broker.pos == {}
+    h.clock.t = datetime(2026, 10, 21, 14, 0, tzinfo=UTC)  # Wednesday: the app is back
+    h.broker.set_price("F", 10.0)
+    engine = Engine(
+        config, db, h.broker, h.decider, notifier=h.notes, clock=h.clock, scanner=h.scanner
+    )
+    for _ in range(4):
+        await engine.monitor_tick()
+        h.clock.advance(seconds=15)
+    assert db.get_position_meta("STK:F") is not None  # still waiting for the fill
+    for _ in range(60):
+        await engine.monitor_tick()
+        h.clock.advance(seconds=15)
+    assert db.get_position_meta("STK:F") is None
+    [trade] = db.list_trades()
+    assert "price estimated" in (trade.exit_reason or "")
+    assert trade.exit_ts.date() == datetime(2026, 10, 20).date()  # on the entry's day
+    assert "Exit of F not reported" in h.notes.titles()
+
+
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:
     h = await harness(db, config)
     h.broker.standalone_stops = False

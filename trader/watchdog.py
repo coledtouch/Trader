@@ -646,7 +646,8 @@ class CryptoWatchdog:
                     "default",
                 )
             )
-        self._was_unhealthy = unhealthy or killed
+        # A kill-switch poll is no outage of its own: it only carries a stale heartbeat on.
+        self._was_unhealthy = unhealthy or (killed and self._was_unhealthy)
         titles = {title for title, _, _ in wanted}
         for title, message, priority in wanted:
             if title in self._active_alerts:
