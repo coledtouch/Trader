@@ -64,13 +64,18 @@ Anthropic (Claude Console), xAI (console.x.ai) and your e-mail.
 authenticator app is enough to sign in. The sign-in page then shows only the code box.
 
 **Where it applies.** Only behind Cloudflare Access, or on a paper or simulator account.
-With Access off and the gateway logged in to your live account (shadow mode starts without
-Access) or to an account the app has not seen yet, the password is required anyway.
+With Access off, the password is required anyway when `TRADER_IB_PORT` is a live port
+(4003, as in DEPLOY.md Part C, or 4001/7496), when `TRADER_IB_ACCOUNT` or the account the
+app last connected to is not a paper ("DU") account, or when no account is known yet.
+Shadow mode starts without Access, so this is what keeps a live account behind the
+password. When the app first connects to a live account, it also ends every session, so
+none opened with the code alone on paper carries over.
 
 What it costs: the code becomes the only secret. At any moment 3 of the 1,000,000 possible
 codes are valid, so a stranger who guesses has odds of 3 in a million per try. To keep
 that small, failed codes are capped at `TRADER_LOGIN_DAILY_FAILURES` (default 20) per
-24 hours, counted over all addresses, on top of the 15-minute limits. At 20 guesses a day
+24 hours, counted over all addresses, on top of the 15-minute limits. Your own mistyped
+2FA codes in the app (for loosening limits and the like) count toward it too. At 20 guesses a day
 that is about a 2% chance per year that a determined guesser gets in.
 
 - **The lockout also blocks you, and a stranger can keep it going.** Once 20 codes have
@@ -158,7 +163,7 @@ Every owner action is recorded with time, action, details and IP address (taken 
 Cloudflare's `CF-Connecting-IP`): logins (successful, failed, rate limited), logout,
 start / stop / kill / resume, arm / disarm, order approvals and rejections, settings
 changes, failed or rate-limited 2FA step-ups. Command-line actions (`setup`,
-`reset-password`, `reset-2fa`, `logout-all`, `disarm`) are recorded with actor `cli`, and
+`reset-password`, `reset-2fa`, `logout-all`, `unlock`, `disarm`) are recorded with actor `cli`, and
 the engine's own actions (halts, flattening, reconnects, disarming at startup because
 `TRADER_ALLOW_LIVE` is off) with actor `engine`.
 

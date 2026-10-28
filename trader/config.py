@@ -37,9 +37,11 @@ class AppConfig(BaseSettings):
     session_max_hours: int = 12
     login_max_attempts_per_ip: int = 5  # per 15 minutes
     login_lockout_failures: int = 10  # global failures in 15 minutes -> lock all logins
-    # False: sign in with the authenticator code alone, no password. The 6-digit code is
-    # then the only secret, so failed codes (sign-ins and step-ups, all addresses together)
-    # are also capped per day. Live trading still requires Cloudflare Access (below).
+    # False: sign in with the authenticator code alone, no password, but only behind
+    # Cloudflare Access or on a paper/simulator account. The 6-digit code is then the only
+    # secret, so failed codes (sign-ins and 2FA step-ups, all addresses together) count
+    # toward a daily cap; once it is reached, sign-ins are refused (step-ups in an open
+    # session are not). Live trading still requires Cloudflare Access (below).
     login_password_required: bool = True
     login_daily_failures: int = Field(default=20, ge=1)  # per 24 h when the code is alone
     # True only behind a proxy you control (cloudflared): the client IP is then taken from

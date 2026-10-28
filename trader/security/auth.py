@@ -37,6 +37,7 @@ MAX_PASSWORD_LENGTH = 1024
 LOGIN_WINDOW = timedelta(minutes=15)  # rate limit and lockout window
 LOGIN_DAY = timedelta(days=1)  # daily cap on failed codes when no password is required
 BROKER_ACCOUNT_KEY = "broker_account"  # kv written by the engine (engine.ACCOUNT_KEY)
+LIVE_PORTS = frozenset({4001, 4003, 7496})  # IB Gateway, its Docker relay, TWS: live accounts
 TOTP_VALID_WINDOW = 1  # accept the previous, current and next 30 s step
 TOTP_ISSUER = "AI Trader"
 TOTP_ACCOUNT = "owner"
@@ -239,9 +240,15 @@ class Authenticator:
             return True
         if self.config.cf_access_enabled or self.config.broker == "sim":
             return False
-        # The account the engine last connected to; IBKR paper accounts start with "DU".
-        account = (self.db.get_kv(BROKER_ACCOUNT_KEY) or self.config.ib_account).strip()
-        return not account.upper().startswith("DU")
+        # A live port means a live account, before the gateway has even logged in.
+        if self.config.ib_port in LIVE_PORTS:
+            return True
+        # Every account id known must be a paper one (IBKR paper accounts start with "DU"):
+        # the one the engine last connected to (kept from earlier runs) and the pinned one.
+        known = (self.db.get_kv(BROKER_ACCOUNT_KEY) or "").strip()
+        pinned = self.config.ib_account.strip()
+        accounts = [a for a in (known, pinned) if a]
+        return not accounts or not all(a.upper().startswith("DU") for a in accounts)
 
     def rate_limited(self, ip: str, now: datetime | None = None) -> bool:
         now = now or self._clock()
@@ -278,10 +285,11 @@ class Authenticator:
         with self._lock:  # check, verify and record atomically (no burst past the limits)
             now = self._clock()
             self.db.purge_login_attempts(now - LOGIN_DAY)
-            if self.rate_limited(ip, now):
-                raise RateLimited("too many failed attempts; try again later")
+            # The longer lock first, so the sign-in page reports how long it really lasts.
             if not need_password and self.daily_cap_reached(now):
                 raise RateLimited("too many failed codes today", daily=True)
+            if self.rate_limited(ip, now):
+                raise RateLimited("too many failed attempts; try again later")
             auth = self.db.get_auth()
             password_ok = self._check_password(auth, password) if need_password else True
             secret = self._totp_secret(auth)

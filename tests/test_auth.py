@@ -288,6 +288,18 @@ def test_a_strangers_guesses_do_not_block_the_owners_step_ups(db, clock, secret)
         ({"login_password_required": False, "broker": "ibkr"}, "DU1234567", False),  # paper
         ({"login_password_required": False, "broker": "ibkr"}, "U1234567", True),  # live
         ({"login_password_required": False, "broker": "ibkr"}, None, True),  # unknown yet
+        # Re-review: an old paper id in the database must not outvote a live pin or port.
+        (
+            {"login_password_required": False, "broker": "ibkr", "ib_account": "U7654321"},
+            "DU1234567",
+            True,
+        ),
+        ({"login_password_required": False, "broker": "ibkr", "ib_port": 4003}, "DU1234567", True),
+        (
+            {"login_password_required": False, "broker": "ibkr", "ib_account": "DU1234567"},
+            "DU1234567",
+            False,
+        ),
         (
             {
                 "login_password_required": False,
@@ -335,6 +347,19 @@ def test_cli_unlock_forgets_failed_attempts(tmp_path, monkeypatch, capsys):
     assert db.count_failed_logins(datetime.now(UTC) - timedelta(days=1)) == 0
     assert [row["action"] for row in db.list_audit(5)][0] == "unlock"
     db.close()
+
+
+def test_the_daily_lock_is_reported_even_while_the_15_minute_lockout_runs(db, clock, secret):
+    """Re-review: the page said 'wait 15 minutes' when sign-in was closed for up to a day."""
+    config = make_config(login_password_required=False, login_daily_failures=6)
+    auth = Authenticator(config, db, hasher=FAST, clock=clock)
+    auth.set_owner(PASSWORD, secret)
+    for i in range(6):  # both the 15-minute lockout (6) and the daily cap (6) trip
+        with pytest.raises(InvalidCredentials):
+            auth.login("", _wrong_code(secret, clock), f"10.10.0.{i}")
+    with pytest.raises(RateLimited) as limited:
+        auth.login("", code(secret, clock), "10.11.0.1")
+    assert limited.value.daily
 
 
 def test_the_daily_cap_applies_only_without_a_password(auth, secret, clock):

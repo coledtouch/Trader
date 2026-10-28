@@ -423,7 +423,9 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
   lifetime from config; purge expired on access. A GET with `X-Background: 1` (the
   dashboard's automatic status refresh) does not reset the idle timer. Logout deletes the
   row.
-- Login: `POST /api/auth/login {password, totp}` - both required, constant-time,
+- Login: `POST /api/auth/login {password, totp}` - both required (the code alone when
+  `TRADER_LOGIN_PASSWORD_REQUIRED=false`, behind Cloudflare Access or on a paper/sim
+  account; then also a daily cap, `TRADER_LOGIN_DAILY_FAILURES`), constant-time,
   same generic error for any failure, per-IP limit (`login_max_attempts_per_ip` per
   15 min → 429) and global lockout (`login_lockout_failures` in 15 min → 429 for
   everyone), TOTP valid_window=1 with replay protection (`totp_last_step`), audit
@@ -466,7 +468,7 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
 | GET | `/static/*` | - | static assets |
 | POST | `/api/auth/login` | `{"password", "totp"}` | `{"ok": true, "csrf"}` + cookie; 401; 429 |
 | POST | `/api/auth/logout` | - | `{"ok": true}` |
-| GET | `/api/session` | - | `{"authenticated": bool, "csrf"?: str}` |
+| GET | `/api/session` | - | `{"authenticated": bool, "csrf"?: str, "password"?: bool}` (`password` when not signed in) |
 | GET | `/api/status` | - | `{"status": EngineStatus, "account": AccountSnapshot\|null, "positions": [Position], "open_orders": [OrderRecord], "pending": [OrderRecord], "today": DayStats\|null}` |
 | GET | `/api/decisions?limit=20` | - | `[DecisionBatch]` (limit ≤ 200) |
 | GET | `/api/orders?limit=50` | - | `[OrderRecord]` |
@@ -492,7 +494,8 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
 | POST | `/api/research/run` | `{"days": 30}` | 202 background replay; 409 if running or no captured cycles; session + CSRF required |
 
 Datetimes serialize as ISO-8601 strings (pydantic `model_dump(mode="json")`).
-Errors: rate-limited login/step-up → 429 `{"detail": "too many failed attempts"}`; PUT
+Errors: rate-limited login/step-up → 429 `{"detail": "too many failed attempts"}`; a
+code-only login over the daily cap → 429 `{"detail": "too many failed codes today"}`; PUT
 /api/settings → 422 with a string detail when a risk value exceeds HARD_CAPS, the entry
 window is invalid or a universe has an invalid symbol / more than 50 symbols; engine
 failures map PermissionError → 403, ValueError/LookupError → 409, anything else → 503.

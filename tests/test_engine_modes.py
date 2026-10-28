@@ -406,6 +406,24 @@ async def test_account_change_starts_a_new_journal_epoch(db: Database, config: A
     assert h.broker.pos
 
 
+@pytest.mark.parametrize(("password_required", "ended"), [(False, True), (True, False)])
+async def test_switching_to_a_live_account_ends_code_only_sessions(
+    db: Database, config: AppConfig, password_required: bool, ended: bool
+) -> None:
+    """Re-review: a session opened with the code alone on paper (Access off) must not carry
+    over to the live account; with the password required, sessions stay."""
+    cfg = config.model_copy(update={"broker": "ibkr", "login_password_required": password_required})
+    h = await harness(db, cfg)
+    switch_account(h.broker, "DUX123456")
+    await h.engine.monitor_tick()
+    db.create_session("hash-of-a-token", "csrf", "10.0.0.1", "phone")
+    switch_account(h.broker, "U7654321")
+    h.clock.advance(minutes=2)
+    await h.engine.monitor_tick()
+    assert (db.get_session("hash-of-a-token") is None) is ended
+    assert any(a["action"] == "sessions_ended" for a in db.list_audit()) is ended
+
+
 async def test_approval_after_an_account_change_is_cancelled(
     db: Database, config: AppConfig
 ) -> None:

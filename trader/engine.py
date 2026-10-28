@@ -1473,11 +1473,29 @@ class Engine:
         if known == current:
             return
         self.db.set_kv(ACCOUNT_KEY, current)
+        if not current.upper().startswith("DU"):
+            self._end_code_only_sessions(current)
         if not known:
             self.db.set_kv("journal_account_since", now.isoformat())
             log.info("journal belongs to broker account %s", _mask(current))
             return
         await self._on_account_changed(known, current, now)
+
+    def _end_code_only_sessions(self, account: str) -> None:
+        """A session opened with the code alone (paper, Cloudflare Access off) must not carry
+        over to a live account: end every session, so the next sign-in needs the password."""
+        cfg = self.config
+        if cfg.login_password_required or cfg.cf_access_enabled or cfg.broker == "sim":
+            return
+        self.db.delete_all_sessions()
+        log.warning(
+            "now on live account %s: every session ended (password required)", _mask(account)
+        )
+        self.db.audit(
+            "sessions_ended",
+            {"account": _mask(account), "reason": "live account: the password is required"},
+            actor="engine",
+        )
 
     async def _on_account_changed(self, old: str, new: str, now: datetime) -> None:
         reason = "broker account changed"
