@@ -1225,6 +1225,12 @@ class IBKRBroker(Broker):
         # Other clients' orders (TWS, IBKR Mobile) are listed as "perm:<permId>".
         return not (order.broker_order_id or "").startswith("perm:")
 
+    def cancel_requested(self, order: OrderRecord) -> bool:
+        # This client's orders are listed by orderId; a cancel (cancel_order, cancel_all or
+        # an entry's quiet cancel) records it before IBKR confirms.
+        order_id = _to_int(order.broker_order_id or "")
+        return order_id is not None and order_id in self._cancel_requested
+
     async def cancel_order(self, broker_order_id: str) -> None:
         self._require_connected()
         trade = self._find_trade(broker_order_id)
@@ -1236,22 +1242,30 @@ class IBKRBroker(Broker):
                 broker_order_id,
             )
             return
-        self._cancel_requested.add(trade.order.orderId)
+        order_id = trade.order.orderId
+        first = order_id not in self._cancel_requested
+        self._cancel_requested.add(order_id)
         try:
             self._ib.cancelOrder(trade.order)
         except ConnectionError as exc:
+            if first:
+                self._cancel_requested.discard(order_id)  # never sent: still working
             raise BrokerError(f"IBKR cancel failed: {exc}") from exc
         if not await _wait_until(trade.isDone, self.CANCEL_TIMEOUT):
             logger.warning("IBKR has not confirmed the cancel of order %s yet", broker_order_id)
 
     async def cancel_all(self) -> None:
         self._require_connected()
-        for trade in self._ib.openTrades():
-            if self._is_own(trade.order):
-                self._cancel_requested.add(trade.order.orderId)
+        sent = {
+            trade.order.orderId
+            for trade in self._ib.openTrades()
+            if self._is_own(trade.order) and trade.order.orderId not in self._cancel_requested
+        }
+        self._cancel_requested |= sent
         try:
             self._ib.reqGlobalCancel()  # cancels every open order, incl. other clients'
         except ConnectionError as exc:
+            self._cancel_requested -= sent  # never sent: still working
             raise BrokerError(f"IBKR global cancel failed: {exc}") from exc
         done = await _wait_until(
             lambda: not any(self._is_own(t.order) for t in self._ib.openTrades()),

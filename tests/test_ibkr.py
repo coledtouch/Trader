@@ -1537,3 +1537,142 @@ async def test_flatten_carries_on_past_one_failed_position() -> None:
     assert [r.request.instrument.symbol for r in failed.value.records] == ["MSFT"]
     assert _working(fake, "STP") == [("AAPL", 98.12)]  # put back
     assert _working(fake, "MKT") == [("MSFT", 3.0)]  # sold
+
+
+class _Stall:
+    """An IB Gateway stall: chosen open-orders reads time out and, while `hold` is set, IBKR
+    confirms no cancel. Like ib_async, cancelOrder marks the order PendingCancel locally
+    and a global cancel changes nothing locally until IBKR confirms."""
+
+    def __init__(self, fake: FakeIB) -> None:
+        self.reads = 0
+        self.fail_reads: set[int] = set()
+        self.hold = False
+        self.held: list[Trade] = []
+        read, cancel, global_cancel = (
+            fake.reqAllOpenOrdersAsync,
+            fake.cancelOrder,
+            fake.reqGlobalCancel,
+        )
+
+        async def stalled_read() -> list[Trade]:
+            self.reads += 1
+            if self.reads in self.fail_reads:
+                raise TimeoutError
+            return await read()
+
+        def stalled_cancel(order: Order) -> Trade | None:
+            if not self.hold:
+                return cancel(order)
+            fake.cancelled.append(order.orderId)
+            for trade in fake.trade_list:
+                if trade.order is order and trade.orderStatus.status not in DONE:
+                    trade.orderStatus.status = "PendingCancel"
+                    self.held.append(trade)
+                    return trade
+            return None
+
+        def stalled_global_cancel() -> None:
+            if not self.hold:
+                return global_cancel()
+            fake.global_cancels += 1
+            self.held += [t for t in fake.trade_list if t.orderStatus.status not in DONE]
+
+        fake.reqAllOpenOrdersAsync = stalled_read
+        fake.cancelOrder = stalled_cancel
+        fake.reqGlobalCancel = stalled_global_cancel
+
+    def release(self) -> None:
+        """The stall ends: IBKR confirms every cancel it received."""
+        for trade in self.held:
+            if trade.orderStatus.status not in DONE:
+                trade.orderStatus.status = "Cancelled"
+        self.held.clear()
+
+
+async def test_retried_close_puts_back_the_stop_it_asked_to_cancel() -> None:
+    """Review finding: a close put a stop back during a stall; its retry asked IBKR to
+    cancel that stop (unconfirmed), could not read orders, and took the stop's last known
+    state as cover. Once IBKR confirmed the cancel, nothing protected the position."""
+    broker, fake, _ = await filled_bracket()
+    stall = _Stall(fake)
+    stall.fail_reads = {2, 3}  # the last check and _covered's read
+    with pytest.raises(BrokerError):
+        await broker.close_position(AAPL, "time stop")
+    assert _working(fake, "STP") == [("AAPL", 98.12)]  # put back
+    stall.fail_reads, stall.hold = {5, 6}, True  # read 4 lists the put-back stop
+    with pytest.raises(BrokerError):
+        await broker.close_position(AAPL, "time stop")
+    stall.release()
+    assert _working(fake, "STP") == [("AAPL", 98.12)]
+    assert _working(fake, "MKT") == []
+
+
+async def test_kill_after_a_failed_close_puts_back_the_cancelled_stop() -> None:
+    """Review finding: as above, with KILL's global cancel taking the put-back stop."""
+    broker, fake, _ = await filled_bracket()
+    stall = _Stall(fake)
+    stall.fail_reads = {2, 3}
+    with pytest.raises(BrokerError):
+        await broker.close_position(AAPL, "time stop")
+    stall.fail_reads, stall.hold = {5, 6}, True  # 4: flatten_all's read
+    with pytest.raises(PartialFlattenError):
+        await broker.flatten_all("kill switch")
+    stall.release()
+    assert _working(fake, "STP") == [("AAPL", 98.12)]
+    assert _working(fake, "MKT") == []
+
+
+async def test_kill_never_counts_a_stop_its_global_cancel_took_as_cover() -> None:
+    """Review finding: KILL's global cancel was not confirmed yet, the close's first read
+    timed out, and the next read still listed the bracket stop as working: it counted as
+    cover, so nothing was put back and the position ended with no stop and no sell."""
+    broker, fake, _ = await filled_bracket()
+    stall = _Stall(fake)
+    stall.fail_reads, stall.hold = {2}, True  # 1: flatten_all's read, 2: the close's first
+    with pytest.raises(PartialFlattenError):
+        await broker.flatten_all("kill switch")
+    stall.release()
+    assert _working(fake, "STP") == [("AAPL", 98.12)]
+    assert _working(fake, "MKT") == []
+
+
+async def test_kill_sells_although_a_queued_sell_it_cancelled_is_still_listed() -> None:
+    """A queued market exit (after hours) that KILL asked IBKR to cancel is no close of the
+    position: KILL still sends its own sell, rather than leaving none once the cancel is
+    confirmed."""
+    broker, fake, _ = await filled_bracket()
+    queued = await broker.place_order(
+        OrderRequest(
+            instrument=AAPL,
+            side=Side.SELL,
+            qty=3,
+            order_type=OrderType.MARKET,
+            is_exit=True,
+            reason="time stop",
+        )
+    )
+    assert queued.status == OrderStatus.SUBMITTED  # resting until the market opens
+    stall = _Stall(fake)
+    stall.hold = True
+    records = await broker.flatten_all("kill switch")
+    stall.release()
+    assert [r.request.qty for r in records] == [3]
+    assert _working(fake, "MKT") == [("AAPL", 3.0)]  # only KILL's sell
+    assert _working(fake, "STP") == []
+
+
+async def test_a_cancel_that_never_went_out_leaves_the_order_working() -> None:
+    """A cancel that failed to send (connection lost) is not a cancel on its way: the stop
+    still covers the position, and still moves with modify_stop."""
+    broker, fake, stop = await filled_bracket()
+
+    def lost(order: Order) -> Trade | None:
+        raise ConnectionError("Not connected")
+
+    fake.cancelOrder = lost
+    with pytest.raises(BrokerError):
+        await broker.cancel_order(str(stop.order.orderId))
+    [listed] = [o for o in await broker.open_orders() if o.request.stop_loss is not None]
+    assert not broker.cancel_requested(listed)
+    assert await broker.modify_stop(AAPL, 99.0) is True

@@ -130,6 +130,13 @@ class Broker(ABC):
         the broker placed (on IBKR: TWS or IBKR Mobile), which only that client can cancel."""
         return True
 
+    def cancel_requested(self, order: OrderRecord) -> bool:
+        """True if this app asked the broker to cancel the order, even if the broker has not
+        confirmed it yet (IBKR lists it as working until then). Such an order is on its way
+        out: never a sell that already covers a position. Brokers whose cancels take effect
+        at once never list one, so the default is False."""
+        return False
+
     def supports_standalone_stops(self, instrument: Instrument) -> bool:
         """True if place_order rests a stop order for a SELL exit carrying stop_loss (used to
         re-place a missing protective stop). False means such a request is rejected."""
@@ -242,6 +249,7 @@ class Broker(ABC):
                 and order.status in OPEN_ORDER_STATUSES
                 and order.broker_order_id
                 and self.can_cancel(order)
+                and not self.cancel_requested(order)
             ):
                 await self.cancel_order(order.broker_order_id)
                 stops.append(other.stop_loss)
@@ -297,7 +305,8 @@ class Broker(ABC):
 
     def _own_market_sell(self, orders: list[OrderRecord], instrument: Instrument) -> bool:
         """A market sell of this app's for the instrument is working. Only this client's
-        orders count: another client's (TWS, IBKR Mobile) is not a close of this app."""
+        orders count: another client's (TWS, IBKR Mobile) is not a close of this app, nor is
+        one this app asked to cancel (it will not sell once the cancel is confirmed)."""
         return any(
             order.request.instrument.key == instrument.key
             and order.request.side == Side.SELL
@@ -305,6 +314,7 @@ class Broker(ABC):
             and order.request.stop_loss is None
             and order.status in OPEN_ORDER_STATUSES
             and self.can_cancel(order)
+            and not self.cancel_requested(order)
             for order in orders
         )
 
@@ -329,8 +339,9 @@ class Broker(ABC):
 
     async def _covered(self, instrument: Instrument, cancelled: set[str]) -> bool:
         """Whether this app already has a sell working for the held position: a market sell
-        or a protective stop (one this close did not just cancel). Without a fresh order
-        list, the last stop this broker put back for it counts while still working."""
+        or a protective stop it has not asked to cancel (here, or in flatten_all's
+        cancel_all; IBKR may confirm such a cancel only later). Without a fresh order list,
+        the last stop this broker put back for it counts while still working."""
         try:
             listed = await self.open_orders()
         except BrokerError:
@@ -341,7 +352,12 @@ class Broker(ABC):
                 rec = await self.order_status(last)
             except BrokerError:
                 return False
-            return rec is not None and rec.status in OPEN_ORDER_STATUSES
+            return (
+                rec is not None
+                and rec.status in OPEN_ORDER_STATUSES
+                and last not in cancelled
+                and not self.cancel_requested(rec)
+            )
         return self._own_market_sell(listed, instrument) or any(
             order.request.instrument.key == instrument.key
             and order.request.side == Side.SELL
@@ -350,5 +366,6 @@ class Broker(ABC):
             and order.broker_order_id
             and order.broker_order_id not in cancelled
             and self.can_cancel(order)
+            and not self.cancel_requested(order)
             for order in listed
         )
