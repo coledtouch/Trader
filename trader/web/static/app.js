@@ -934,6 +934,8 @@
   function renderPositions(positions) {
     const box = $('positions-list');
     if (!changed('positions', positions)) return;
+    // Prices change every poll and the table is rebuilt: keep focus on the same Close button.
+    const focused = box.contains(document.activeElement) ? document.activeElement.dataset.key : null;
     if (!positions.length) {
       box.replaceChildren(empty('No open positions.'));
       return;
@@ -949,6 +951,12 @@
       { label: 'Opened', value: (p) => when(p.opened_at) },
       { label: 'Action', value: (p) => closeButton(p) },
     ], positions));
+    if (focused) focusCloseButton(focused);
+  }
+
+  function focusCloseButton(key) {
+    const button = [...$('positions-list').querySelectorAll('button[data-key]')].find((b) => b.dataset.key === key);
+    if (button) button.focus();
   }
 
   function closeButton(position) {
@@ -956,6 +964,7 @@
     const button = el('button', {
       class: 'btn btn-danger btn-sm', type: 'button', text: 'Close',
       'aria-label': `Close the ${inst.symbol || ''} position`,
+      'data-key': `${inst.asset_class}:${inst.symbol}`,
     });
     button.addEventListener('click', () => openClose(position));
     return button;
@@ -2836,6 +2845,13 @@
     });
     $('close-dialog').addEventListener('cancel', (event) => {
       if (isBusy($('close-confirm'))) event.preventDefault(); // let a running close finish
+    });
+    $('close-dialog').addEventListener('close', () => {
+      // The button that opened the dialog may have been rebuilt: return focus to its row.
+      const active = document.activeElement;
+      if (state.closing && (!active || active === document.body || $('close-dialog').contains(active))) {
+        focusCloseButton(state.closing.key);
+      }
     });
     $('startstop-btn').addEventListener('click', toggleBot);
     $('cycle-btn').addEventListener('click', runCycle);

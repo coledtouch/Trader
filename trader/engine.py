@@ -977,7 +977,11 @@ class Engine:
                     f"{inst.symbol} has a sell order placed in TWS or IBKR Mobile: cancel it "
                     "there first, or it could sell again after this close"
                 )
-            self._closing[key] = now
+            # The monitor's exits do not take the entry lock: one may have started during
+            # the broker calls above. Check again with no await before the stamp.
+            if self._closing_now(key, self._now()):
+                raise ValueError(f"{inst.symbol} is already being closed")
+            self._closing[key] = self._now()
             self._close_reasons[key] = reason
             self._cancel_pending(f"cancelled: {reason}", key=key)
             try:

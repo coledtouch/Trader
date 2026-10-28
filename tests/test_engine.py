@@ -1268,6 +1268,30 @@ async def test_buy_decided_before_a_manual_close_is_not_sent_after_it(db, config
     assert "you closed it today" in [s.skip_reason for s in db.list_signals()]
 
 
+async def test_monitor_exit_during_the_close_checks_is_not_doubled(db, config) -> None:
+    """Review finding (regression): the TWS-order check awaits the broker between the
+    "already closing" check and the stamp. A monitor exit (15:50 flatten, engine stop)
+    starting in that gap must make the owner's close back off, not send a second sell."""
+    h = await harness(db, config)
+    await enter_f(h)
+    real_open_orders = h.broker.open_orders
+    calls = 0
+
+    async def monitor_exit_meanwhile():
+        nonlocal calls
+        calls += 1
+        if calls == 1:  # the owner's close is waiting on this broker call
+            await h.engine._engine_close(Instrument(symbol="F"), "flatten before close", h.clock())
+        return await real_open_orders()
+
+    h.broker.open_orders = monitor_exit_meanwhile
+    with pytest.raises(ValueError, match="already being closed"):
+        await h.engine.close_position("STK:F")
+    sells = [r for r in h.broker.placed if r.side == Side.SELL and r.order_type == OrderType.MARKET]
+    assert len(sells) == 1 and sells[0].reason == "flatten before close"
+    assert db.get_kv("owner_closed:STK:F") is None
+
+
 async def test_manual_close_refusals(db, config) -> None:
     h = await harness(db, config)
     with pytest.raises(LookupError, match="no open F position"):
