@@ -1292,6 +1292,59 @@ async def test_monitor_exit_during_the_close_checks_is_not_doubled(db, config) -
     assert db.get_kv("owner_closed:STK:F") is None
 
 
+async def _refused_then_owner_closes(h: H) -> None:
+    """After a refused close nothing is selling: the owner's Close goes out at once."""
+    assert h.broker.pos  # still held
+    h.broker.reject_exits = False
+    h.clock.advance(seconds=5)
+    rec = await h.engine.close_position("STK:F")
+    assert rec.status == OrderStatus.FILLED and h.broker.pos == {}
+
+
+async def test_owner_close_after_a_refused_kill(db, config) -> None:
+    """Review finding: a refused close elsewhere left its marker for 60 s, so Close said
+    "already being closed" though nothing was selling."""
+    h = await harness(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.broker.reject_exits = True
+    await h.engine.kill()
+    assert "KILL switch FAILED" in h.notes.titles()
+    await _refused_then_owner_closes(h)
+
+
+async def test_owner_close_after_a_refused_ai_close(db, config) -> None:
+    h = await harness(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.clock.advance(minutes=5)
+    h.decider.decisions = [
+        hold("F").model_copy(update={"action": TradeAction.CLOSE, "rationale": "fading"})
+    ]
+    h.broker.reject_exits = True
+    await h.engine.run_cycle()
+    await _refused_then_owner_closes(h)
+
+
+async def test_owner_close_after_a_refused_flatten_before_close(db, config) -> None:
+    h = await harness(db, config)
+    await enter_f(h)
+    h.clock.t = datetime(2026, 10, 21, 19, 51, tzinfo=UTC)  # 15:51 New York
+    h.broker.reject_exits = True
+    await h.engine.monitor_tick()
+    await _refused_then_owner_closes(h)
+
+
+async def test_a_close_that_was_taken_still_blocks_a_second_one(db, config) -> None:
+    """The other side: a sell the broker took is in flight, so Close is refused."""
+    h = await harness(db, config)
+    await enter_f(h)
+    await h.engine._engine_close(Instrument(symbol="F"), "time stop", h.clock())
+    h.broker.pos["STK:F"] = [24.0, 10.01]  # the sell has not filled yet
+    with pytest.raises(ValueError, match="already being closed"):
+        await h.engine.close_position("STK:F")
+
+
 async def test_manual_close_refusals(db, config) -> None:
     h = await harness(db, config)
     with pytest.raises(LookupError, match="no open F position"):

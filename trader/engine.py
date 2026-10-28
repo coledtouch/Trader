@@ -431,6 +431,9 @@ class Engine:
         # exits and halts
         self._closing: dict[str, datetime] = {}
         self._close_reasons: dict[str, str] = {}
+        # Instruments whose latest close the broker refused (or found nothing to sell): not
+        # in flight, though _closing still throttles the monitor's next try.
+        self._close_refused: set[str] = set()
         self._last_halt_at: dict[str, datetime] = {}
         self._skip_logged: set[tuple[str, str]] = set()
         self._mismatch_logged: set[str] = set()
@@ -883,14 +886,14 @@ class Engine:
         log.warning("KILL switch pressed by %s", actor)
         self._cancel_pending("cancelled: kill switch")
         for pos in self._positions:
-            self._closing[pos.instrument.key] = now
-            self._close_reasons[pos.instrument.key] = KILL_REASON
+            self._mark_closing(pos.instrument.key, KILL_REASON, now)
         try:
             async with self._entry_lock:  # no entry can slip in after the flatten
                 if not self.broker.connected:
                     await self.broker.connect()
                 records = await self.broker.flatten_all(KILL_REASON)  # cancels everything
         except Exception as exc:
+            self._close_refused.update(p.instrument.key for p in self._positions)
             log.exception("kill switch could not finish")
             self._set_error("kill", f"kill switch failed: {exc}")
             await self._notify(
@@ -902,6 +905,7 @@ class Engine:
             return
         for rec in records:
             self._journal_order(rec, now)
+            self._note_close(rec.request.instrument.key, rec)
         refused = _refused_exits(records)
         if refused:
             log.error("kill switch: the broker refused to close %s", refused)
@@ -954,7 +958,7 @@ class Engine:
             )
         reason = f"closed by the {actor}"
         async with self._entry_lock:  # no entry or second close can interleave
-            if self._closing_now(key, now):
+            if self._close_in_flight(key, now):
                 raise ValueError(f"{inst.symbol} is already being closed")
             if not self.broker.connected:
                 raise BrokerError("not connected to the broker")
@@ -979,10 +983,9 @@ class Engine:
                 )
             # The monitor's exits do not take the entry lock: one may have started during
             # the broker calls above. Check again with no await before the stamp.
-            if self._closing_now(key, self._now()):
+            if self._close_in_flight(key, self._now()):
                 raise ValueError(f"{inst.symbol} is already being closed")
-            self._closing[key] = self._now()
-            self._close_reasons[key] = reason
+            self._mark_closing(key, reason, self._now())
             self._cancel_pending(f"cancelled: {reason}", key=key)
             try:
                 rec = await self.broker.close_position(held.instrument, reason=reason)
@@ -1150,8 +1153,8 @@ class Engine:
                         order_id, status=OrderStatus.CANCELLED, message="no position to close"
                     )
                     return self._get_order(order_id)
-                self._closing[order.instrument.key] = now
-                self._close_reasons[order.instrument.key] = order.reason
+                self._mark_closing(order.instrument.key, order.reason, now)
+                self._note_close(order.instrument.key, placed)
             else:
                 placed = await self._send_entry(order, now)
                 # Journal the target as sent: none when winners run (exits.no_target).
@@ -1775,12 +1778,16 @@ class Engine:
 
     async def _flatten_all(self, reason: str, now: datetime) -> list[OrderRecord]:
         for pos in self._positions:
-            self._closing[pos.instrument.key] = now
-            self._close_reasons[pos.instrument.key] = reason
-        async with self._entry_lock:  # no entry can slip in after the flatten
-            records = await self.broker.flatten_all(reason)  # cancels everything first
+            self._mark_closing(pos.instrument.key, reason, now)
+        try:
+            async with self._entry_lock:  # no entry can slip in after the flatten
+                records = await self.broker.flatten_all(reason)  # cancels everything first
+        except BaseException:
+            self._close_refused.update(p.instrument.key for p in self._positions)
+            raise
         for rec in records:
             self._journal_order(rec, now)
+            self._note_close(rec.request.instrument.key, rec)
         self.db.audit("flatten", {"reason": reason, "orders": len(records)}, actor="engine")
         refused = _refused_exits(records)
         if refused:
@@ -1798,9 +1805,13 @@ class Engine:
                 key = pos.instrument.key
                 if pos.qty <= 0 or key not in metas:
                     continue
-                self._closing[key] = now
-                self._close_reasons[key] = reason
-                rec = await self.broker.close_position(pos.instrument, reason=reason)
+                self._mark_closing(key, reason, now)
+                try:
+                    rec = await self.broker.close_position(pos.instrument, reason=reason)
+                except BaseException:
+                    self._close_refused.add(key)
+                    raise
+                self._note_close(key, rec)
                 if rec is not None:
                     records.append(rec)
         for rec in records:
@@ -1819,12 +1830,30 @@ class Engine:
         since = self._closing.get(key)
         return since is not None and now - since < CLOSE_RETRY
 
+    def _close_in_flight(self, key: str, now: datetime) -> bool:
+        """A close was sent in the last CLOSE_RETRY and the broker did not refuse it."""
+        return self._closing_now(key, now) and key not in self._close_refused
+
+    def _mark_closing(self, key: str, reason: str, at: datetime) -> None:
+        self._closing[key] = at
+        self._close_reasons[key] = reason
+        self._close_refused.discard(key)
+
+    def _note_close(self, key: str, rec: OrderRecord | None) -> None:
+        """After a close attempt: a refused one (or nothing to sell) is not in flight."""
+        if rec is None or rec.status == OrderStatus.REJECTED:
+            self._close_refused.add(key)
+
     async def _engine_close(self, inst: Instrument, reason: str, now: datetime) -> None:
         """Close a position for a protective reason (never waits for approval)."""
-        self._closing[inst.key] = now
-        self._close_reasons[inst.key] = reason
+        self._mark_closing(inst.key, reason, now)
         log.warning("closing %s: %s", inst.key, reason)
-        rec = await self.broker.close_position(inst, reason=reason)
+        try:
+            rec = await self.broker.close_position(inst, reason=reason)
+        except BaseException:
+            self._close_refused.add(inst.key)  # the monitor still waits CLOSE_RETRY
+            raise
+        self._note_close(inst.key, rec)
         if rec is not None:
             self._journal_order(rec, now)
         self.db.audit("engine_close", {"instrument": inst.key, "reason": reason}, actor="engine")
@@ -3224,9 +3253,13 @@ class Engine:
         async with self._entry_lock:
             if self._closing_now(inst.key, self._now()):
                 return
-            self._closing[inst.key] = self._now()
-            self._close_reasons[inst.key] = req.reason
-            rec = await self.broker.close_position(inst, reason=req.reason)
+            self._mark_closing(inst.key, req.reason, self._now())
+            try:
+                rec = await self.broker.close_position(inst, reason=req.reason)
+            except BaseException:
+                self._close_refused.add(inst.key)
+                raise
+            self._note_close(inst.key, rec)
         if rec is not None:
             if rec.request.trace_id:
                 req = req.model_copy(update={"trace_id": rec.request.trace_id})

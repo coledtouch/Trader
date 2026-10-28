@@ -956,7 +956,7 @@
 
   function focusCloseButton(key) {
     const button = [...$('positions-list').querySelectorAll('button[data-key]')].find((b) => b.dataset.key === key);
-    if (button) button.focus();
+    if (button) button.focus({ preventScroll: true }); // the owner may have scrolled away
   }
 
   function closeButton(position) {
