@@ -11,8 +11,8 @@
   <link rel="manifest" href="/static/manifest.webmanifest" crossorigin="use-credentials">
   <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
-  <link rel="stylesheet" href="/static/styles.css?v=18">
-  <script src="/static/login.js?v=18" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=19">
+  <script src="/static/login.js?v=19" defer></script>
 </head>
 <body>
   <main class="login">
@@ -22,13 +22,13 @@
           <img src="/static/icon.svg" alt="" width="48" height="48">
           <h1>AI Trader</h1>
         </div>
-        <p class="muted">Sign in with your password and the 6-digit code from your authenticator app.</p>
+        <p id="login-intro" class="muted">Sign in with your password and the 6-digit code from your authenticator app.</p>
         <noscript><p class="form-error">This app needs JavaScript to sign in.</p></noscript>
         <form id="login-form" novalidate>
           <!-- Lets password managers file the saved password under a fixed name. -->
           <input class="visually-hidden" type="text" name="username" value="owner"
                  autocomplete="username" tabindex="-1" aria-hidden="true">
-          <div class="field">
+          <div id="password-field" class="field">
             <label for="password">Password</label>
             <input id="password" name="password" type="password" autocomplete="current-password"
                    required autofocus>

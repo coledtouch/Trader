@@ -656,7 +656,8 @@ def create_app(
         auth: Authenticator = state(request).auth
         session = auth.get_session(request.cookies.get(auth.cookie_name))
         if session is None:
-            return {"authenticated": False}
+            # The sign-in page asks for a password only when one is required.
+            return {"authenticated": False, "password": auth.config.login_password_required}
         return {"authenticated": True, "csrf": session.csrf_token}
 
     # ------------------------------------------------------------ read-only data

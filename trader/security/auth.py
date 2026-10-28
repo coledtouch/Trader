@@ -35,6 +35,7 @@ log = logging.getLogger(__name__)
 MIN_PASSWORD_LENGTH = 12
 MAX_PASSWORD_LENGTH = 1024
 LOGIN_WINDOW = timedelta(minutes=15)  # rate limit and lockout window
+LOGIN_DAY = timedelta(days=1)  # daily cap on failed codes when no password is required
 TOTP_VALID_WINDOW = 1  # accept the previous, current and next 30 s step
 TOTP_ISSUER = "AI Trader"
 TOTP_ACCOUNT = "owner"
@@ -222,28 +223,38 @@ class Authenticator:
 
     # ------------------------------------------------------------ login and step-up
     def rate_limited(self, ip: str, now: datetime | None = None) -> bool:
-        since = (now or self._clock()) - LOGIN_WINDOW
+        now = now or self._clock()
+        since = now - LOGIN_WINDOW
         if self.db.count_failed_logins(since) >= self.config.login_lockout_failures:
+            return True
+        # Without a password a guesser needs only the code: 3 of a million are valid at
+        # any time. The 15-minute lockout alone would allow ~960 guesses a day.
+        if not self.config.login_password_required and (
+            self.db.count_failed_logins(now - LOGIN_DAY) >= self.config.login_daily_failures
+        ):
             return True
         return self.db.count_failed_logins(since, ip=ip) >= self.config.login_max_attempts_per_ip
 
     def login(
         self, password: str, totp: str, ip: str, user_agent: str | None = None
     ) -> tuple[str, Session]:
-        """Verify password + TOTP and open a new session. Returns (cookie token, session).
+        """Verify password + TOTP (the code alone when login_password_required is off) and
+        open a new session. Returns (cookie token, session).
 
         Raises RateLimited before checking anything when limited (such attempts are not
-        recorded, so the lockout ends 15 minutes after the last real failure), and
-        InvalidCredentials for every other failure. The password hash is always computed,
-        even when no owner exists, so timing does not reveal why a login failed.
+        recorded, so the lockout ends 15 minutes after the last real failure, or once the
+        day's failures fall below the daily cap), and InvalidCredentials for every other
+        failure. When a password is required its hash is always computed, even when no
+        owner exists, so timing does not reveal why a login failed.
         """
+        need_password = self.config.login_password_required
         with self._lock:  # check, verify and record atomically (no burst past the limits)
             now = self._clock()
-            self.db.purge_login_attempts(now - timedelta(days=1))
+            self.db.purge_login_attempts(now - LOGIN_DAY)
             if self.rate_limited(ip, now):
                 raise RateLimited("too many failed attempts; try again later")
             auth = self.db.get_auth()
-            password_ok = self._check_password(auth, password)
+            password_ok = self._check_password(auth, password) if need_password else True
             secret = self._totp_secret(auth)
             step = match_totp(secret, totp, now) if secret else None
             ok = (
@@ -257,7 +268,9 @@ class Authenticator:
             self.db.record_login_attempt(ip, success=ok)
         if not ok or auth is None:
             raise InvalidCredentials("invalid credentials")
-        if self._hasher.check_needs_rehash(auth["password_hash"]):
+        # Only a verified password may replace the stored hash (never the empty one sent
+        # by a code-only sign-in).
+        if need_password and self._hasher.check_needs_rehash(auth["password_hash"]):
             self.db.update_password_hash(self._hasher.hash(password))
         return self.create_session(ip, user_agent)
 

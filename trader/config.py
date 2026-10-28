@@ -37,6 +37,11 @@ class AppConfig(BaseSettings):
     session_max_hours: int = 12
     login_max_attempts_per_ip: int = 5  # per 15 minutes
     login_lockout_failures: int = 10  # global failures in 15 minutes -> lock all logins
+    # False: sign in with the authenticator code alone, no password. The 6-digit code is
+    # then the only secret, so failed codes (sign-ins and step-ups, all addresses together)
+    # are also capped per day. Live trading still requires Cloudflare Access (below).
+    login_password_required: bool = True
+    login_daily_failures: int = Field(default=20, ge=1)  # per 24 h when the code is alone
     # True only behind a proxy you control (cloudflared): the client IP is then taken from
     # CF-Connecting-IP only. A missing header falls back to the socket peer, never to
     # X-Forwarded-For (a client can spoof that).

@@ -24,6 +24,7 @@ secrets live, what gets logged, and what to do when a device is lost.
  [3] Access token check ------ the app verifies Cloudflare's signed token (when configured)
    |
  [4] App login --------------- password (argon2id) + 6-digit 2FA code, rate limited
+                               (or the code alone: see "Code-only sign-in" below)
    |
  [5] Session protections ----- secure cookie, CSRF token + Origin check, idle timeout
    |
@@ -56,6 +57,33 @@ secrets live, what gets logged, and what to do when a device is lost.
 
 Also turn on 2FA for the accounts around the app: Cloudflare, DigitalOcean, GitHub,
 Anthropic (Claude Console), xAI (console.x.ai) and your e-mail.
+
+## Code-only sign-in (optional)
+
+`TRADER_LOGIN_PASSWORD_REQUIRED=false` drops the password: the 6-digit code from your
+authenticator app is enough to sign in. The sign-in page then shows only the code box.
+
+What it costs: the code becomes the only secret. At any moment 3 of the 1,000,000 possible
+codes are valid, so a stranger who guesses has odds of 3 in a million per try. To keep
+that small, failed codes (sign-ins and step-ups from all addresses together) are capped at
+`TRADER_LOGIN_DAILY_FAILURES` (default 20) per 24 hours, on top of the 15-minute limits.
+At 20 guesses a day that is about a 2% chance per year that a determined guesser gets in.
+
+- **The lockout also blocks you.** Someone can lock new sign-ins for a day by failing 20
+  times. Sessions you already have keep working (up to `TRADER_SESSION_MAX_HOURS`), and the
+  audit log shows the failures (`login_failed`).
+- **Step-up codes are unchanged.** Loosening risk, arming live trading and the other
+  sensitive actions still need a fresh code, and each code works only once.
+- **Live trading still needs Cloudflare Access.** With `TRADER_ALLOW_LIVE=true` the app
+  refuses to start unless `TRADER_CF_ACCESS_TEAM_DOMAIN` and `TRADER_CF_ACCESS_AUD` are
+  set, so a code-only page open to the internet is possible only on paper or the simulator.
+
+To also drop the Cloudflare PIN (paper only): delete the `desk.kaxo.dev` application in
+Cloudflare Zero Trust (Access, Applications), then remove `TRADER_CF_ACCESS_TEAM_DOMAIN`
+and `TRADER_CF_ACCESS_AUD` from `.env` and run `docker compose up -d`. Leaving them set
+makes the app refuse every request, because Cloudflare no longer sends the Access token.
+The tunnel stays, so the site is still reachable, now by anyone. Put Access back (and the
+two values) before setting `TRADER_ALLOW_LIVE=true`.
 
 ## Where secrets live
 

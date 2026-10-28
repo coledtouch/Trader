@@ -1,4 +1,5 @@
-/* AI Trader sign-in page: password + TOTP code -> POST /api/auth/login -> "/". */
+/* AI Trader sign-in page: password (unless the server needs none) + TOTP code
+   -> POST /api/auth/login -> "/". */
 (() => {
   'use strict';
 
@@ -6,6 +7,7 @@
   const $ = (id) => document.getElementById(id);
   const form = $('login-form');
   const password = $('password');
+  const passwordField = $('password-field');
   const code = $('code');
   const error = $('login-error');
   const submit = $('login-submit');
@@ -57,9 +59,19 @@
       if (!res.ok || !isJson(res)) return;
       const data = await res.json();
       if (data && data.authenticated) window.location.replace('/');
+      else if (data && data.password === false) codeOnly();
     } catch {
       /* offline or slow: the form still works once the network is back */
     }
+  }
+
+  /** The server signs in with the authenticator code alone: hide the password. */
+  function codeOnly() {
+    passwordField.hidden = true;
+    password.required = false;
+    password.value = '';
+    $('login-intro').textContent = 'Sign in with the 6-digit code from your authenticator app.';
+    if (document.activeElement === password || document.activeElement === document.body) code.focus();
   }
 
   async function signIn(event) {
@@ -67,7 +79,7 @@
     if (submit.disabled) return;
     error.textContent = '';
     const totp = code.value.replace(/\D/g, '');
-    if (!password.value) {
+    if (!passwordField.hidden && !password.value) {
       showError('Enter your password.', password);
       return;
     }
@@ -86,8 +98,8 @@
       }
       code.value = '';
       if (proxyBlocked(res)) showError('Session expired - reload to sign in again');
-      else if (res.status === 401) showError('Incorrect password or code.', code);
-      else if (res.status === 429) showError('Too many failed attempts. Wait 15 minutes, then try again.');
+      else if (res.status === 401) showError(passwordField.hidden ? 'Incorrect code.' : 'Incorrect password or code.', code);
+      else if (res.status === 429) showError('Too many failed attempts. Wait 15 minutes, then try again (after many failures, up to a day).');
       else showError(`Sign-in failed (HTTP ${res.status}). Try again.`, code);
     } catch (err) {
       const timedOut = err && err.name === 'AbortError';

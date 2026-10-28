@@ -223,6 +223,54 @@ def test_global_lockout_and_window_expiry(auth, secret, clock):
     auth.login(PASSWORD, code(secret, clock), "10.2.0.1")
 
 
+# ---------------------------------------------------------------------- code-only sign-in
+def _wrong_code(secret: str, clock: Clock) -> str:
+    valid = {code(secret, clock, offset) for offset in (-1, 0, 1)}
+    return next(c for c in ("000000", "111111", "222222", "333333") if c not in valid)
+
+
+def test_code_only_login_needs_no_password_and_keeps_the_hash(db, clock, secret):
+    config = make_config(login_password_required=False)
+    Authenticator(config, db, hasher=FAST, clock=clock).set_owner(PASSWORD, secret)
+    stronger = PasswordHasher(time_cost=2, memory_cost=16, parallelism=1)
+    auth = Authenticator(config, db, hasher=stronger, clock=clock)
+    before = db.get_auth()["password_hash"]
+    current = code(secret, clock)
+    token, _ = auth.login("", current, "10.0.0.1")
+    assert auth.get_session(token) is not None
+    # An outdated hash is never "upgraded" to a hash of the empty password sent.
+    assert db.get_auth()["password_hash"] == before
+    with pytest.raises(InvalidCredentials):  # the code is still checked, and works once
+        auth.login("", current, "10.0.0.1")
+    with pytest.raises(InvalidCredentials):
+        auth.login("", _wrong_code(secret, clock), "10.0.0.1")
+
+
+def test_code_only_login_caps_failures_per_day(db, clock, secret):
+    """The 15-minute lockout alone would let a guesser try ~960 codes a day."""
+    config = make_config(login_password_required=False, login_daily_failures=8)
+    auth = Authenticator(config, db, hasher=FAST, clock=clock)
+    auth.set_owner(PASSWORD, secret)
+    for i in range(8):  # spread out, so the per-IP and 15-minute limits never trip
+        with pytest.raises(InvalidCredentials):
+            auth.login("", _wrong_code(secret, clock), f"10.3.0.{i}")
+        clock.advance(minutes=20)
+    with pytest.raises(RateLimited):
+        auth.login("", code(secret, clock), "10.4.0.1")  # even the right code, from anywhere
+    with pytest.raises(RateLimited):
+        auth.step_up(code(secret, clock), "10.4.0.1")
+    clock.advance(hours=24)  # the failures age out
+    auth.login("", code(secret, clock), "10.4.0.1")
+
+
+def test_the_daily_cap_applies_only_without_a_password(auth, secret, clock):
+    for i in range(25):  # more than the default daily cap of 20, spread out
+        with pytest.raises(InvalidCredentials):
+            auth.login("wrong password!!", code(secret, clock), f"10.5.0.{i}")
+        clock.advance(minutes=20)
+    auth.login(PASSWORD, code(secret, clock), "10.6.0.1")
+
+
 # ---------------------------------------------------------------------- step-up
 def test_step_up(auth, secret, clock, db):
     with pytest.raises(StepUpRequired):

@@ -201,7 +201,7 @@ def test_healthz_and_no_docs(env):
         assert env.client.get(path).status_code == 404
 
 
-@pytest.mark.parametrize("asset", ["app.js?v=18", "login.js?v=18", "styles.css?v=18", "sw.js"])
+@pytest.mark.parametrize("asset", ["app.js?v=19", "login.js?v=19", "styles.css?v=19", "sw.js"])
 def test_executable_shell_assets_revalidate_on_deploy(env, asset):
     response = env.client.get(f"/static/{asset}")
     assert response.status_code == 200
@@ -349,7 +349,7 @@ def test_dashboard_marks_its_status_poll_as_background():
 
 
 def test_login_flow(env):
-    assert env.client.get("/api/session").json() == {"authenticated": False}
+    assert env.client.get("/api/session").json() == {"authenticated": False, "password": True}
     bad = env.client.post("/api/auth/login", json={"password": PASSWORD, "totp": "000000"})
     wrong = env.client.post("/api/auth/login", json={"password": "nope", "totp": env.code()})
     empty = env.client.post("/api/auth/login", json={})
@@ -367,12 +367,26 @@ def test_login_flow(env):
 
     headers = {"X-CSRF-Token": body["csrf"], "Origin": ORIGIN}
     assert env.client.post("/api/auth/logout", headers=headers).json() == {"ok": True}
-    assert env.client.get("/api/session").json() == {"authenticated": False}
+    assert env.client.get("/api/session").json() == {"authenticated": False, "password": True}
     assert env.client.get("/api/status").status_code == 401
 
     actions = [row["action"] for row in env.db.list_audit(20)]
     assert actions.count("login_failed") == 3
     assert "login" in actions and "logout" in actions
+
+
+def test_code_only_sign_in():
+    """TRADER_LOGIN_PASSWORD_REQUIRED=false: the page hides the password and the
+    authenticator code alone signs in. A wrong code is still refused."""
+    ctx = build(login_password_required=False)
+    with TestClient(ctx.app) as client:
+        assert client.get("/api/session").json() == {"authenticated": False, "password": False}
+        wrong = "000000" if ctx.code() != "000000" else "111111"
+        assert client.post("/api/auth/login", json={"totp": wrong}).status_code == 401
+        response = client.post("/api/auth/login", json={"totp": ctx.code()})
+        assert response.status_code == 200, response.text
+        assert client.get("/api/session").json()["authenticated"] is True
+    ctx.db.close()
 
 
 def test_login_rotates_the_session(env):
@@ -900,7 +914,10 @@ def test_cf_access_middleware(monkeypatch):
             == 403
         )
         good = {"Cf-Access-Jwt-Assertion": make_token(key)}
-        assert client.get("/api/session", headers=good).json() == {"authenticated": False}
+        assert client.get("/api/session", headers=good).json() == {
+            "authenticated": False,
+            "password": True,
+        }
         assert client.get("/login", headers=good).status_code == 200
     assert fetch.calls == [f"https://{TEAM}/cdn-cgi/access/certs"]
 

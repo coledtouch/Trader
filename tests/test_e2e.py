@@ -191,7 +191,7 @@ def test_trading_day_end_to_end(tmp_path: Path) -> None:
         page = st.client.get("/", follow_redirects=False)
         assert page.status_code == 302 and page.headers["location"] == "/login"
         assert st.client.get("/api/status").status_code == 401
-        assert st.get("/api/session") == {"authenticated": False}
+        assert st.get("/api/session") == {"authenticated": False, "password": True}
 
         st.login()
         assert st.get("/api/session") == {"authenticated": True, "csrf": st.csrf}
