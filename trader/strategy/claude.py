@@ -9,13 +9,18 @@ dropped and logged. Failure handling (fail safe, never a BUY on a failure):
 - refusal (`stop_reason == "refusal"`): `refused=True`, no decisions, no fallback.
 - cut off, unparseable output, 4xx errors, unexpected exceptions: `error` set, no decisions.
 - transient API errors (429, 408/409, 5xx/overloaded, connection or timeout) that remain
-  after the SDK's own retries: the fallback maker's CLOSE decisions only (exits that
-  reduce risk; its BUYs are discarded), with `error` set. Broker-side stops protect
-  positions in every case.
+  after the SDK's own retries, and no answer within DECISION_DEADLINE_S: the fallback
+  maker's CLOSE decisions only (exits that reduce risk; its BUYs are discarded), with
+  `error` set. Broker-side stops protect positions in every case.
+
+The request is streamed: the API keeps a streamed connection busy while Claude thinks,
+so a long answer cannot trip the HTTP read timeout, which a single non-streamed response
+did. DECISION_DEADLINE_S bounds the whole call instead.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -45,8 +50,11 @@ log = logging.getLogger(__name__)
 DEFAULT_MODEL = "claude-opus-5-5"
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 MAX_TOKENS = 16000  # thinking counts towards this as well as the JSON answer
-REQUEST_TIMEOUT_S = 90.0
+REQUEST_TIMEOUT_S = 90.0  # per read; a streamed answer keeps the connection busy
 MAX_RETRIES = 2
+# The whole call, retries included. The engine drops a BUY decided on data more than
+# 3 minutes old (DECISION_MAX_AGE), and the market data fetch comes first.
+DECISION_DEADLINE_S = 140.0
 # Server-side refusal fallback: the API re-runs a declined request on the model
 # Anthropic recommends for the refusal category, inside the same call.
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
@@ -177,6 +185,7 @@ class ClaudeDecisionMaker:
         effort: str,
         fallback: DecisionMaker,
         client: AsyncAnthropic | None = None,
+        deadline_s: float = DECISION_DEADLINE_S,
     ) -> None:
         if effort not in EFFORTS:
             raise ValueError(f"effort must be one of {EFFORTS}, got {effort!r}")
@@ -192,6 +201,7 @@ class ClaudeDecisionMaker:
         self.model = model
         self.effort = effort
         self.fallback = fallback
+        self.deadline_s = deadline_s
         self._client = client
 
     async def decide(self, ctx: DecisionContext) -> DecisionBatch:
@@ -201,19 +211,17 @@ class ClaudeDecisionMaker:
             log.exception("could not render the decision context")
             return self._failed(ctx, f"could not render context: {type(exc).__name__}")
         try:
-            response = await self._client.beta.messages.parse(**self._request(user_text))
+            response = await asyncio.wait_for(self._call(user_text), self.deadline_s)
         except ValidationError as exc:
-            # The SDK validates the JSON inside parse(); with constrained decoding this only
-            # fails on incomplete JSON (cut off at max_tokens). Usage is lost with the
-            # response, so charge a worst-case estimate rather than nothing.
+            # The SDK validates the JSON as the answer completes; with constrained decoding
+            # this only fails on incomplete JSON (cut off at max_tokens). Usage is lost with
+            # the response, so charge a worst-case estimate rather than nothing.
             log.warning("Claude output failed validation (%d errors)", exc.error_count())
-            prompt_tokens = (len(SYSTEM_PROMPT) + len(user_text)) // CHARS_PER_TOKEN
-            cost = estimate_cost(self.model, prompt_tokens, MAX_TOKENS)
             return self._failed(
                 ctx,
                 "Claude output was not valid JSON for the schema (likely cut off); "
                 "tokens and cost are estimated",
-                spend=_Spend(self.model, prompt_tokens, MAX_TOKENS, cost),
+                spend=self._worst_case(user_text),
             )
         except anthropic.AnthropicError as exc:
             error = _describe(exc)
@@ -221,6 +229,14 @@ class ClaudeDecisionMaker:
             if _is_transient(exc):
                 return await self._exits_only(ctx, error)
             return self._failed(ctx, error)
+        except TimeoutError:
+            # The stream was cancelled mid-answer: what it cost is unknown, so charge a
+            # worst-case estimate (the daily AI budget must not under-count).
+            error = f"Claude did not answer within {self.deadline_s:.0f}s"
+            log.warning("%s; the decision would be stale", error)
+            return await self._exits_only(
+                ctx, f"{error}; tokens and cost are estimated", spend=self._worst_case(user_text)
+            )
         except Exception as exc:
             log.exception("unexpected error calling Claude")
             return self._failed(ctx, f"unexpected error: {type(exc).__name__}")
@@ -239,6 +255,16 @@ class ClaudeDecisionMaker:
             )
 
     # ------------------------------------------------------------------ request
+    async def _call(self, user_text: str) -> Any:
+        async with self._client.beta.messages.stream(**self._request(user_text)) as stream:
+            return await stream.get_final_message()
+
+    def _worst_case(self, user_text: str) -> _Spend:
+        """An estimate for a call whose usage was lost: the whole output budget spent."""
+        prompt_tokens = (len(SYSTEM_PROMPT) + len(user_text)) // CHARS_PER_TOKEN
+        cost = estimate_cost(self.model, prompt_tokens, MAX_TOKENS)
+        return _Spend(self.model, prompt_tokens, MAX_TOKENS, cost)
+
     def _request(self, user_text: str) -> dict[str, Any]:
         # Thinking stays at the model default (adaptive); no sampling parameters, no
         # prefill. Effort is set explicitly because the default differs per model.
@@ -318,15 +344,21 @@ class ClaudeDecisionMaker:
             cost=spend.cost,
         )
 
-    async def _exits_only(self, ctx: DecisionContext, error: str) -> DecisionBatch:
+    async def _exits_only(
+        self, ctx: DecisionContext, error: str, *, spend: _Spend | None = None
+    ) -> DecisionBatch:
         """Transient outage: keep the fallback's risk-reducing CLOSEs, never its BUYs."""
+        spend = spend or _Spend(self.model, 0, 0, 0.0)
         return await exits_only(
             ctx,
             maker=self.name,
-            model=self.model,
+            model=spend.model,
             label="Claude",
             fallback=self.fallback,
             error=error,
+            prompt_tokens=spend.prompt_tokens,
+            output_tokens=spend.output_tokens,
+            cost=spend.cost,
         )
 
 

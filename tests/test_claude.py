@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -42,21 +43,42 @@ REQ = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
 
 
 # ---------------------------------------------------------------------- fakes
-class FakeMessages:
-    def __init__(self, result: Any):
-        self.result = result
-        self.calls: list[dict[str, Any]] = []
+class FakeStream:
+    """What `client.beta.messages.stream(...)` returns: an async context manager."""
 
-    async def parse(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
+    def __init__(self, result: Any, delay: float = 0.0):
+        self.result, self.delay = result, delay
+        self.closed = False
+
+    async def __aenter__(self) -> "FakeStream":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        self.closed = True
+
+    async def get_final_message(self) -> Any:
+        if self.delay:
+            await asyncio.sleep(self.delay)
         if isinstance(self.result, BaseException):
             raise self.result
         return self.result
 
 
+class FakeMessages:
+    def __init__(self, result: Any, delay: float = 0.0):
+        self.result, self.delay = result, delay
+        self.calls: list[dict[str, Any]] = []
+        self.streams: list[FakeStream] = []
+
+    def stream(self, **kwargs: Any) -> FakeStream:
+        self.calls.append(kwargs)
+        self.streams.append(FakeStream(self.result, self.delay))
+        return self.streams[-1]
+
+
 class FakeClient:
-    def __init__(self, result: Any):
-        self.messages = FakeMessages(result)
+    def __init__(self, result: Any, delay: float = 0.0):
+        self.messages = FakeMessages(result, delay)
         self.beta = SimpleNamespace(messages=self.messages)
 
 
@@ -452,6 +474,29 @@ async def test_validation_error_inside_parse_charges_worst_case():
     assert batch.cost_usd >= MAX_TOKENS * 20 / 1e6
 
 
+async def test_no_answer_within_the_deadline_keeps_exits_and_charges_worst_case():
+    """A Claude answer later than the deadline would be stale: the stream is cancelled,
+    the fallback's exits still go out, and the unknown cost is charged as a worst case."""
+    ctx = base_ctx()
+    rules_batch = await RuleBasedDecisionMaker().decide(
+        make_ctx(
+            candidates=ctx.candidates,
+            positions=[pos("AMD")],
+            market={"STK:AMD": {"price": 99.0, "vwap": 100.0}},
+        )
+    )
+    assert {d.action for d in rules_batch.decisions} == {TradeAction.CLOSE, TradeAction.BUY}
+    fallback = FakeFallback(rules_batch)
+    client = FakeClient(response(output(decision("BUY", "AMD"))), delay=5)
+    m = ClaudeDecisionMaker(API_KEY, "claude-opus-5-5", "high", fallback, client, deadline_s=0.05)
+    batch = await m.decide(ctx)
+    assert "did not answer within" in (batch.error or "")
+    assert [d.action for d in batch.decisions] == [TradeAction.CLOSE]  # no BUY
+    assert fallback.calls == 1
+    assert client.messages.streams[0].closed  # the stream was cancelled and closed
+    assert batch.output_tokens == MAX_TOKENS and batch.cost_usd >= MAX_TOKENS * 20 / 1e6
+
+
 async def test_unexpected_exception_is_safe():
     batch = await maker(FakeClient(KeyError("weird"))).decide(base_ctx())
     assert batch.decisions == []
@@ -488,7 +533,7 @@ async def test_render_failure_is_safe(monkeypatch):
 async def test_api_key_never_logged_or_journaled(caplog, monkeypatch):
     real = ClaudeDecisionMaker(API_KEY, "claude-opus-5-5", "medium", FakeFallback())
     fake = FakeMessages(status_error(anthropic.AuthenticationError, 401))
-    monkeypatch.setattr(real._client.beta.messages, "parse", fake.parse)
+    monkeypatch.setattr(real._client.beta.messages, "stream", fake.stream)
     with caplog.at_level(logging.DEBUG):
         batch = await real.decide(base_ctx())
     assert batch.decisions == []
@@ -498,13 +543,51 @@ async def test_api_key_never_logged_or_journaled(caplog, monkeypatch):
 
 
 # ---------------------------------------------------------------------- real SDK, mocked HTTP
+def sse(message: dict[str, Any]) -> bytes:
+    """A Messages API answer as the server-sent events of a streamed response."""
+    usage = message["usage"]
+    start = {**message, "content": [], "stop_reason": None, "stop_details": None}
+    start["usage"] = {**usage, "output_tokens": 1}
+    events: list[tuple[str, dict[str, Any]]] = [
+        ("message_start", {"type": "message_start", "message": start})
+    ]
+    for i, block in enumerate(message["content"]):
+        if block["type"] == "thinking":
+            empty = {"type": "thinking", "thinking": "", "signature": ""}
+            delta = {"type": "signature_delta", "signature": block["signature"]}
+        else:
+            empty = {"type": "text", "text": ""}
+            delta = {"type": "text_delta", "text": block["text"]}
+        start_block = {"type": "content_block_start", "index": i, "content_block": empty}
+        events += [
+            ("content_block_start", start_block),
+            ("content_block_delta", {"type": "content_block_delta", "index": i, "delta": delta}),
+            ("content_block_stop", {"type": "content_block_stop", "index": i}),
+        ]
+    final = {
+        "stop_reason": message["stop_reason"],
+        "stop_sequence": None,
+        "stop_details": message.get("stop_details"),
+    }
+    out = {"output_tokens": usage["output_tokens"]}
+    events += [
+        ("message_delta", {"type": "message_delta", "delta": final, "usage": out}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    return "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events).encode()
+
+
 def sdk_maker(body: dict[str, Any], seen: dict[str, Any]) -> ClaudeDecisionMaker:
     """A maker whose real AsyncAnthropic client talks to an in-process mock transport."""
 
     def handler(request: httpx2.Request) -> httpx2.Response:
         seen["headers"] = request.headers
         seen["body"] = json.loads(request.content)
-        return httpx2.Response(200, json=body, headers={"request-id": "req_1"})
+        return httpx2.Response(
+            200,
+            content=sse(body),
+            headers={"request-id": "req_1", "content-type": "text/event-stream"},
+        )
 
     client = anthropic.AsyncAnthropic(
         api_key=API_KEY,
@@ -550,8 +633,10 @@ async def test_real_sdk_request_body_and_parse():
         "messages",
         "model",
         "output_config",
+        "stream",
         "system",
     ]
+    assert body["stream"] is True  # a long answer must not trip the HTTP read timeout
     assert body["output_config"]["effort"] == "medium"
     assert body["output_config"]["format"]["type"] == "json_schema"
     assert body["fallbacks"] == "default"
