@@ -680,25 +680,43 @@ async def test_real_sdk_truncated_output_fails_safe():
     assert batch.cost_usd == pytest.approx((2000 * 4 + 900 * 20 + 1500 * 0.2) / 1e6)
 
 
-async def test_real_sdk_refusal_mid_answer_keeps_the_fallback_models_answer():
-    """Review finding: with server-side fallback, a refusal part way through leaves the
-    declined model's partial text, then a `fallback` block, then the fallback model's
-    answer. Parsing every text block lost the valid answer."""
-    answer = output(decision("BUY", "AMD", size_fraction=0.5), view="Constructive.")
-    hand_off = {
+def _hand_off(to: str) -> dict[str, Any]:
+    return {
         "type": "fallback",
         "from": {"model": "claude-opus-5-5"},
-        "to": {"model": "claude-opus-4-8"},
+        "to": {"model": to},
         "trigger": {"type": "refusal", "category": "cyber"},
     }
-    content = [
-        {"type": "text", "text": '{"market_view": "Constr'},
-        hand_off,
-        {"type": "text", "text": answer.model_dump_json()},
-    ]
+
+
+@pytest.mark.parametrize("shape", ["continuation", "two_hops", "restart"])
+async def test_real_sdk_refusal_mid_answer_keeps_the_fallback_models_answer(shape):
+    """Review findings: with server-side fallback, a refusal part way through a streamed
+    answer hands over to the fallback model, which continues from the partial text (so the
+    answer is every text block joined). A fallback that restarts instead sends a whole answer
+    after the `fallback` block. Both must keep the answer."""
+    answer = output(decision("BUY", "AMD", size_fraction=0.5), view="Constructive.")
+    raw = answer.model_dump_json()
+    k1, k2 = len(raw) // 3, 2 * len(raw) // 3
+
+    def text(part: str) -> dict[str, Any]:
+        return {"type": "text", "text": part}
+
+    content = {
+        "continuation": [text(raw[:k1]), _hand_off("claude-opus-4-8"), text(raw[k1:])],
+        "two_hops": [
+            text(raw[:k1]),
+            _hand_off("claude-opus-5"),
+            text(raw[k1:k2]),
+            _hand_off("claude-opus-4-8"),
+            text(raw[k2:]),
+        ],
+        "restart": [text(raw[:k1]), _hand_off("claude-opus-4-8"), text(raw)],
+    }[shape]
     batch = await sdk_maker(api_message(content, "end_turn"), {}).decide(base_ctx())
     assert batch.error is None, batch.error
     assert batch.model == "claude-opus-4-8"
+    assert batch.market_view == "Constructive."
     assert [(d.action, d.symbol) for d in batch.decisions] == [(TradeAction.BUY, "AMD")]
 
 
@@ -758,18 +776,20 @@ async def test_real_sdk_overloaded_error_mid_stream_keeps_exits():
 
 
 @pytest.mark.parametrize(
-    "exc",
+    ("started", "exc"),
     [
-        httpx2.RemoteProtocolError("peer closed connection"),
-        httpx2.ReadTimeout("read timed out"),
-        None,
+        (True, httpx2.RemoteProtocolError("peer closed connection")),
+        (True, httpx2.ReadTimeout("read timed out")),
+        (True, None),  # the body just ends after message_start
+        (False, None),  # the body ends before message_start (the SDK asserts)
     ],
 )
-async def test_real_sdk_answer_broken_off_mid_stream_keeps_exits_and_charges(exc):
-    """Review finding: a connection lost, stalled or ended while reading the open stream
-    came out as an 'unexpected error' (no exits, no cost). None: the body just ends."""
+async def test_real_sdk_answer_broken_off_mid_stream_keeps_exits_and_charges(started, exc):
+    """Review findings: a connection lost, stalled or ended while reading the open stream
+    came out as an 'unexpected error' (no exits, no cost)."""
     ctx, fallback = await _exits_fallback()
-    batch = await broken_sdk_maker([_start_event()], exc, fallback).decide(ctx)
+    chunks = [_start_event()] if started else []
+    batch = await broken_sdk_maker(chunks, exc, fallback).decide(ctx)
     assert fallback.calls == 1
     assert [d.action for d in batch.decisions] == [TradeAction.CLOSE]
     assert "broke off" in (batch.error or "")

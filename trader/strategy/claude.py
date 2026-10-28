@@ -265,8 +265,11 @@ class ClaudeDecisionMaker:
     async def _call(self, user_text: str, opened: list[bool]) -> Any:
         async with self._client.beta.messages.stream(**self._request(user_text)) as stream:
             opened.append(True)  # accepted (HTTP 200): from here on the call may be billed
-            message = await stream.get_final_message()
-        if message.stop_reason is None:  # the body ended before message_delta/message_stop
+            try:
+                message = await stream.get_final_message()
+            except AssertionError:  # the SDK's check: the body ended before message_start
+                raise _StreamEnded("the answer ended before it started") from None
+        if message is None or message.stop_reason is None:  # ended before message_stop
             raise _StreamEnded("the answer ended without a stop reason")
         return message
 
@@ -316,13 +319,17 @@ class ClaudeDecisionMaker:
                 ctx, f"response stopped early ({response.stop_reason})", spend=spend
             )
 
-        text = _answer_text(response.content)
-        if not text.strip():
+        candidates = _answer_texts(response.content)
+        if not candidates[0].strip():
             return self._failed(ctx, "response contained no structured output", spend=spend)
-        try:
-            output = ModelDecisions.model_validate_json(text)
-        except ValidationError as exc:
-            log.warning("Claude output failed validation (%d errors)", exc.error_count())
+        output = None
+        for text in candidates:
+            try:
+                output = ModelDecisions.model_validate_json(text)
+                break
+            except ValidationError as exc:
+                log.warning("Claude output failed validation (%d errors)", exc.error_count())
+        if output is None:
             return self._failed(ctx, "Claude output was not valid JSON for the schema", spend=spend)
         decisions, dropped = convert_decisions(output, ctx, source="Claude")
         return DecisionBatch(
@@ -382,14 +389,22 @@ class _StreamEnded(Exception):
     """The streamed answer ended before its stop reason (a cut-off body)."""
 
 
-def _answer_text(content: Any) -> str:
-    """The final model's JSON: the text after the last fallback hand-off. A refusal part
-    way through leaves the declined model's partial text before the `fallback` block."""
+def _answer_texts(content: Any) -> list[str]:
+    """The answer's JSON, as the candidates to try in order. A refusal part way through a
+    streamed answer hands over to the fallback model, which continues from the partial
+    text: the answer is every text block joined, across the `fallback` blocks. A fallback
+    that restarts instead puts a whole answer after the last `fallback` block."""
     blocks = list(content or [])
+
+    def text(part: list[Any]) -> str:
+        return "".join(b.text for b in part if getattr(b, "type", None) == "text")
+
+    whole = text(blocks)
     last = max(
         (i for i, b in enumerate(blocks) if getattr(b, "type", None) == "fallback"), default=-1
     )
-    return "".join(b.text for b in blocks[last + 1 :] if getattr(b, "type", None) == "text")
+    tail = text(blocks[last + 1 :])
+    return [whole] if tail == whole else [whole, tail]
 
 
 def _is_transient(exc: Exception) -> bool:
