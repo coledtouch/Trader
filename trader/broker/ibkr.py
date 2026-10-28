@@ -363,7 +363,9 @@ class IBKRBroker(Broker):
     SCANNER_TIMEOUT = 8.0
     UPSTREAM_GRACE = 90.0  # force a reconnect if 1100/2110 is not cleared by then
     TICKER_RETRY_AFTER = 60.0  # resubscribe a ticker that never delivered data
-    MAX_TICKERS = 60  # streaming market data lines held at once (IB default limit 100)
+    # Streaming market data lines held at once. IBKR's default is 100 for the whole account;
+    # the rest is left for the crypto watchdog and paper-test (their own API clients).
+    MAX_TICKERS = 95
 
     def __init__(self, config: AppConfig, ib: IB | None = None) -> None:
         self._config = config
