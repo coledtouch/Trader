@@ -50,7 +50,7 @@ from ib_async import (
 )
 
 from trader import fees
-from trader.broker.base import Broker, BrokerError
+from trader.broker.base import PROTECTIVE_REJECTED, Broker, BrokerError
 from trader.config import AppConfig
 from trader.models import (
     MAX_QUOTE_STREAMS,
@@ -1094,10 +1094,10 @@ class IBKRBroker(Broker):
                 self._quiet_cancel(parent.order)
                 return _rejected(
                     req,
-                    f"protective order rejected by IBKR ({reason}); entry cancelled",
+                    f"{PROTECTIVE_REJECTED} by IBKR ({reason}); entry cancelled",
                     broker_order_id=str(parent.order.orderId),
                 )
-            record.message = f"WARNING: protective order rejected by IBKR ({reason})"
+            record.message = f"WARNING: {PROTECTIVE_REJECTED} by IBKR ({reason})"
         return record
 
     def _quiet_cancel(self, order: Order) -> None:

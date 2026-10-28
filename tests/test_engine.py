@@ -3257,6 +3257,151 @@ async def test_an_exit_ibkr_no_longer_reports_frees_the_symbol(db, config) -> No
     assert "Exit of F not reported" in h.notes.titles()
 
 
+async def test_two_single_flat_reads_a_day_apart_never_fake_an_exit(db, config) -> None:
+    """Review finding: the unreported-exit timer ran from the first flat read the process
+    ever saw, so one empty positions read on Tuesday and another on Wednesday journaled
+    an estimated exit for shares still held, cancelled their stop and forgot them."""
+    tuesday = datetime(2026, 10, 20, 15, 0, tzinfo=UTC)  # 11:00 New York
+    h = await harness(
+        db, config, mode=Mode.PAPER, now=tuesday, flatten_stocks_before_close=False,
+        exits={"time_stop_minutes": 0},
+    )  # fmt: skip
+    await enter_f(h)
+    stops = h.broker.working("STK:F", "stop")
+    h.clock.advance(minutes=3)
+    await h.engine.monitor_tick()
+    read, empty = h.broker.positions, 0
+
+    async def positions():
+        nonlocal empty
+        if empty:
+            empty -= 1
+            return []
+        return await read()
+
+    h.broker.positions = positions
+    empty = 1  # one empty read on Tuesday (e.g. right after a gateway reconnect)
+    await h.engine.monitor_tick()
+    for _ in range(30):  # held for the rest of the day and overnight
+        h.clock.advance(minutes=30)
+        await h.engine.monitor_tick()
+    h.clock.t = datetime(2026, 10, 21, 14, 0, tzinfo=UTC)  # Wednesday 10:00 New York
+    await h.engine.monitor_tick()
+    empty = 1  # and one on Wednesday
+    await h.engine.monitor_tick()
+    assert db.get_position_meta("STK:F") is not None
+    assert h.broker.working("STK:F", "stop") == stops
+    assert db.list_trades() == []
+
+
+async def test_no_entry_once_the_price_fell_through_its_stop(db, config) -> None:
+    """Review finding: while Claude thought, the price fell through the stop but stayed
+    within the 1% collar. The BUY still went out, filled, and its bracket stop (already
+    above the bid) sold it at once."""
+    h = await harness(db, config)
+    h.scanner.candidates["STK:F"] = [cand(price=10.0, stop=9.93, target=10.20)]
+
+    async def drop(ctx: DecisionContext) -> None:
+        h.clock.advance(seconds=90)
+        h.broker.set_price("F", 9.92)  # bid 9.91, ask 9.93: below the stop at 9.95
+
+    maker = SlowMaker(drop)
+    maker.decisions = [buy(limit_price=10.01, stop_loss=9.95, take_profit=10.20)]
+    h.engine._decider = maker
+    await h.engine.run_cycle()
+    assert not [r for r in h.broker.placed if r.side == Side.BUY]
+    assert h.broker.fills == []
+
+
+async def test_an_approved_entry_whose_stop_the_price_fell_through_is_blocked(db, config) -> None:
+    h = await harness(db, config, autopilot=False)
+    h.scanner.candidates["STK:F"] = [cand(price=10.0, stop=9.95, target=10.20)]
+    h.decider.decisions = [buy()]  # limit = the ask, 10.01
+    await h.engine.run_cycle()
+    [pending] = h.orders(OrderStatus.PENDING_APPROVAL)
+    h.clock.advance(minutes=3)
+    h.broker.set_price("F", 9.92)
+    await h.engine.monitor_tick()
+    rec = await h.engine.approve_order(pending.id)
+    assert rec.status == OrderStatus.BLOCKED and "at/above the market" in (rec.message or "")
+    assert h.broker.fills == []
+
+
+async def test_open_positions_of_today_count_against_day_trades_left(db, config) -> None:
+    """Review finding: with one day trade left the bot opened F and then T while F was
+    still open. The flatten before the close sold both: two day trades with one left."""
+    h = await harness(db, config)
+    h.broker.day_trades = 1
+    await h.engine.run_cycle()
+    assert "STK:F" in h.broker.pos
+    h.scanner.candidates = {"STK:T": [cand("T", price=20.0, stop=19.8, target=20.6)]}
+    h.decider.decisions = [buy("T")]
+    h.clock.advance(minutes=5)
+    await h.engine.run_cycle()
+    assert "STK:T" not in h.broker.pos
+
+
+async def test_a_second_buy_in_one_answer_is_not_squeezed_by_the_first(db, config) -> None:
+    """Review finding: the first BUY of a batch filled at once and was counted twice, as a
+    position and as a working buy, so the second BUY sized to 0 shares."""
+    h = await harness(db, config)
+    h.scanner.candidates = {
+        "STK:F": [cand()],
+        "STK:T": [cand("T", price=20.0, stop=19.8, target=20.6)],
+    }
+    h.decider.decisions = [buy("F"), buy("T")]
+    await h.engine.run_cycle()
+    assert "STK:F" in h.broker.pos and "STK:T" in h.broker.pos
+
+
+async def test_a_refused_bracket_stop_alerts_and_is_placed_again(db, config) -> None:
+    """Review finding: IBKR refused the bracket stop after the entry filled. The owner got
+    the usual "BUY" alert naming a stop that did not exist, and nothing re-placed it."""
+    from ib_async import Trade
+
+    from tests.test_ibkr import NOW as IB_NOW
+    from tests.test_ibkr import av, connected_broker, log_error, stock
+    from tests.test_ibkr import hold as hold_ib
+
+    broker, fake = await connected_broker(ib_market_data_type=1)
+    fake.summary = [
+        av("NetLiquidation", "10000"),
+        av("TotalCashValue", "10000"),
+        av("BuyingPower", "10000"),
+    ]
+    fake.ticker_values[stock().conId] = {"bid": 100.0, "ask": 100.02, "last": 100.01}
+    settings = BotSettings(
+        stock_universe=["AAPL"], trade_crypto=False, autopilot=True,
+        risk=RiskLimits(max_order_notional_usd=1000),
+    )  # fmt: skip
+    db.save_settings(settings)
+    scanner = FakeScanner(settings)
+    scanner.candidates["STK:AAPL"] = [cand("AAPL", price=100.01, stop=99.5, target=101.5)]
+    maker = FakeDecisionMaker()
+    maker.decisions = [buy("AAPL")]
+    notes, clock = RecordingNotifier(), FakeClock(IB_NOW)
+    engine = Engine(config, db, broker, maker, notifier=notes, clock=clock, scanner=scanner)
+
+    def fill_parent_refuse_stop(trade: Trade) -> None:
+        if trade.order.orderType == "STP" and trade.order.parentId:
+            trade.orderStatus.status = "Inactive"
+            log_error(trade, 201, "Order rejected - reason: stop price invalid")
+            parent = fake.trade_list[0]
+            parent.orderStatus.status = "Filled"
+            parent.orderStatus.filled = parent.order.totalQuantity
+            hold_ib(fake, stock(), parent.order.totalQuantity, 100.02)
+
+    fake.on_place = fill_parent_refuse_stop
+    await engine.run_cycle()
+    fake.on_place = None
+    assert "Unprotected AAPL" in notes.titles() and "BUY AAPL" not in notes.titles()
+    clock.advance(seconds=15)
+    await engine.monitor_tick()
+    assert [
+        (t.order.action, t.order.auxPrice) for t in fake.openTrades() if t.order.orderType == "STP"
+    ] == [("SELL", 99.5)]
+
+
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:
     h = await harness(db, config)
     h.broker.standalone_stops = False

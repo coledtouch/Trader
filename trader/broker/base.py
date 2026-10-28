@@ -29,6 +29,10 @@ from trader.models import (
 logger = logging.getLogger(__name__)
 
 
+# In an accepted entry's message: the parent filled but the broker refused its bracket stop.
+PROTECTIVE_REJECTED = "protective order rejected"
+
+
 class BrokerError(Exception):
     """Raised for broker failures the engine should log and survive (not crash on)."""
 

@@ -868,14 +868,23 @@ Contracts changed by the confirmed review findings (each has a regression test).
   holds shares, last filled on an earlier day, gets its exit journaled at an estimate (the
   stop, else the entry price; exit reason "closed at broker (fill not reported; price
   estimated)"), dated just after that fill, and the owner is told to check the real price.
-  Otherwise its meta would block entries in the symbol for good.
+  Otherwise its meta would block entries in the symbol for good. The flat reads must be
+  consecutive (a held read restarts the wait), and positions are read once more right
+  before acting.
+- **Entry levels** (ENG-9): an entry is blocked when its stop is at or above the current
+  bid (the price fell through it since the decision, or while it waited for approval).
+  An entry the broker accepted whose bracket stop it refused alerts "Unprotected X" and
+  arms re-protect. In a batch, an entry already filled counts as its position only, not
+  also as a working buy.
 - **IBKR 1101** (BRK-1): `connected` is False and data/order calls raise `BrokerError` until
   `connect()` has disconnected and reconnected (re-running ib_async's startup syncs);
   1102 needs no reconnect.
 - **PDT lag** (BRK-2): `Engine._with_day_trades` lowers a reported
   `day_trades_remaining` by the bot's same-day stock round trips whose closing fill is
-  younger than `PDT_REFRESH` (5 min), for the decision context, autopilot BUYs and
-  approvals.
+  younger than `PDT_REFRESH` (5 min), and by the bot's stock positions opened today and
+  still open (entries still working included): each becomes a day trade when sold the same
+  day, at the latest by the flatten before the close. For the decision context, autopilot
+  BUYs and approvals.
 - **Simulator inside-spread limits** (BRK-3): `_Order.inside_spread` (see 5.9).
 - **Delayed data** (BRK-4): `IBKRBroker.data_delayed` is True only for market data types
   3/4; 10167 marks that instrument's quotes `delayed` (no contract: every current

@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
-from trader.broker.base import Broker, BrokerError, PartialFlattenError
+from trader.broker.base import PROTECTIVE_REJECTED, Broker, BrokerError, PartialFlattenError
 from trader.config import AppConfig
 from trader.db import EQUITY_SINCE_KEY, Database
 from trader.models import (
@@ -1602,10 +1602,25 @@ class Engine:
         remaining = account.day_trades_remaining
         if remaining is None:
             return account
-        recent = self._recent_day_trades(now)
-        if recent <= 0:
+        used = self._recent_day_trades(now) + self._open_day_trades(now)
+        if used <= 0:
             return account
-        return account.model_copy(update={"day_trades_remaining": max(0, remaining - recent)})
+        return account.model_copy(update={"day_trades_remaining": max(0, remaining - used)})
+
+    def _open_day_trades(self, now: datetime) -> int:
+        """Bot stock positions opened today and not closed yet, entries still working
+        included (their meta is written before the order is sent): each becomes a day
+        trade when it is sold today, at the latest by the flatten before the close, but
+        IBKR counts it only then. Counted now, so one more entry cannot be the day trade
+        that flags the account."""
+        today = trading_day(now)
+        return sum(
+            1
+            for key, meta in self.db.all_position_meta().items()
+            if key.startswith(f"{AssetClass.STOCK.value}:")
+            and meta.get("opened_at") is not None
+            and trading_day(_aware(meta["opened_at"])) == today
+        )
 
     def _recent_day_trades(self, now: datetime) -> int:
         """Stock exit orders (by order id) filled within PDT_REFRESH that closed shares
@@ -2645,6 +2660,10 @@ class Engine:
         last = max(fills, key=lambda f: _aware(f.ts))
         if _aware(last.ts) >= trading_day_start(trading_day(now)):
             return False  # today's executions would still report the exit: wait for it
+        # Acting on a false flat read would cancel the stop of a held position: read again.
+        if any(p.instrument.key == key and p.qty > 0 for p in await self.broker.positions()):
+            self._mismatch_logged.pop(key, None)
+            return False
         qty = self._open_qty.get(key, 0.0)
         price = meta.get("stop_loss") or meta.get("entry_price") or last.price
         exit_fill = Fill(
@@ -2684,6 +2703,7 @@ class Engine:
             # the bot's (they may be the owner's buy since, which the fills journal counts).
             sold = sold_by_watchdog(self.db, key, meta)
             if (key in held and not sold) or key in buying or key in self._pending_trades:
+                self._mismatch_logged.pop(key, None)  # flat reads must be consecutive
                 continue
             opened = meta.get("opened_at")
             last_exit = self._last_exit_for(key)
@@ -3216,7 +3236,7 @@ class Engine:
             self._track_halt(key, quote, send_now)
             account = self._with_day_trades(await self.broker.account(), send_now)
             positions = await self.broker.positions()
-            open_orders = self._merge_orders(await self.broker.open_orders(), placed)
+            open_orders = self._merge_orders(await self.broker.open_orders(), placed, positions)
             day = self._today(send_now)
             entry = decision.limit_price or quote.ask or quote.last
             if not entry or not math.isfinite(entry) or entry <= 0:
@@ -3317,11 +3337,20 @@ class Engine:
             return _BuyOutcome(cand.setup, True, order_id)
 
     @staticmethod
-    def _merge_orders(fresh: list[OrderRecord], placed: list[OrderRecord]) -> list[OrderRecord]:
+    def _merge_orders(
+        fresh: list[OrderRecord], placed: list[OrderRecord], positions: list[Position]
+    ) -> list[OrderRecord]:
         """The broker's working orders plus entries sent earlier in this batch that it does
-        not list (yet), without counting one order twice."""
+        not list (yet), without counting one order twice: one whose instrument is held has
+        filled (a BUY never adds to a position), and the position already counts it."""
         known = {o.broker_order_id for o in fresh if o.broker_order_id}
-        extra = [o for o in placed if not o.broker_order_id or o.broker_order_id not in known]
+        held = {p.instrument.key for p in positions if p.qty > 0}
+        extra = [
+            o
+            for o in placed
+            if (not o.broker_order_id or o.broker_order_id not in known)
+            and o.request.instrument.key not in held
+        ]
         return fresh + extra
 
     async def _send_entry(self, order: OrderRequest, now: datetime) -> OrderRecord:
@@ -3378,6 +3407,19 @@ class Engine:
             target_text,
             placed.status.value,
         )
+        if PROTECTIVE_REJECTED in (placed.message or ""):
+            # The entry filled but the broker refused its stop: the next monitor pass
+            # re-places it (or alerts that it cannot); the backup stop watches meanwhile.
+            self._reprotect_pending = True
+            await self._notify(
+                f"Unprotected {order.instrument.symbol}",
+                f"Bought {order.qty:g} @ {entry:g}, but the broker refused its stop at "
+                f"{stop:g} ({_short(placed.message or '')}). Re-placing it; the engine's "
+                "backup stop watches it meanwhile.",
+                priority="high",
+                tags=["warning"],
+            )
+            return placed
         await self._notify(
             f"BUY {order.instrument.symbol}",
             f"{order.qty:g} @ {entry:g}, stop {stop:g}, target {target_text}",

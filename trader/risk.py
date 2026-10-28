@@ -458,6 +458,14 @@ class RiskManager:
             reasons.append(f"target {target:g} must be above the entry {entry:g}")
         else:
             levels_ok = True
+            # The price may have fallen through the stop since the decision (or while the
+            # entry waited for approval): bought now, it would be stopped out at once.
+            bid = quote.bid if quote is not None and quote.bid and quote.bid > 0 else ref
+            if bid is not None and _finite_positive(bid) and stop >= bid:
+                reasons.append(
+                    f"stop {stop:g} is at/above the market {bid:g}: the setup broke since "
+                    "the decision"
+                )
             rr = (target - entry) / (entry - stop)
             if rr < lim.min_reward_risk - RR_TOLERANCE:
                 reasons.append(f"reward:risk {rr:.2f} < {lim.min_reward_risk:.2f}")
