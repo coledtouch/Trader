@@ -896,15 +896,18 @@ class Engine:
                     await self.broker.connect()
                 records = await self.broker.flatten_all(KILL_REASON)  # cancels everything
         except Exception as exc:
-            for rec in getattr(exc, "records", []):  # sent before another position failed
+            sent = getattr(exc, "records", [])
+            for rec in sent:  # sent before another position failed
                 self._journal_order(rec, now)
                 key = rec.request.instrument.key
                 self._note_close(key, rec, seqs.get(key))
+            refused = _refused_exits(sent)
+            text = f"the broker refused to close {refused}; {exc}" if refused else str(exc)
             log.exception("kill switch could not finish")
-            self._set_error("kill", f"kill switch failed: {exc}")
+            self._set_error("kill", f"kill switch failed: {text}")
             await self._notify(
                 "KILL switch FAILED",
-                f"Could not cancel/close everything: {_short(str(exc))}. Check the broker now.",
+                f"Could not cancel/close everything: {_short(text)}. Check the broker now.",
                 priority="urgent",
                 tags=["rotating_light"],
             )
@@ -1810,6 +1813,11 @@ class Engine:
                     self._journal_order(rec, now)
                     key = rec.request.instrument.key
                     self._note_close(key, rec, seqs.get(key))
+                refused = _refused_exits(exc.records)
+                if refused:  # the alert must name these too
+                    raise PartialFlattenError(
+                        f"the broker refused to close {refused}; {exc}", exc.records
+                    ) from exc
                 raise
         for rec in records:
             self._journal_order(rec, now)
@@ -1827,24 +1835,33 @@ class Engine:
         positions_meta). Positions the owner holds on the live account are never touched."""
         metas = self.db.all_position_meta()
         records: list[OrderRecord] = []
-        async with self._entry_lock:
-            for pos in list(self._positions):
-                key = pos.instrument.key
-                if pos.qty <= 0 or key not in metas:
-                    continue
-                seq = self._mark_closing(key, reason, now)
-                rec = await self.broker.close_position(pos.instrument, reason=reason)
-                self._note_close(key, rec, seq)
-                if rec is not None:
-                    records.append(rec)
-        for rec in records:
-            self._journal_order(rec, now)
+        failed: list[str] = []
+        try:
+            async with self._entry_lock:
+                for pos in list(self._positions):
+                    key = pos.instrument.key
+                    if pos.qty <= 0 or key not in metas:
+                        continue
+                    seq = self._mark_closing(key, reason, now)
+                    # One failure must not leave the other positions unsold (as flatten_all).
+                    try:
+                        rec = await self.broker.close_position(pos.instrument, reason=reason)
+                    except BrokerError as exc:  # close_position put the stop back
+                        failed.append(f"{pos.instrument.symbol}: {exc}")
+                        continue
+                    self._note_close(key, rec, seq)
+                    if rec is not None:
+                        records.append(rec)
+        finally:
+            for rec in records:  # what was sent is journaled even if a later close failed
+                self._journal_order(rec, now)
         self.db.audit(
             "flatten", {"reason": reason, "orders": len(records), "scope": "bot"}, actor="engine"
         )
         refused = _refused_exits(records)
-        if refused:
-            raise BrokerError(f"the broker refused to close {refused}")
+        problems = ([f"the broker refused to close {refused}"] if refused else []) + failed
+        if problems:
+            raise BrokerError("; ".join(problems))
         self._clear_error("flatten")
         return records
 

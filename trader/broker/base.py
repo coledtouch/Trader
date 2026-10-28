@@ -202,24 +202,34 @@ class Broker(ABC):
             working = await self.open_orders()
         except BrokerError:
             # A stop may already be cancelled (here, or by flatten_all's cancel_all): never
-            # leave a held position without it.
+            # leave a held position without it, unless another close of this app is
+            # selling it meanwhile (a stop next to that sell could sell the shares twice).
             if stops and pos is not None and pos.qty > 0:
-                await self._put_stop_back(req, max(stops))
+                try:
+                    selling = self._own_market_sell(await self.open_orders(), instrument)
+                except BrokerError:
+                    selling = False
+                if not selling:
+                    await self._put_stop_back(req, max(stops))
             raise
         # Another close of this app (a monitor exit, KILL, an approved close) may have sent
         # its market sell while this one was cancelling: never send a second one (a short).
-        # Only this client's orders count: another client's (TWS, IBKR Mobile) may be listed
-        # as a market sell without being one (MIT, LOC, a %-trailing stop, ...).
-        if any(
-            order.request.instrument.key == instrument.key
-            and order.request.side == Side.SELL
-            and order.request.order_type == OrderType.MARKET
-            and order.request.stop_loss is None
-            and order.status in OPEN_ORDER_STATUSES
-            and self.can_cancel(order)
-            for order in working
-        ):
+        if self._own_market_sell(working, instrument):
             return None
+        # A stop another close put back after this one's cancels (its own check failed)
+        # would sit next to this sell: cancel it first, and keep it for a REJECTED sell.
+        for order in working:
+            other = order.request
+            if (
+                other.instrument.key == instrument.key
+                and other.side == Side.SELL
+                and other.stop_loss is not None
+                and order.status in OPEN_ORDER_STATUSES
+                and order.broker_order_id
+                and self.can_cancel(order)
+            ):
+                await self.cancel_order(order.broker_order_id)
+                stops.append(other.stop_loss)
         record = await self.place_order(req)
         if (
             record.status == OrderStatus.REJECTED
@@ -268,6 +278,20 @@ class Broker(ABC):
         if errors:
             raise PartialFlattenError("; ".join(errors), results)
         return results
+
+    def _own_market_sell(self, orders: list[OrderRecord], instrument: Instrument) -> bool:
+        """A market sell of this app's for the instrument is working. Only this client's
+        orders count: another client's (TWS, IBKR Mobile) may be listed as a market sell
+        without being one (MIT, LOC, a %-trailing stop, ...)."""
+        return any(
+            order.request.instrument.key == instrument.key
+            and order.request.side == Side.SELL
+            and order.request.order_type == OrderType.MARKET
+            and order.request.stop_loss is None
+            and order.status in OPEN_ORDER_STATUSES
+            and self.can_cancel(order)
+            for order in orders
+        )
 
     async def _put_stop_back(self, req: OrderRequest, stop: float) -> None:
         """Best effort: re-place a protective stop a failed close had already removed."""

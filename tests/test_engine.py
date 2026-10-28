@@ -1603,6 +1603,106 @@ async def test_kill_that_fails_on_one_position_still_closes_and_journals_the_res
     assert "STK:T" in journaled
 
 
+async def test_a_failed_check_puts_no_stop_next_to_a_kill_sell(db, config) -> None:
+    """Review finding: a monitor exit's last check failed after KILL had sent its market
+    sell; putting the stop back left a stop and a market sell on one position."""
+    h = await _resting(db, config)
+    h.engine.settings.exits.time_stop_minutes = 0
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.broker.rest = {"STK:F"}
+    gate, entered = _slow_first_cancel(h)
+    monitor = asyncio.create_task(
+        h.engine._engine_close(Instrument(symbol="F"), "time stop", h.clock())
+    )
+    await entered.wait()
+    await h.engine.kill()
+    h.broker.fail_open_orders_on = {h.broker.open_orders_calls + 1}  # its last check
+    gate.set()
+    with pytest.raises(BrokerError):
+        await monitor
+    assert len(_working_market_sells(h, "STK:F")) == 1
+    assert h.broker.working("STK:F", "stop") == []
+
+
+async def test_a_close_cancels_a_stop_put_back_after_its_own_cancels(db, config) -> None:
+    """The other ordering: a concurrent close put its stop back between this close's
+    cancels and its last check; this close's market sell must not sit next to it."""
+    h = await _resting(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.broker.rest = {"STK:F"}
+    real = h.broker.open_orders
+    calls = 0
+
+    async def stop_put_back_before_the_last_check():
+        nonlocal calls
+        calls += 1
+        if calls == 2:  # the last check: another close has just re-placed its stop
+            stop = OrderRequest(
+                instrument=Instrument(symbol="F"),
+                side=Side.SELL,
+                qty=24,
+                order_type=OrderType.MARKET,
+                stop_loss=9.8,
+                is_exit=True,
+                reason="protective stop (exit check failed)",
+            )
+            await h.broker.place_order(stop)
+        return await real()
+
+    h.broker.open_orders = stop_put_back_before_the_last_check
+    rec = await h.broker.close_position(Instrument(symbol="F"), "time stop")
+    assert rec is not None and rec.status == OrderStatus.SUBMITTED
+    assert h.broker.working("STK:F", "stop") == []
+    assert len(_working_market_sells(h, "STK:F")) == 1
+
+
+async def test_shadow_loss_flatten_carries_on_and_journals_what_it_sent(db, tmp_path) -> None:
+    """Review finding: the shadow-mode flatten stopped at the first failed close and never
+    journaled the sells it had already sent."""
+    h = await disarmed_with_bot_position(db, tmp_path)
+    h.broker.pos["STK:T"] = [5.0, 20.0]
+    db.set_position_meta(
+        "STK:T", stop_loss=19.0, take_profit=None, entry_price=20.0, initial_risk=5.0,
+        opened_at=h.clock(), decision_id=None, setup=None,
+    )  # fmt: skip
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    real = h.broker.open_orders
+    calls = 0
+
+    async def fails_on_the_first_close():
+        nonlocal calls
+        calls += 1
+        if calls == 1:  # the first position's first read
+            raise BrokerError("IBKR open orders timed out after 10s")
+        return await real()
+
+    h.broker.open_orders = fails_on_the_first_close
+    before = {o.id for o in h.orders()}
+    with pytest.raises(BrokerError, match="timed out"):
+        await h.engine._flatten_engine_positions("daily loss limit", h.clock())
+    new = [o for o in h.orders() if o.id not in before and o.request.side == Side.SELL]
+    assert len(new) == 1  # the second position was still closed and journaled
+    assert len(h.broker.pos) == 1  # the failed one is still held
+
+
+async def test_partial_kill_alert_names_the_refused_positions(db, config) -> None:
+    """Review finding: the alert for a partly failed KILL only named the failure, not the
+    positions the broker refused to close (left unsold, maybe without a stop)."""
+    h = await _resting(db, config)
+    await enter_f(h)
+    h.broker.pos["STK:T"] = [10.0, 20.0]
+    await h.engine.monitor_tick()
+    h.broker.reject_exits = True
+    h.broker.open_orders_calls = 0
+    h.broker.fail_open_orders_on = {5}  # F: #2, #3 (sell refused); T: #4, #5 times out
+    await h.engine.kill()
+    [(_, body, _)] = [n for n in h.notes.sent if n[0] == "KILL switch FAILED"]
+    assert "refused to close F" in body and "T:" in body
+
+
 async def test_manual_close_refusals(db, config) -> None:
     h = await harness(db, config)
     with pytest.raises(LookupError, match="no open F position"):
