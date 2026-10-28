@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -1343,6 +1344,148 @@ async def test_a_close_that_was_taken_still_blocks_a_second_one(db, config) -> N
     h.broker.pos["STK:F"] = [24.0, 10.01]  # the sell has not filled yet
     with pytest.raises(ValueError, match="already being closed"):
         await h.engine.close_position("STK:F")
+
+
+class RestingBroker(FakeBroker):
+    """Market sells for `rest` keys are accepted but do not fill yet (a halted stock, an
+    order IBKR has not filled), with scripted open_orders failures and a gate that parks
+    one close_position call and then fails it (a request timeout)."""
+
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        self.rest: set[str] = set()
+        self.open_orders_calls = 0
+        self.fail_open_orders_on: set[int] = set()
+        self.gate: asyncio.Event | None = None
+        self.gate_key: str | None = None
+        self.gate_entered = asyncio.Event()
+
+    async def place_order(self, req: OrderRequest) -> OrderRecord:
+        key = req.instrument.key
+        if (
+            req.side == Side.SELL
+            and req.order_type == OrderType.MARKET
+            and req.stop_loss is None
+            and key in self.rest
+            and req.qty <= self.pos.get(key, [0.0, 0.0])[0] + 1e-9
+            and not self.reject_exits
+        ):
+            self._require()
+            self.placed.append(req)
+            oid = f"O{next(self._ids)}"
+            self.orders[oid] = OrderRecord(
+                request=req, status=OrderStatus.SUBMITTED, broker_order_id=oid
+            )
+            self.kind[oid], self.parent[oid] = "rest", None
+            return self.orders[oid].model_copy()
+        return await super().place_order(req)
+
+    async def open_orders(self):
+        self.open_orders_calls += 1
+        if self.open_orders_calls in self.fail_open_orders_on:
+            raise BrokerError("IBKR open orders timed out after 10s")
+        return await super().open_orders()
+
+    async def close_position(self, instrument, reason="", **kw):
+        if self.gate is not None and instrument.key == self.gate_key:
+            gate, self.gate = self.gate, None
+            self.gate_entered.set()
+            await gate.wait()
+            raise BrokerError("IBKR open orders timed out after 10s")
+        return await super().close_position(instrument, reason, **kw)
+
+
+async def _resting(db, config) -> H:
+    h = await harness(db, config)
+    broker = RestingBroker(h.clock)
+    broker.quotes = h.broker.quotes
+    await broker.connect()
+    h.engine.broker = broker
+    h.broker = broker
+    return h
+
+
+def _market_sells(h: H, key: str) -> list[OrderRequest]:
+    return [
+        r
+        for r in h.broker.placed
+        if r.instrument.key == key
+        and r.side == Side.SELL
+        and r.order_type == OrderType.MARKET
+        and r.stop_loss is None
+    ]
+
+
+async def _second_close_is_refused(h: H) -> None:
+    h.clock.advance(seconds=5)
+    with pytest.raises(ValueError, match="already being closed"):
+        await h.engine.close_position("STK:F")
+    assert len(_market_sells(h, "STK:F")) == 1
+
+
+@pytest.mark.parametrize("via", ["kill", "loss_flatten"])
+async def test_a_flatten_that_fails_partway_keeps_its_sent_sell_in_flight(db, config, via) -> None:
+    """Review finding: flatten_all sent F's sell, then failed on T; every position was
+    marked refused, so Close sent a second sell for F while the first was working."""
+    h = await _resting(db, config)
+    await enter_f(h)
+    h.broker.pos["STK:T"] = [10.0, 20.0]
+    await h.engine.monitor_tick()
+    h.broker.rest = {"STK:F", "STK:T"}
+    h.broker.open_orders_calls = 0
+    h.broker.fail_open_orders_on = {3}  # flatten_all: #1 cancel-all, #2 F, #3 T times out
+    if via == "kill":
+        await h.engine.kill()
+        assert "KILL switch FAILED" in h.notes.titles()
+    else:
+        with pytest.raises(BrokerError):
+            await h.engine._flatten_all("daily loss limit", h.clock())
+    assert len(_market_sells(h, "STK:F")) == 1
+    await _second_close_is_refused(h)
+
+
+async def test_an_older_close_failing_after_a_newer_one_sent_is_ignored(db, config) -> None:
+    """Review finding: a monitor exit failed after KILL had stamped F and sent its sell;
+    the stale failure marked F refused while the kill's sell was working."""
+    h = await _resting(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.broker.rest = {"STK:F"}
+    gate = asyncio.Event()
+    h.broker.gate, h.broker.gate_key = gate, "STK:F"
+    monitor = asyncio.create_task(
+        h.engine._engine_close(Instrument(symbol="F"), "time stop", h.clock())
+    )
+    await h.broker.gate_entered.wait()
+    await h.engine.kill()
+    gate.set()  # the monitor's broker call now fails
+    with pytest.raises(BrokerError):
+        await monitor
+    assert "STK:F" not in h.engine._close_refused
+    await _second_close_is_refused(h)
+
+
+async def test_an_ai_close_failing_after_the_kill_stamped_is_ignored(db, config) -> None:
+    h = await _resting(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.clock.advance(minutes=5)
+    h.decider.decisions = [
+        hold("F").model_copy(update={"action": TradeAction.CLOSE, "rationale": "fading"})
+    ]
+    h.broker.rest = {"STK:F"}
+    gate = asyncio.Event()
+    h.broker.gate, h.broker.gate_key = gate, "STK:F"
+    cycle = asyncio.create_task(h.engine.run_cycle())
+    await h.broker.gate_entered.wait()  # the AI close holds the entry lock
+    kill = asyncio.create_task(h.engine.kill())
+    await asyncio.sleep(0)  # kill stamps F and waits for the lock
+    gate.set()
+    with contextlib.suppress(BrokerError):
+        await cycle
+    await kill
+    assert len(_market_sells(h, "STK:F")) == 1
+    await _second_close_is_refused(h)
 
 
 async def test_manual_close_refusals(db, config) -> None:
