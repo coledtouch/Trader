@@ -257,6 +257,7 @@
     'invalid CSRF token': 'The security token expired. Reload the page.',
     'origin not allowed': 'Request blocked: it did not come from this site.',
     'too many failed attempts': 'Too many failed attempts. Wait a few minutes and try again.',
+    'position_close failed': 'The broker did not take the sell.',
   };
 
   function locPath(loc) {
@@ -946,7 +947,60 @@
       { label: 'Stop', num: true, value: (p) => price(p.stop_loss) },
       { label: 'Target', num: true, value: (p) => price(p.take_profit) },
       { label: 'Opened', value: (p) => when(p.opened_at) },
+      { label: 'Action', value: (p) => closeButton(p) },
     ], positions));
+  }
+
+  function closeButton(position) {
+    const inst = position.instrument || {};
+    const button = el('button', {
+      class: 'btn btn-danger btn-sm', type: 'button', text: 'Close',
+      'aria-label': `Close the ${inst.symbol || ''} position`,
+    });
+    button.addEventListener('click', () => openClose(position));
+    return button;
+  }
+
+  function openClose(position) {
+    const dialog = $('close-dialog');
+    if (dialog.open) return;
+    const inst = position.instrument || {};
+    state.closing = { key: `${inst.asset_class}:${inst.symbol}`, symbol: inst.symbol };
+    setText($('close-title'), `Close ${inst.symbol}?`);
+    setText($('close-what'), `Sell all ${qty(position.qty)} ${inst.symbol} at market now?`);
+    // Positions the bot opened carry its entry time; the owner's own do not.
+    $('close-owner').hidden = Boolean(position.opened_at);
+    setText($('close-confirm'), `Sell ${inst.symbol}`);
+    $('close-error').textContent = '';
+    dialog.showModal();
+    $('close-cancel').focus();
+  }
+
+  async function confirmClose(event) {
+    event.preventDefault();
+    const target = state.closing;
+    if (!target) return;
+    const button = $('close-confirm');
+    await busy(button, async () => {
+      $('close-error').textContent = '';
+      try {
+        const result = await api('POST', '/api/positions/close', { instrument: target.key });
+        if (result && result.status) mergeStatus(result.status);
+        $('close-dialog').close();
+        toast(`Selling ${target.symbol} at market. The bot will not buy it again today.`);
+      } catch (err) {
+        const reason = String(err.message || '').replace(/\.$/, '');
+        // 409: refused before anything was sent (market closed, already closing, no position).
+        let message = err.status === 409 ? `Not closed: ${reason}.` : `Not closed: ${reason}. Check your IBKR account.`;
+        if (err.fatal) message = `Not sent: ${reason}.`;
+        else if (err.status === 0) {
+          message = `${err.message} The sell may still go through: check the positions before trying again.`;
+        }
+        $('close-error').textContent = message;
+      } finally {
+        refreshStatus();
+      }
+    });
   }
 
   function renderOpenOrders(orders) {
@@ -2770,6 +2824,11 @@
     $('kill-cancel').addEventListener('click', () => $('kill-dialog').close());
     $('kill-dialog').addEventListener('cancel', (event) => {
       if (isBusy($('kill-confirm'))) event.preventDefault(); // let a running kill finish
+    });
+    $('close-form').addEventListener('submit', confirmClose);
+    $('close-cancel').addEventListener('click', () => $('close-dialog').close());
+    $('close-dialog').addEventListener('cancel', (event) => {
+      if (isBusy($('close-confirm'))) event.preventDefault(); // let a running close finish
     });
     $('startstop-btn').addEventListener('click', toggleBot);
     $('cycle-btn').addEventListener('click', runCycle);

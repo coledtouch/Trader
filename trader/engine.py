@@ -151,6 +151,7 @@ EXTRA_PREFIX = "position_extra:"
 BASELINE_PREFIX = "halt_baseline:"
 ACCOUNT_KEY = "broker_account"  # kv: the broker account id the journal belongs to
 SENT_PREFIX = "order_sent:"  # kv: when an approved order was actually sent (order id)
+OWNER_CLOSED_PREFIX = "owner_closed:"  # kv: trading day the owner closed this instrument
 # Engine-side stops/targets/time stops and the daily halts fire only when the breach is
 # seen on this many consecutive monitor ticks (one bad tick never sells or flattens).
 # Broker-native stops are not affected.
@@ -930,6 +931,73 @@ class Engine:
         log.warning("trading resumed by %s (was: %s)", actor, previous)
         await self._notify("Trading resumed", f"Halt cleared by {actor} (was: {previous}).")
 
+    async def close_position(self, key: str, actor: str = "owner") -> OrderRecord:
+        """Sell one position at market on the owner's request (the dashboard's Close button).
+        Its working orders at the broker (bracket stop and target) are cancelled first, and
+        the stop is put back if the broker refuses the sell (Broker.close_position). Like
+        KILL it also works in shadow mode, while halted and on positions the owner opened:
+        the owner asked for it. Raises LookupError (no such position), ValueError (market
+        closed, already closing) or BrokerError (not sent, or refused)."""
+        try:
+            inst = Instrument.from_key(key)
+        except ValueError:
+            raise LookupError(f"unknown instrument {key!r}") from None
+        now = self._now()
+        if inst.asset_class == AssetClass.STOCK and not stock_market_open(now):
+            raise ValueError(
+                f"the stock market is closed: close {inst.symbol} in IBKR, or after the open"
+            )
+        reason = f"closed by the {actor}"
+        async with self._entry_lock:  # no entry or second close can interleave
+            if self._closing_now(key, now):
+                raise ValueError(f"{inst.symbol} is already being closed")
+            if not self.broker.connected:
+                raise BrokerError("not connected to the broker")
+            held = next(
+                (p for p in await self.broker.positions() if p.instrument.key == key and p.qty > 0),
+                None,
+            )
+            if held is None:
+                raise LookupError(f"no open {inst.symbol} position")
+            self._closing[key] = now
+            self._close_reasons[key] = reason
+            self._cancel_pending(f"cancelled: {reason}", key=key)
+            try:
+                rec = await self.broker.close_position(held.instrument, reason=reason)
+            except BaseException:
+                self._closing.pop(key, None)  # not sent: the monitor manages it again
+                self._close_reasons.pop(key, None)
+                raise
+        if rec is None:  # sold in between (a stop or target filled)
+            self._closing.pop(key, None)
+            self._close_reasons.pop(key, None)
+            raise LookupError(f"no open {inst.symbol} position")
+        self._journal_order(rec, now)
+        refused = _refused_exits([rec])
+        if refused:
+            self._closing.pop(key, None)
+            self._close_reasons.pop(key, None)
+            log.error("close by %s: the broker refused to close %s", actor, refused)
+            await self._notify(
+                f"Close {inst.symbol} FAILED",
+                f"The broker refused the sell ({_short(refused)}). The stop was put back. "
+                "Check IBKR now.",
+                priority="high",
+                tags=["warning"],
+            )
+            raise BrokerError(f"the broker refused to close {refused}")
+        # The owner overrode the bot: no new entry in this symbol for the rest of the day.
+        self.db.set_kv(OWNER_CLOSED_PREFIX + key, trading_day(now))
+        log.warning("%s: %s at market (%g)", key, reason, held.qty)
+        await self._notify(
+            f"Closing {inst.symbol}",
+            f"Sold at market: {reason}. No new {inst.symbol} entries today.",
+        )
+        return rec
+
+    def _owner_closed_today(self, key: str, now: datetime) -> bool:
+        return self.db.get_kv(OWNER_CLOSED_PREFIX + key) == trading_day(now)
+
     async def arm_live(self, actor: str = "owner") -> None:
         """Allow real-money orders. The caller has already verified a fresh TOTP code."""
         if not self.config.allow_live:
@@ -1136,9 +1204,10 @@ class Engine:
             if now - _aware(rec.created_at) >= APPROVAL_TTL:
                 self._expire(rec)
 
-    def _cancel_pending(self, message: str) -> None:
+    def _cancel_pending(self, message: str, key: str | None = None) -> None:
+        """Cancel the orders waiting for approval (only those for `key` when given)."""
         for rec in self.db.list_orders(limit=200, statuses=[OrderStatus.PENDING_APPROVAL]):
-            if rec.id is not None:
+            if rec.id is not None and (key is None or rec.request.instrument.key == key):
                 self.db.update_order(rec.id, status=OrderStatus.CANCELLED, message=message)
                 self._revert_signal(rec.id, message)
 
@@ -2615,6 +2684,8 @@ class Engine:
             reasons.append("already waiting for approval")
         if self._halt_pending is not None:
             reasons.append(f"halt condition being confirmed: {self._halt_pending}")
+        if self._owner_closed_today(key, now):
+            reasons.append(f"you closed {cand.instrument.symbol} today")
         if self.db.get_position_meta(key) is not None and not any(
             p.instrument.key == key and p.qty > 0 for p in self._positions
         ):
@@ -2872,6 +2943,8 @@ class Engine:
         target = decision.take_profit or cand.suggested_target
         async with self._entry_lock:
             send_now = self._now()
+            if self._owner_closed_today(key, send_now):  # closed by hand while deciding
+                return _BuyOutcome(cand.setup, False, skip_reason="you closed it today")
             age = send_now - now
             if age > DECISION_MAX_AGE:
                 log.warning("BUY %s dropped: decided on data %.0fs old", key, age.total_seconds())

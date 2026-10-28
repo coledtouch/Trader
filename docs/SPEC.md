@@ -491,6 +491,7 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
 | POST | `/api/bot/start` | - | `EngineStatus` |
 | POST | `/api/bot/stop` | - | `EngineStatus` |
 | POST | `/api/bot/kill` | - | `EngineStatus` |
+| POST | `/api/positions/close` | `{"instrument": "STK:AXGN"}` | `{"order": OrderRecord, "status": EngineStatus}`; 409 no such position / market closed / already closing; 503 not sent or refused (no 2FA: a close only reduces risk) |
 | POST | `/api/bot/resume` | `{"totp"}` | `EngineStatus`; 403 step_up_required |
 | POST | `/api/bot/cycle` | - | `{"ok": true}` (runs one decision cycle in background) |
 | POST | `/api/live/arm` | `{"totp"}` | `EngineStatus`; 403 if not allowed / bad TOTP |

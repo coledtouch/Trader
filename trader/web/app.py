@@ -222,6 +222,10 @@ class SettingsBody(BaseModel):
     totp: str | None = Field(default=None, max_length=16)
 
 
+class CloseBody(BaseModel):
+    instrument: str = Field(pattern=r"^(STK|CRYPTO):[A-Za-z0-9.\-]{1,20}$")
+
+
 class ResearchBody(BaseModel):
     days: int = Field(default=30, ge=1, le=90)
 
@@ -975,6 +979,15 @@ def create_app(
         background.add_task(_manual_cycle, state(request).engine)
         audit(request, "bot_cycle")
         return {"ok": True}
+
+    @app.post("/api/positions/close")
+    async def position_close(
+        request: Request, body: CloseBody, session: Session = Depends(require_csrf)
+    ) -> Any:
+        # No 2FA step-up: like KILL, a close only reduces risk.
+        call = state(request).engine.close_position(body.instrument, actor="owner")
+        record = await call_engine(request, "position_close", call, {"instrument": body.instrument})
+        return {"order": _dump(record), "status": engine_status(request)}
 
     # ------------------------------------------------------------ live trading
     @app.post("/api/live/arm")

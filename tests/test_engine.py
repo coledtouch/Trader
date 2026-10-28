@@ -1225,6 +1225,109 @@ async def test_kill_switch_with_refused_exit_restores_the_stop_and_alerts(db, co
     assert rejected and "protective stop re-placed at 9.8" in rejected[0].message
 
 
+# =========================================================================== manual close
+async def test_owner_closes_one_position_and_the_bot_stays_out_today(db, config) -> None:
+    h = await harness(db, config)
+    await enter_f(h)
+    assert h.broker.working("STK:F", "stop") and h.broker.working("STK:F", "target")
+    rec = await h.engine.close_position("STK:F")
+    assert rec.request.side == Side.SELL and rec.request.is_exit
+    assert rec.request.reason == "closed by the owner"
+    assert h.broker.pos == {}
+    assert not h.broker.working("STK:F", "stop") and not h.broker.working("STK:F", "target")
+    sells = [o for o in h.orders() if o.request.side == Side.SELL]
+    assert [o.request.reason for o in sells] == ["closed by the owner"]
+    assert "Closing F" in h.notes.titles()
+    # The scanner still proposes F and the model still says BUY: no new entry today.
+    h.clock.advance(minutes=5)
+    batch = await h.engine.run_cycle()
+    assert batch is not None and "you closed F today" in batch.market_view
+    assert len([r for r in h.broker.placed if r.side == Side.BUY]) == 1
+    # Tomorrow the symbol is tradable again.
+    h.clock.advance(days=1)
+    await h.engine.run_cycle()
+    assert len([r for r in h.broker.placed if r.side == Side.BUY]) == 2
+
+
+async def test_buy_decided_before_a_manual_close_is_not_sent_after_it(db, config) -> None:
+    """Send-time check: F was flat when the models were asked; meanwhile F was bought
+    outside the bot and the owner closed it here. The BUY F decided on the older context
+    must not go out after the close."""
+    h = await harness(db, config)
+
+    async def owner_buys_and_closes(ctx: DecisionContext) -> None:
+        h.broker.pos["STK:F"] = [5.0, 10.0]
+        await h.engine.close_position("STK:F")
+
+    maker = SlowMaker(owner_buys_and_closes)
+    maker.decisions = [buy()]
+    h.engine._decider = maker
+    await h.engine.run_cycle()
+    assert maker.calls
+    assert not [r for r in h.broker.placed if r.side == Side.BUY]
+    assert "you closed it today" in [s.skip_reason for s in db.list_signals()]
+
+
+async def test_manual_close_refusals(db, config) -> None:
+    h = await harness(db, config)
+    with pytest.raises(LookupError, match="no open F position"):
+        await h.engine.close_position("STK:F")
+    with pytest.raises(LookupError, match="unknown instrument"):
+        await h.engine.close_position("nonsense")
+    await enter_f(h)
+    await h.engine.close_position("STK:F")
+    h.broker.pos["STK:F"] = [5.0, 10.0]  # bought back elsewhere a moment later
+    with pytest.raises(ValueError, match="already being closed"):
+        await h.engine.close_position("STK:F")  # a double click sells once
+    h.clock.advance(hours=7)  # 18:00 New York
+    with pytest.raises(ValueError, match="stock market is closed"):
+        await h.engine.close_position("STK:F")
+
+
+async def test_manual_close_of_the_owners_own_position(db, config) -> None:
+    """The bot never manages positions the owner opened, but the owner may close them."""
+    h = await harness(db, config)
+    h.broker.pos["STK:T"] = [3.0, 19.0]
+    await h.engine.monitor_tick()
+    assert db.get_position_meta("STK:T") is None
+    await h.engine.close_position("STK:T")
+    assert "STK:T" not in h.broker.pos
+
+
+async def test_manual_close_cancels_a_waiting_close_approval(db, config) -> None:
+    h = await harness(db, config)
+    await enter_f(h)
+    h.engine.settings.autopilot = False
+    h.clock.advance(minutes=5)
+    h.decider.decisions = [
+        hold("F").model_copy(update={"action": TradeAction.CLOSE, "rationale": "fading"})
+    ]
+    await h.engine.run_cycle()
+    [waiting] = h.orders(OrderStatus.PENDING_APPROVAL)
+    await h.engine.close_position("STK:F")
+    assert h.db.get_order(waiting.id).status == OrderStatus.CANCELLED
+    with pytest.raises(ValueError):
+        await h.engine.approve_order(waiting.id)
+
+
+async def test_refused_manual_close_restores_the_stop_and_alerts(db, config) -> None:
+    h = await harness(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.broker.reject_exits = True
+    with pytest.raises(BrokerError, match="refused to close F"):
+        await h.engine.close_position("STK:F")
+    assert h.broker.pos  # still held
+    [stop] = h.broker.working("STK:F", "stop")
+    assert h.broker.orders[stop].request.stop_loss == 9.8
+    assert "Close F FAILED" in h.notes.titles()
+    assert not h.engine._closing_now("STK:F", h.clock())  # the monitor manages it again
+    assert db.get_kv("owner_closed:STK:F") is None  # not closed: entries not blocked
+    h.broker.reject_exits = False
+    await h.engine.close_position("STK:F")  # the owner can try again at once
+    assert h.broker.pos == {}
+
+
 async def test_two_looks_at_one_bad_equity_print_do_not_halt(db, config) -> None:
     """ENG-5: run_cycle runs its own monitor tick right after the monitor loop's. A single
     bad equity snapshot seen by both at the same moment is not a confirmed loss halt."""

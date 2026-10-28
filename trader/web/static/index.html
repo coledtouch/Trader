@@ -11,8 +11,8 @@
   <link rel="manifest" href="/static/manifest.webmanifest" crossorigin="use-credentials">
   <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="/static/icon-192.png">
-  <link rel="stylesheet" href="/static/styles.css?v=21">
-  <script src="/static/app.js?v=21" defer></script>
+  <link rel="stylesheet" href="/static/styles.css?v=22">
+  <script src="/static/app.js?v=22" defer></script>
 </head>
 <body data-mode="unknown">
   <a class="skip-link" href="#main">Skip to content</a>
@@ -375,6 +375,22 @@
       <div class="dialog-actions">
         <button id="kill-cancel" class="btn" type="button" autofocus>Cancel</button>
         <button id="kill-confirm" class="btn btn-danger" type="submit">Kill: close everything</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog id="close-dialog" class="dialog" aria-labelledby="close-title" aria-describedby="close-what">
+    <form id="close-form" method="dialog">
+      <h2 id="close-title">Close position</h2>
+      <p><strong id="close-what"></strong></p>
+      <p class="small muted">Its stop and target at IBKR are cancelled first, then it is sold at
+        market. The bot will not buy this symbol again today.</p>
+      <p id="close-owner" class="small muted" hidden>You opened this position yourself: the bot
+        does not manage it.</p>
+      <div id="close-error" class="form-error" role="alert"></div>
+      <div class="dialog-actions">
+        <button id="close-cancel" class="btn" type="button" autofocus>Cancel</button>
+        <button id="close-confirm" class="btn btn-danger" type="submit">Sell at market</button>
       </div>
     </form>
   </dialog>

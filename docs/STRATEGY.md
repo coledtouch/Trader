@@ -224,7 +224,7 @@ Loosening any of these in the app needs a fresh 2FA code; tightening does not.
   symbol is not halted and was not halted in the last 15 minutes;
   stocks need a two-sided quote with a spread of at most 0.3%; delayed data blocks stock
   entries in every mode regardless of receipt age; stocks only while the market is open and inside the entry
-  window.
+  window; not a symbol you closed by hand today (the Close button).
 - **Prices:** a valid entry price; a stop below it; a target above it; reward:risk at
   least `min_reward_risk`; price at least `min_price`; a limit within the collar.
 - **Size and money:** quantity above 0 after rounding; order at most
@@ -272,6 +272,7 @@ Exit rules (`exits` settings; they only touch positions the bot opened):
 | Daily loss limit | -6% | Halt and close everything (`flatten_on_halt`) once two consecutive checks agree; resume needs 2FA |
 | Daily target | off ($0) | If configured positive and reached, no new entries today; open positions keep their stops |
 | KILL button | | Cancel every order and close every position |
+| Close button | | Close one position at market from **Open positions** (after a confirm): its IBKR stop and target are cancelled first, the stop is put back if the sell is refused, and the bot buys no new shares of that symbol for the rest of the trading day. It works on any position you hold, in shadow mode and while halted; stocks only while the market is open |
 
 Stops only ever move **up**. P&L, stops and R multiples use the bid, because that is what
 a sale would actually get.

@@ -85,6 +85,22 @@ class FakeEngine:
     async def monitor_tick(self) -> None:
         return None
 
+    async def close_position(self, key: str, actor: str = "owner") -> OrderRecord:
+        self._call("close_position")
+        if key == "STK:NONE":
+            raise LookupError("no open NONE position")
+        if key == "STK:SHUT":
+            raise ValueError("the stock market is closed: close SHUT in IBKR, or after the open")
+        request = OrderRequest(
+            instrument=Instrument.from_key(key),
+            side="SELL",
+            qty=5,
+            order_type="MKT",
+            is_exit=True,
+            reason=f"closed by the {actor}",
+        )
+        return OrderRecord(request=request, status=OrderStatus.SUBMITTED)
+
     async def approve_order(self, order_id: int, actor: str = "owner") -> OrderRecord:
         self._call("approve")
         self.db.update_order(order_id, status=OrderStatus.SUBMITTED, broker_order_id="b-1")
@@ -201,7 +217,7 @@ def test_healthz_and_no_docs(env):
         assert env.client.get(path).status_code == 404
 
 
-@pytest.mark.parametrize("asset", ["app.js?v=21", "login.js?v=21", "styles.css?v=21", "sw.js"])
+@pytest.mark.parametrize("asset", ["app.js?v=22", "login.js?v=22", "styles.css?v=22", "sw.js"])
 def test_executable_shell_assets_revalidate_on_deploy(env, asset):
     response = env.client.get(f"/static/{asset}")
     assert response.status_code == 200
@@ -460,6 +476,7 @@ POST_ROUTES = [
     "/api/live/disarm",
     "/api/orders/1/approve",
     "/api/orders/1/reject",
+    "/api/positions/close",
 ]
 
 
@@ -473,6 +490,35 @@ def test_api_requires_a_session(env):
     put = env.client.put("/api/settings", json={"settings": {}}, headers={"Origin": ORIGIN})
     assert put.status_code == 401
     assert env.engine.calls == []
+
+
+def test_close_one_position(env):
+    headers = login(env)
+    url = "/api/positions/close"
+    ok = env.client.post(url, json={"instrument": "STK:AXGN"}, headers=headers)
+    assert ok.status_code == 200, ok.text
+    body = ok.json()
+    assert body["order"]["request"]["side"] == "SELL"
+    assert body["order"]["request"]["reason"] == "closed by the owner"
+    assert "running" in body["status"]
+    assert env.engine.calls == ["close_position"]
+    assert env.db.list_audit(1)[0]["action"] == "position_close"
+    for bad in ["AXGN", "STK:", "OPT:AXGN", "STK:AX GN", "STK:" + "A" * 21, "STK:../x"]:
+        response = env.client.post(url, json={"instrument": bad}, headers=headers)
+        assert response.status_code == 422, bad
+    assert env.engine.calls == ["close_position"]
+    missing = env.client.post(url, json={"instrument": "STK:NONE"}, headers=headers)
+    assert missing.status_code == 409 and missing.json()["detail"] == "no open NONE position"
+    shut = env.client.post(url, json={"instrument": "STK:SHUT"}, headers=headers)
+    assert shut.status_code == 409 and "market is closed" in shut.json()["detail"]
+    env.engine.fail = "close_position"
+    broken = env.client.post(url, json={"instrument": "STK:AXGN"}, headers=headers)
+    assert broken.status_code == 503 and broken.json()["detail"] == "position_close failed"
+    assert env.db.list_audit(1)[0]["action"] == "position_close_failed"
+    without_token = env.client.post(
+        url, json={"instrument": "STK:AXGN"}, headers={"Origin": ORIGIN}
+    )
+    assert without_token.status_code == 403
 
 
 def test_csrf_and_origin_checks(env):
