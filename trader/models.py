@@ -444,6 +444,14 @@ class ExitRules(BaseModel):
     breakeven_at_r: float = Field(default=1.0, ge=0)
     # After breakeven, trail the stop this many ATRs below the best price. 0 disables.
     trail_atr_mult: float = Field(default=0.0, ge=0)
+    # With the trailing stop on, new entries get no take-profit order: the trailing stop
+    # decides when a winner is sold. Trades already open keep their target.
+    let_winners_run: bool = False
+
+    @property
+    def no_target(self) -> bool:
+        """Whether new entries go out without a take-profit order (see let_winners_run)."""
+        return self.let_winners_run and self.trail_atr_mult > 0
 
 
 SetupName = Literal[

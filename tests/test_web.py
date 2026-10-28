@@ -667,6 +667,20 @@ def test_loosening_requires_2fa(env):
     assert env.db.list_audit(1)[0]["detail"]["loosened"] == ["risk.max_risk_per_trade_pct"]
 
 
+def test_let_winners_run_saves_without_2fa(env):
+    """An exit rule: it never raises the loss at the stop, so no step-up."""
+    headers = login(env)
+    settings = BotSettings()
+    settings.exits.trail_atr_mult = 1.5
+    settings.exits.let_winners_run = True
+    ok = put_settings(env, headers, settings)
+    assert ok.status_code == 200, ok.text
+    saved = env.db.get_settings().exits
+    assert saved.let_winners_run and saved.no_target
+    assert ok.json()["settings"]["exits"]["let_winners_run"] is True
+    assert env.db.list_audit(1)[0]["detail"]["loosened"] == []
+
+
 def test_leaving_consensus_requires_2fa_and_returning_does_not(env):
     headers = login(env)
     single = BotSettings(decision_mode="claude")

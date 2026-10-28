@@ -2044,7 +2044,7 @@
     {
       title: 'Exits',
       object: 'exits',
-      note: 'Managed by the bot on top of the stop-loss and target placed with every entry. 0 turns a rule off.',
+      note: 'Managed by the bot on top of the stop-loss (and the target, unless winners run) placed with every entry. 0 turns a rule off.',
     },
   ];
 
@@ -2134,6 +2134,10 @@
     'exits.time_stop_min_r': { label: 'Time stop minimum', unit: 'R', min: 0 },
     'exits.breakeven_at_r': { label: 'Move stop to entry at', unit: 'R', min: 0 },
     'exits.trail_atr_mult': { label: 'Trailing stop distance', unit: '× ATR', min: 0 },
+    'exits.let_winners_run': {
+      label: 'Let winners run',
+      help: 'Only with the trailing stop on: new trades get no fixed target, so the trailing stop decides when a winner is sold. Stocks are still sold by 3:50 PM. Trades already open keep their target.',
+    },
     'operating_costs.hosting_monthly_usd': { label: 'Monthly hosting cost', unit: '$ / month', min: 0, nullable: true },
     'operating_costs.data_monthly_usd': { label: 'Monthly market-data cost', unit: '$ / month', min: 0, nullable: true },
   };

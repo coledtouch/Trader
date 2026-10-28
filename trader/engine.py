@@ -3071,6 +3071,8 @@ class Engine:
         is always managed even if the call fails halfway (stale metadata is cleaned up)."""
         order = self._traced(order, None)
         assert order.limit_price is not None and order.stop_loss is not None
+        if self.settings.exits.no_target:  # let winners run: the trailing stop sells
+            order = order.model_copy(update={"take_profit": None})
         key = order.instrument.key
         entry, stop = order.limit_price, order.stop_loss
         self.db.set_position_meta(

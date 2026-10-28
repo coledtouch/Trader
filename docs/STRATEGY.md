@@ -267,6 +267,7 @@ Exit rules (`exits` settings; they only touch positions the bot opened):
 | Time stop | 45 min, 0.5R | A trade that has not reached +0.5R after 45 minutes is closed: stale trades tie up a small account |
 | Breakeven | at +1R | The stop moves up to the entry price (the IBKR stop is modified) |
 | Trailing stop | off (`trail_atr_mult` 0) | If set, after breakeven the stop trails that many ATRs below the best price |
+| Let winners run | off (`let_winners_run`) | Only with the trailing stop on: new entries are sent without the take-profit order, so a winner runs until the trailing stop (or the time stop, an AI close or the 15:50 flatten) sells it. The entry still needs a target for its reward:risk check |
 | Setup broke | rules / Claude | e.g. a VWAP setup back below VWAP: close |
 | Flatten before close | 15:50 ET (12:50 on half days) | Stock positions are closed 10 minutes before the bell (`flatten_stocks_before_close`) |
 | Daily loss limit | -6% | Halt and close everything (`flatten_on_halt`) once two consecutive checks agree; resume needs 2FA |

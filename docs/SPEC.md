@@ -606,7 +606,9 @@ for the open to settle; time stops; size small.
   `BOOL_FALSE_IS_LOOSER` (web step-up uses these; every other numeric risk field: higher
   is looser).
 - `ExitRules` (in `BotSettings.exits`): `time_stop_minutes` (45), `time_stop_min_r` (0.5),
-  `breakeven_at_r` (1.0), `trail_atr_mult` (0 = off).
+  `breakeven_at_r` (1.0), `trail_atr_mult` (0 = off), `let_winners_run` (False: with
+  `trail_atr_mult` > 0, `_send_entry` sends the bracket without the take-profit child and
+  stores no target; `ExitRules.no_target`).
 - `BotSettings.stock_universe` default: liquid lower-priced names.
 - `SignalRecord`, `SetupStats` models; `Database.insert_signal/update_signal/get_signal/
   list_signals/unevaluated_signals/setup_stats`.

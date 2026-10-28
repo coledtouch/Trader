@@ -2001,6 +2001,54 @@ async def test_trailing_stop_never_moves_down(db, config) -> None:
     assert h.broker.pos
 
 
+async def test_let_winners_run_sends_no_target_and_the_trailing_stop_sells(db, config) -> None:
+    h = await harness(db, config, exits={"trail_atr_mult": 1.0, "let_winners_run": True})
+    rec = await enter_f(h)  # the scanner snapshot reports ATR 0.10
+    assert rec.request.take_profit is None  # journaled as sent
+    assert h.broker.working("STK:F", "stop") and not h.broker.working("STK:F", "target")
+    assert db.get_position_meta("STK:F")["take_profit"] is None
+    # The planned target was 10.50: the winner keeps running past it.
+    h.broker.set_price("F", 10.80)  # bid 10.79: breakeven, then the trail 1 ATR below
+    h.clock.advance(minutes=2)
+    await h.engine.monitor_tick()
+    await h.engine.monitor_tick()
+    assert h.broker.pos
+    assert db.get_position_meta("STK:F")["stop_loss"] == pytest.approx(10.69)
+    h.broker.set_price("F", 10.65)  # bid 10.64: through the trailed stop at IBKR
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    assert h.broker.pos == {}
+
+
+@pytest.mark.parametrize(
+    "exits",
+    [{"let_winners_run": True}, {"trail_atr_mult": 1.0}, {}],
+    ids=["no-trail", "off", "default"],
+)
+async def test_target_is_sent_unless_winners_run_with_a_trailing_stop(db, config, exits) -> None:
+    h = await harness(db, config, exits=exits)
+    rec = await enter_f(h)
+    assert rec.request.take_profit == 10.5
+    assert h.broker.working("STK:F", "target")
+    assert db.get_position_meta("STK:F")["take_profit"] == 10.5
+
+
+async def test_let_winners_run_on_an_approved_entry(db, config) -> None:
+    """With autopilot off the approval card shows the planned target (the risk check needs
+    it); the order sent on approval follows the setting at that moment."""
+    h = await harness(db, config, autopilot=False, exits={"trail_atr_mult": 1.0})
+    await h.engine.run_cycle()
+    [waiting] = h.orders(OrderStatus.PENDING_APPROVAL)
+    assert waiting.request.take_profit == 10.5
+    settings = h.engine.settings.model_copy(deep=True)
+    settings.exits.let_winners_run = True
+    db.save_settings(settings)
+    h.engine.reload_settings()
+    sent = await h.engine.approve_order(waiting.id)
+    assert sent.status == OrderStatus.FILLED
+    assert not h.broker.working("STK:F", "target") and h.broker.working("STK:F", "stop")
+
+
 async def test_backup_stop_for_stock_without_working_broker_stop(db, config) -> None:
     h = await harness(db, config)
     await enter_f(h)
