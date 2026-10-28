@@ -321,6 +321,10 @@ def _aware(ts: datetime) -> datetime:
     return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
 
 
+def _target_text(target: float | None) -> str:
+    return f"{target:g}" if target is not None else "none (trailing stop)"
+
+
 def _refused_exits(records: Iterable[OrderRecord]) -> str:
     """Exit orders the broker rejected, as "SYMBOL: message; ..." ("" when none)."""
     return "; ".join(
@@ -1130,6 +1134,8 @@ class Engine:
                 self._close_reasons[order.instrument.key] = order.reason
             else:
                 placed = await self._send_entry(order, now)
+                # Journal the target as sent: none when winners run (exits.no_target).
+                order = order.model_copy(update={"take_profit": placed.request.take_profit})
                 # The stale-entry timer runs from now, not from when it was proposed.
                 self.db.set_kv(SENT_PREFIX + str(order_id), now.isoformat())
             self.db.update_order(
@@ -1998,7 +2004,9 @@ class Engine:
         if best != extra.get("best_price"):
             self._set_extra(key, best_price=best)
         current = new_stop if new_stop is not None else stop
-        atr = self._market.get(key, {}).get("atr14")
+        # The last cycle's ATR, else the one saved with the position: no decision cycle
+        # runs while halted (or right after a restart), and the trail must keep moving.
+        atr = self._market.get(key, {}).get("atr14") or extra.get("atr")
         trailing = exits.trail_atr_mult > 0 and (
             exits.breakeven_at_r == 0 or (current is not None and current >= pos.avg_cost)
         )
@@ -2742,6 +2750,10 @@ class Engine:
             except Exception:
                 log.exception("scanner failed for %s", inst.key)
         candidates.sort(key=lambda c: c.score, reverse=True)
+        for pos in self._positions:  # the trail's distance survives restarts and halts
+            atr = market.get(pos.instrument.key, {}).get("atr14")
+            if pos.qty > 0 and atr and atr > 0 and self.db.get_position_meta(pos.instrument.key):
+                self._set_extra(pos.instrument.key, atr=atr)
         self._market = market
 
         # Signal ledger: one row per instrument+setup per SIGNAL_DEDUPE window.
@@ -3086,6 +3098,9 @@ class Engine:
             setup=order.setup,
         )
         extra = {"initial_stop": stop, "unit_risk": entry - stop, "best_price": entry}
+        atr = self._market.get(key, {}).get("atr14")
+        if atr and atr > 0:
+            extra["atr"] = atr  # the trailing stop's distance, if no cycle runs later
         if self._is_delayed_paper_entry(order):
             extra["delayed_data"] = 1.0  # not evidence of an edge (performance report)
         self.db.set_kv(EXTRA_PREFIX + key, json.dumps(extra))
@@ -3107,18 +3122,19 @@ class Engine:
         day = self._today(now)
         day.trades += 1
         self._save_day()
+        target_text = _target_text(order.take_profit)
         log.info(
             "BUY %s %g @ %g (stop %g, target %s) -> %s",
             key,
             order.qty,
             entry,
             stop,
-            order.take_profit,
+            target_text,
             placed.status.value,
         )
         await self._notify(
             f"BUY {order.instrument.symbol}",
-            f"{order.qty:g} @ {entry:g}, stop {stop:g}, target {order.take_profit}",
+            f"{order.qty:g} @ {entry:g}, stop {stop:g}, target {target_text}",
         )
         return placed
 

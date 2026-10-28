@@ -539,8 +539,9 @@ unreachable for longer than the grace time, the pings stop and healthchecks.io a
 ### Checking the order plumbing (paper)
 
 `docker compose exec trader python -m trader paper-test` sends one entry the way the bot
-does (a limit buy 20% below the market with a GTC stop-loss and take-profit attached),
-checks that IBKR accepted all three, and cancels them. Nothing can fill, it works outside
+does (a limit buy 20% below the market with a GTC stop-loss and take-profit attached, or
+the stop-loss alone when **Let winners run** is on with a trailing stop), checks that IBKR
+accepted them, and cancels them. Nothing can fill, it works outside
 market hours, and it refuses a live account. If no price is available, add
 `--price 12.30` (a recent price of `F`), or pick another stock with `--symbol`.
 

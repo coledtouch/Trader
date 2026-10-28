@@ -2046,7 +2046,39 @@ async def test_let_winners_run_on_an_approved_entry(db, config) -> None:
     h.engine.reload_settings()
     sent = await h.engine.approve_order(waiting.id)
     assert sent.status == OrderStatus.FILLED
+    assert sent.request.take_profit is None  # journaled as sent (review finding)
+    assert any("target none (trailing stop)" in body for _, body, _ in h.notes.sent)
     assert not h.broker.working("STK:F", "target") and h.broker.working("STK:F", "stop")
+
+
+async def test_trailing_stop_keeps_moving_after_a_restart_while_halted(db, config) -> None:
+    """Review finding: the trail read ATR only from the last decision cycle, and none runs
+    while halted (a reached daily target) or right after a restart. With no target, the
+    winner then had no profit exit. The ATR is saved with the position."""
+    h = await harness(
+        db,
+        config,
+        mode=Mode.PAPER,
+        risk={"daily_profit_target_usd": 5},
+        exits={"trail_atr_mult": 1.0, "let_winners_run": True, "time_stop_minutes": 0},
+    )
+    await enter_f(h)  # ATR 0.10
+    h.broker.set_price("F", 10.30)  # +$6.96: the daily target is reached
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert h.day().halted
+    engine = Engine(
+        config, db, h.broker, h.decider, notifier=h.notes, clock=h.clock, scanner=h.scanner
+    )
+    h.clock.advance(minutes=1)
+    await engine.monitor_tick()
+    assert await engine.run_cycle() is None and engine._market == {}
+    h.broker.set_price("F", 11.50)  # bid 11.49
+    h.clock.advance(seconds=15)
+    await engine.monitor_tick()
+    assert db.get_position_meta("STK:F")["stop_loss"] == pytest.approx(11.39)
 
 
 async def test_backup_stop_for_stock_without_working_broker_stop(db, config) -> None:

@@ -1,9 +1,10 @@
 """`python -m trader paper-test`: check the order plumbing on the IBKR paper account.
 
 Sends one stock entry exactly the way the engine does: a DAY limit buy with a GTC
-stop-loss and a GTC take-profit in one OCA group (`IBKRBroker.place_order`). The limit is
-20% below the market so it cannot fill. It then checks that IBKR accepted all three
-orders as built, that the bot's open-orders view sees the entry, and cancels everything.
+stop-loss and a GTC take-profit in one OCA group (`IBKRBroker.place_order`), or with the
+stop-loss alone when the saved settings let winners run (`ExitRules.no_target`). The limit
+is 20% below the market so it cannot fill. It then checks that IBKR accepted the orders as
+built, that the bot's open-orders view sees the entry, and cancels everything.
 It works outside market hours too (IBKR holds the orders until the next session).
 
 Paper accounts only: it refuses a live ("U...") account. It uses its own API client id,
@@ -97,8 +98,11 @@ def _close(a: object, b: float) -> bool:
     return isinstance(a, int | float) and math.isfinite(a) and abs(a - b) < 0.011
 
 
-def check_bracket(orders: list[dict[str, object]], entry: float, stop: float, target: float) -> str:
-    """'' when the three orders are the bracket the engine relies on, else what is wrong."""
+def check_bracket(
+    orders: list[dict[str, object]], entry: float, stop: float, target: float | None
+) -> str:
+    """'' when the orders are the bracket the engine relies on, else what is wrong. With
+    `target` None (let winners run) the stop-loss must be the entry's only child."""
     parents = [o for o in orders if not o["parent_id"]]
     if len(parents) != 1:
         return f"expected 1 entry order, found {len(parents)}"
@@ -122,7 +126,10 @@ def check_bracket(orders: list[dict[str, object]], entry: float, stop: float, ta
                 f"stop-loss is {s['action']} STP {s['tif']} at {s['stop']}, "
                 f"not SELL STP GTC at {stop:.2f}"
             )
-    if len(targets) != 1:
+    if target is None:
+        if targets:
+            problems.append(f"expected no take-profit (let winners run), found {len(targets)}")
+    elif len(targets) != 1:
         problems.append(f"expected 1 take-profit attached to the entry, found {len(targets)}")
     else:
         t = targets[0]
@@ -152,9 +159,11 @@ async def run_paper_test(
     ref_price: float | None = None,
     settle_seconds: float = SETTLE_SECONDS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    no_target: bool = False,
 ) -> list[Check]:
     """Run the checks in order and always clean up. Never raises for a broker problem:
-    it becomes a failed check."""
+    it becomes a failed check. `no_target`: send the entry the way the engine does when
+    winners run (the stop-loss alone)."""
     checks: list[Check] = []
     tag = f"{TAG_PREFIX}{uuid4().hex[:12]}"
     instrument = Instrument(symbol=symbol.upper())
@@ -196,7 +205,8 @@ async def run_paper_test(
                 return checks
         checks.append(Check(f"price for {instrument.symbol}", True, f"reference ${ref:.2f}"))
 
-        entry, stop, target = bracket_levels(ref)
+        entry, stop, planned = bracket_levels(ref)
+        target = None if no_target else planned
         req = OrderRequest(
             instrument=instrument,
             side=Side.BUY,
@@ -222,25 +232,26 @@ async def run_paper_test(
                 "entry accepted",
                 True,
                 f"BUY 1 {instrument.symbol} limit ${entry:.2f} (cannot fill), "
-                f"stop ${stop:.2f}, target ${target:.2f}",
+                f"stop ${stop:.2f}, "
+                + (f"target ${target:.2f}" if target is not None else "no target (winners run)"),
             )
         )
 
         def settled() -> bool:
             orders = broker.orders_tagged(tag)
-            return len(orders) == 3 and all(
+            return len(orders) == (2 if target is None else 3) and all(
                 o["status"] not in ("ApiPending", "PendingSubmit") for o in orders
             )
 
         await _wait_for(settled, settle_seconds, sleep)
         problem = check_bracket(broker.orders_tagged(tag), entry, stop, target)
-        checks.append(
-            Check(
-                "stop-loss and take-profit attached at IBKR",
-                not problem,
-                problem or "GTC stop-loss and GTC take-profit, one OCA group, both working",
-            )
-        )
+        if target is None:
+            name = "stop-loss attached at IBKR (no take-profit: winners run)"
+            fine = "GTC stop-loss working, no take-profit"
+        else:
+            name = "stop-loss and take-profit attached at IBKR"
+            fine = "GTC stop-loss and GTC take-profit, one OCA group, both working"
+        checks.append(Check(name, not problem, problem or fine))
 
         try:
             visible = any(

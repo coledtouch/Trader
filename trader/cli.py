@@ -620,14 +620,25 @@ def cmd_paper_test(args: argparse.Namespace) -> int:
         raise CLIError("--price must be a positive number")
     from trader.broker.ibkr import IBKRBroker
 
+    # The entry's shape follows the saved settings: no target when winners run.
+    no_target = False
+    if config.db_path.exists():
+        db = Database(config.db_path)
+        try:
+            no_target = db.get_settings().exits.no_target
+        finally:
+            db.close()
     client_id = paper_test_client_id(config)
     broker = IBKRBroker(config.model_copy(update={"ib_client_id": client_id}))
     print(f"Paper test on {args.symbol.upper()} (API client id {client_id}). Nothing can fill.")
-    checks = asyncio.run(run_paper_test(broker, symbol=args.symbol, ref_price=args.price))
+    checks = asyncio.run(
+        run_paper_test(broker, symbol=args.symbol, ref_price=args.price, no_target=no_target)
+    )
     for check in checks:
         print(f"{'PASS' if check.ok else 'FAIL'}  {check.name}: {check.detail}")
     if checks and all(check.ok for check in checks):
-        print("All checks passed: entries go out with their stop-loss and target at IBKR.")
+        shape = "stop-loss (winners run: no target)" if no_target else "stop-loss and target"
+        print(f"All checks passed: entries go out with their {shape} at IBKR.")
         return 0
     return 1
 

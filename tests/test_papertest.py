@@ -102,6 +102,21 @@ async def test_no_quote_asks_for_a_price_and_places_nothing() -> None:
     assert broker.placed == 0
 
 
+async def test_paper_test_checks_the_stop_only_bracket_when_winners_run() -> None:
+    """Review finding: with let_winners_run and a trailing stop the engine sends the entry
+    with its stop-loss alone; paper-test must check that shape, not the 3-order one."""
+    broker, fake = make_broker()
+    checks = await run_paper_test(
+        broker, symbol="AAPL", ref_price=100.0, settle_seconds=0.5, no_target=True
+    )
+    assert [c.ok for c in checks] == [True] * len(checks), checks
+    assert "stop-loss attached at IBKR (no take-profit: winners run)" in [c.name for c in checks]
+    parent, stop = (order for _, order in fake.placed)
+    assert (parent.lmtPrice, stop.auxPrice) == (80.0, 75.0)
+    assert stop.transmit and not parent.transmit  # the stop transmits the bracket
+    assert all(t.orderStatus.status in DONE for t in fake.trade_list)
+
+
 def test_check_bracket_names_what_is_wrong() -> None:
     entry, stop, target = bracket_levels(12.0)
     assert (entry, stop, target) == (9.6, 9.0, 10.2)
@@ -126,6 +141,10 @@ def test_check_bracket_names_what_is_wrong() -> None:
     gone = [good[0], {**good[1], "status": "Cancelled", "done": True}, good[2]]
     assert "not working at IBKR: STP Cancelled" in check_bracket(gone, entry, stop, target)
     assert "found 0" in check_bracket([good[0], good[2]], entry, stop, target)
+    # Winners run: the stop-loss alone, and a leftover take-profit is wrong.
+    assert check_bracket(good[:2], entry, stop, None) == ""
+    assert "expected no take-profit" in check_bracket(good, entry, stop, None)
+    assert "found 0" in check_bracket([good[0], good[2]], entry, stop, None)
 
 
 def test_paper_test_client_id_is_free() -> None:
@@ -143,6 +162,42 @@ def test_cli_paper_test_needs_the_ibkr_broker(
     monkeypatch.delenv("TRADER_BROKER", raising=False)
     assert cli.main(["paper-test", "--env-file", str(env)]) == 1
     assert "TRADER_BROKER=ibkr" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("winners_run", [True, False])
+def test_cli_paper_test_follows_the_saved_exit_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], winners_run
+) -> None:
+    from trader import papertest
+    from trader.db import Database
+    from trader.models import BotSettings, ExitRules
+    from trader.security import crypto
+
+    env = tmp_path / ".env"
+    env.write_text(
+        f"TRADER_SECRET_KEY={crypto.generate_secret_key()}\nTRADER_BROKER=ibkr\n",
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("TRADER_SECRET_KEY", raising=False)
+    monkeypatch.delenv("TRADER_BROKER", raising=False)
+    monkeypatch.setenv("TRADER_DATA_DIR", str(tmp_path / "data"))
+    config = AppConfig(_env_file=env)
+    config.data_dir.mkdir(parents=True, exist_ok=True)
+    db = Database(config.db_path)
+    exits = ExitRules(trail_atr_mult=1.5, let_winners_run=winners_run)
+    db.save_settings(BotSettings(exits=exits))
+    db.close()
+    seen = {}
+
+    async def fake_run(broker, **kwargs):
+        seen.update(kwargs)
+        return [papertest.Check("paper account", True, "ok")]
+
+    monkeypatch.setattr(papertest, "run_paper_test", fake_run)
+    assert cli.main(["paper-test", "--env-file", str(env)]) == 0
+    assert seen["no_target"] is winners_run
+    out = capsys.readouterr().out
+    assert ("winners run: no target" in out) is winners_run
 
 
 async def test_a_weekend_warning_status_still_passes_and_children_are_not_double_cancelled() -> (
