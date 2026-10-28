@@ -27,10 +27,12 @@ from trader.models import (
     Side,
 )
 from trader.watchdog import (
+    FLAT_CONFIRM_POLLS,
     HEARTBEAT_KEY,
     STALE_IDLE_TITLE,
     STOP_CONFIRM_TICKS,
     TAG_PREFIX,
+    WATCHDOG_CLOSED_PREFIX,
     CryptoWatchdog,
     WatchdogSettings,
     effective_timeouts,
@@ -80,6 +82,7 @@ class FakeBroker:
         self.orders: list[OrderRecord] = []
         self.quotes: dict[str, Quote] = {}
         self.placed: list[OrderRequest] = []
+        self.records: dict[str, OrderRecord] = {}  # every placed order, by broker id
         self.fail_quote = False
         self.reject = False
         self.connects = 0
@@ -119,9 +122,13 @@ class FakeBroker:
             broker_order_id=f"B{len(self.placed)}",
             message="rejected" if self.reject else "working",
         )
+        self.records[record.broker_order_id or ""] = record
         if status == OrderStatus.SUBMITTED:
             self.orders.append(record)
         return record
+
+    async def order_status(self, broker_order_id: str) -> OrderRecord | None:
+        return self.records.get(broker_order_id)
 
     def round_qty(
         self, instrument: Instrument, qty: float, allow_fractional: bool = False
@@ -716,6 +723,11 @@ async def test_a_stop_breach_is_not_delayed_by_a_reconnect(db: Database) -> None
 
 def _filled(broker: FakeBroker) -> None:
     """The watchdog's sells filled: the bot's crypto is gone."""
+    for order_id, record in broker.records.items():
+        if record.status == OrderStatus.SUBMITTED:
+            broker.records[order_id] = record.model_copy(
+                update={"status": OrderStatus.FILLED, "filled_qty": record.request.qty}
+            )
     broker.positions_list.clear()
     broker.orders.clear()
 
@@ -737,8 +749,9 @@ async def test_a_buy_after_the_watchdog_sold_the_bot_position_is_not_the_bots(
         clock.advance(seconds=10)
     assert [s.qty for s in sells(broker)] == [pytest.approx(0.02)]
     _filled(broker)
-    await watchdog.tick()  # flat: the watchdog notes it sold the bot's position
-    clock.advance(seconds=30)
+    for _ in range(FLAT_CONFIRM_POLLS):  # flat: the watchdog notes it sold the position
+        await watchdog.tick()
+        clock.advance(seconds=10)
     broker.positions_list.append(Position(instrument=instrument, qty=0.5, avg_cost=94.0))
     for _ in range(3):
         await watchdog.tick()
@@ -767,3 +780,65 @@ async def test_a_new_bot_entry_after_a_watchdog_sale_is_managed_again(db: Databa
         await watchdog.tick()
         clock.advance(seconds=10)
     assert [s.qty for s in sells(broker)] == [pytest.approx(0.02), pytest.approx(0.03)]
+
+
+def _app_entry(instrument: Instrument, qty: float) -> OrderRecord:
+    """The rest of a part-filled crypto entry of the app's, still working."""
+    return OrderRecord(
+        request=OrderRequest(
+            instrument=instrument,
+            side=Side.BUY,
+            qty=qty,
+            order_type=OrderType.LIMIT,
+            limit_price=100.0,
+            trace_id="ai-trader-17",
+        ),
+        status=OrderStatus.SUBMITTED,
+        broker_order_id="perm:17",
+    )
+
+
+async def test_one_flat_read_never_marks_a_bot_position_sold(db: Database) -> None:
+    """Review finding: one poll that read the position as flat marked it sold for good.
+    The rest of a part-filled entry filled between the reads, so the bot held new coins
+    that neither the watchdog nor the app would ever sell again."""
+    clock = Clock()
+    broker = FakeBroker()
+    instrument = hold(db, broker, qty=0.02)
+    entry = _app_entry(instrument, 0.03)
+    broker.orders.append(entry)
+    beat(db, clock, age=200)
+    watchdog, _notes = make(db, broker, clock)
+    await watchdog.tick()  # flattens the 0.02 held
+    _filled(broker)  # the sell filled; the entry's rest fills too, not yet in the positions
+    clock.advance(seconds=10)
+    await watchdog.tick()
+    broker.positions_list.append(Position(instrument=instrument, qty=0.03, avg_cost=100.0))
+    clock.advance(seconds=30)
+    await watchdog.tick()
+    assert not db.get_kv(WATCHDOG_CLOSED_PREFIX + instrument.key)
+    assert [s.qty for s in sells(broker)] == [pytest.approx(0.02), pytest.approx(0.03)]
+
+
+async def test_a_refused_sell_never_marks_the_position_sold(db: Database) -> None:
+    """Review finding: a send that failed or was refused still counted as a sale, so empty
+    positions reads (e.g. right after a reconnect) marked a held bot position sold."""
+    clock = Clock()
+    broker = FakeBroker()
+    broker.reject = True
+    instrument = hold(db, broker, qty=0.02)
+    beat(db, clock, age=200)
+    watchdog, _notes = make(db, broker, clock)
+    await watchdog.tick()
+    held = list(broker.positions_list)
+    broker.positions_list.clear()  # bad reads: the positions are not there yet
+    for _ in range(FLAT_CONFIRM_POLLS + 1):
+        clock.advance(seconds=10)
+        await watchdog.tick()
+    assert not db.get_kv(WATCHDOG_CLOSED_PREFIX + instrument.key)
+    broker.positions_list.extend(held)
+    broker.reject = False
+    clock.advance(seconds=30)
+    await watchdog.tick()
+    assert sells(broker)[-1].qty == pytest.approx(0.02)
+    assert len(sells(broker)) == 2

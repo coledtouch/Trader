@@ -187,11 +187,17 @@ class Broker(ABC):
         supports standalone stops, so a failed exit never leaves the position unprotected.
         Closes of one instrument run one at a time: each sees what the one before it left
         (its sell, or the stop it put back), never a half-finished close."""
-        locks: dict[str, asyncio.Lock] = self.__dict__.setdefault("_close_locks", {})
-        async with locks.setdefault(instrument.key, asyncio.Lock()):
+        async with self.close_lock(instrument):
             return await self._close_position(
                 instrument, reason, restore_stop=restore_stop, trace_id=trace_id
             )
+
+    def close_lock(self, instrument: Instrument) -> asyncio.Lock:
+        """Held while a close of the instrument runs. A caller that decides from the
+        instrument's orders (e.g. whether a stop is missing) holds it to see no close
+        half-done."""
+        locks: dict[str, asyncio.Lock] = self.__dict__.setdefault("_close_locks", {})
+        return locks.setdefault(instrument.key, asyncio.Lock())
 
     async def _close_position(
         self,

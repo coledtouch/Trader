@@ -3040,6 +3040,54 @@ async def test_refused_owner_close_during_a_tick_leaves_one_stop(db, config) -> 
     assert _stops(fake) == [95.0]
 
 
+async def test_refused_owner_close_started_before_a_tick_leaves_one_stop(db, config) -> None:
+    """Review finding: as above, with the owner's Close stamped (its stop cancelled) just
+    before the tick took its snapshot, and refused while the tick ran. Re-protect now
+    decides under the broker's close lock, from a fresh read of the orders."""
+    from tests.test_ibkr import log_error
+
+    broker, fake, engine, clock = await _time_stop_with_own_stop(db, config)
+    _set_bid(broker, fake, 103.0)
+
+    def reject_market(trade) -> None:
+        if trade.order.orderType == "MKT":
+            trade.orderStatus.status = "Cancelled"
+            log_error(trade, 201, "Order rejected - reason: test")
+
+    fake.on_place = reject_market
+    read, reads = broker.open_orders, 0
+    parked, resume = asyncio.Event(), asyncio.Event()
+
+    async def open_orders():
+        nonlocal reads
+        reads += 1
+        if reads == 3:  # the close's last check, after it cancelled the stop
+            parked.set()
+            await resume.wait()
+        return await read()
+
+    broker.open_orders = open_orders
+    owner = asyncio.create_task(engine.close_position("STK:AAPL"))
+    await parked.wait()
+    assert _stops(fake) == []
+    manage = engine._manage_positions
+
+    async def manage_while_the_close_finishes(*args, **kwargs):
+        await manage(*args, **kwargs)
+        resume.set()
+        with pytest.raises(BrokerError):
+            await owner
+
+    engine._manage_positions = manage_while_the_close_finishes
+    await engine.monitor_tick()
+    assert _stops(fake) == [95.0]  # the stop the refused close put back, and no other
+    engine._manage_positions = manage
+    for _ in range(6):
+        clock.advance(seconds=15)
+        await engine.monitor_tick()
+    assert _stops(fake) == [95.0]
+
+
 async def test_crypto_the_watchdog_sold_is_not_managed_after_a_restart(db, config) -> None:
     """Review finding: the watchdog sold the bot's BTC while the app was down and the
     owner bought BTC since. The app came back with the old position's meta and managed the

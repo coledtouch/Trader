@@ -2209,7 +2209,9 @@ class Engine:
         not count. A position with a close attempt under way (or in its CLOSE_RETRY
         window), or one stamped since this tick read the orders (`close_seq`: e.g. a
         refused owner Close that put the stop back and dropped its marker), is looked at
-        again on a later tick, from fresh orders."""
+        again on a later tick. A stop is only placed after a fresh read of the position
+        and its orders, under the broker's close lock for the instrument (no close of it
+        half-done), so it never doubles one a close put back or sits next to its sell."""
         if not self._reprotect_pending:
             return
         self._reprotect_pending = False
@@ -2244,19 +2246,35 @@ class Engine:
                     tags=["warning"],
                 )
                 continue
-            req = OrderRequest(
-                instrument=pos.instrument,
-                side=Side.SELL,
-                qty=qty,
-                order_type=OrderType.MARKET,
-                stop_loss=stop,
-                is_exit=True,
-                reason="protective stop (re-placed)",
-                decision_id=meta.get("decision_id") if meta else None,
-                setup=meta.get("setup") if meta else None,
-            )
             try:
-                rec = await self.broker.place_order(req)
+                # This tick's reads may predate a close that ran since (its sell, or the
+                # stop it put back): decide again from fresh ones, with no close of the
+                # instrument running meanwhile.
+                async with self.broker.close_lock(pos.instrument):
+                    orders = await self.broker.open_orders()
+                    held = next(
+                        (p.qty for p in await self.broker.positions() if p.instrument.key == key),
+                        0.0,
+                    )
+                    qty = round(held - self._queued_exits(orders).get(key, 0.0), 8)
+                    if (
+                        qty <= EPS
+                        or key in self._native_stops(orders)
+                        or key in self._working_buys(orders)
+                    ):
+                        continue
+                    req = OrderRequest(
+                        instrument=pos.instrument,
+                        side=Side.SELL,
+                        qty=qty,
+                        order_type=OrderType.MARKET,
+                        stop_loss=stop,
+                        is_exit=True,
+                        reason="protective stop (re-placed)",
+                        decision_id=meta.get("decision_id") if meta else None,
+                        setup=meta.get("setup") if meta else None,
+                    )
+                    rec = await self.broker.place_order(req)
             except BrokerError as exc:
                 log.warning("re-placing the stop for %s failed: %s", key, exc)
                 self._reprotect_pending = True

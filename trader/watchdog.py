@@ -41,6 +41,7 @@ from trader.models import (
     Mode,
     OrderRecord,
     OrderRequest,
+    OrderStatus,
     OrderType,
     Position,
     Quote,
@@ -61,6 +62,8 @@ APP_TAG_PREFIX = "ai-trader-"  # every order the app or this watchdog sends (ord
 WATCHDOG_CLOSED_PREFIX = "watchdog_closed:"
 # One bad bid must not sell. The app uses the same idea (two monitor ticks).
 STOP_CONFIRM_TICKS = 2
+# Polls in a row a sold bot position must read flat before it is marked sold.
+FLAT_CONFIRM_POLLS = 2
 QTY_EPS = 1e-8
 # The app writes the heartbeat once per monitor interval. Three intervals cover a slow
 # tick and one miss before a healthy app looks dead. Flatten stays a step past that.
@@ -106,6 +109,8 @@ class _Broker(Protocol):
     def quote(self, instrument: Instrument) -> Awaitable[Quote]: ...
 
     def place_order(self, req: OrderRequest) -> Awaitable[OrderRecord]: ...
+
+    def order_status(self, broker_order_id: str) -> Awaitable[OrderRecord | None]: ...
 
     def round_qty(
         self, instrument: Instrument, qty: float, allow_fractional: bool = False
@@ -294,8 +299,10 @@ class CryptoWatchdog:
         self._started_at = started if started.tzinfo else started.replace(tzinfo=UTC)
         self._below_stop: dict[str, int] = {}
         self._attempt_at: dict[str, datetime] = {}
-        # Bot positions this process sent a sell for (key -> position_marker), until seen flat.
-        self._sold: dict[str, str] = {}
+        # Bot positions this process sold (key -> position_marker and the broker id of its
+        # last accepted sell), until seen flat; and how many polls in a row saw them flat.
+        self._sold: dict[str, tuple[str, str]] = {}
+        self._flat_seen: dict[str, int] = {}
         # When this process's broker connection last came (back) up. After a gateway
         # outage both processes reconnect, and the app's reconnect backoff (up to
         # MAX_BACKOFF) can lag this poll loop, so the heartbeat is stale for a while
@@ -318,11 +325,15 @@ class CryptoWatchdog:
     async def tick(self) -> TickResult:
         now = self._now()
         result = TickResult()
-        positions = await self.broker.positions()
+        # Orders first: an app entry that fills meanwhile shows in the positions read.
         open_orders = await self.broker.open_orders()
+        positions = await self.broker.positions()
         metas = self.db.all_position_meta()
         held = {p.instrument.key for p in positions if p.qty > QTY_EPS}
-        self._note_sold_flat(metas, held, _app_buys(open_orders))
+        fresh = self._broker_up_since is None or (
+            self._last_ok_at is not None and now - self._last_ok_at > self._reconnect_gap
+        )
+        await self._note_sold_flat(metas, held, _app_buys(open_orders), fresh)
         managed = [
             pos
             for pos in positions
@@ -381,25 +392,52 @@ class CryptoWatchdog:
                 result.skipped.append(f"not sending: {why}")
             return result
         for close in closes:
-            self._sold[close.instrument.key] = position_marker(metas[close.instrument.key])
-            sent = await self._send(close, now, result)
+            marker = position_marker(metas[close.instrument.key])
+            sent = await self._send(close, now, result, marker)
             if sent is not None:
                 result.closes.append(sent)
         return result
 
-    def _note_sold_flat(
-        self, metas: dict[str, dict[str, Any]], held: set[str], app_buying: set[str]
+    async def _note_sold_flat(
+        self,
+        metas: dict[str, dict[str, Any]],
+        held: set[str],
+        app_buying: set[str],
+        fresh: bool,
     ) -> None:
-        """A bot position this process sold is now flat: mark it sold, so a later buy of the
-        symbol (the owner's, while the app is down) is never taken for it."""
-        for key, marker in list(self._sold.items()):
+        """A bot position this process sold is gone: mark it sold, so a later buy of the
+        symbol (the owner's, while the app is down) is never taken for it. A false mark
+        would leave a bot position unmanaged for good, so it takes all of: this process's
+        last sell filled in full at the broker, and the position flat with no entry of
+        the app's working on FLAT_CONFIRM_POLLS polls in a row (none right after a
+        (re)connect, when the positions read may be empty)."""
+        for key, (marker, order_id) in list(self._sold.items()):
             meta = metas.get(key)
             if meta is None or position_marker(meta) != marker:
-                del self._sold[key]  # the app forgot or replaced that position
-            elif key not in held and key not in app_buying:
-                self.db.set_kv(WATCHDOG_CLOSED_PREFIX + key, marker)
-                del self._sold[key]
-                log.info("%s: sold flat by the watchdog; a later buy is not the bot's", key)
+                self._forget_sold(key)  # the app forgot or replaced that position
+                continue
+            if key in held or key in app_buying:
+                self._flat_seen.pop(key, None)
+                continue
+            if fresh:
+                continue
+            seen = self._flat_seen[key] = self._flat_seen.get(key, 0) + 1
+            if seen < FLAT_CONFIRM_POLLS:
+                continue
+            try:
+                sold = await self.broker.order_status(order_id)
+            except BrokerError as exc:
+                log.warning("%s: could not read the watchdog's sell %s: %s", key, order_id, exc)
+                continue
+            if sold is None or sold.status != OrderStatus.FILLED:
+                continue
+            self.db.set_kv(WATCHDOG_CLOSED_PREFIX + key, marker)
+            self._forget_sold(key)
+            log.info("%s: sold flat by the watchdog; a later buy is not the bot's", key)
+
+    def _forget_sold(self, key: str) -> None:
+        self._sold.pop(key, None)
+        self._flat_seen.pop(key, None)
 
     def note_broker_down(self) -> None:
         """The broker connection failed: the next successful tick starts a new
@@ -489,7 +527,9 @@ class CryptoWatchdog:
             marks[key] = sane_exit_price(quote)
         return marks
 
-    async def _send(self, close: Close, now: datetime, result: TickResult) -> OrderRequest | None:
+    async def _send(
+        self, close: Close, now: datetime, result: TickResult, marker: str
+    ) -> OrderRequest | None:
         tag = new_order_tag(close.instrument.symbol, close.kind)
         req = OrderRequest(
             instrument=close.instrument,
@@ -509,6 +549,12 @@ class CryptoWatchdog:
             log.warning("watchdog close %s failed: %s", close.instrument.key, exc)
             result.skipped.append(f"{close.instrument.key}: {exc}")
             return None
+        if placed.broker_order_id and placed.status not in (
+            OrderStatus.REJECTED,
+            OrderStatus.CANCELLED,
+        ):
+            self._sold[close.instrument.key] = (marker, placed.broker_order_id)
+            self._flat_seen.pop(close.instrument.key, None)
         self.db.audit(
             "watchdog_close",
             {
