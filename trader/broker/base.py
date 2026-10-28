@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 
 from trader.models import (
+    OPEN_ORDER_STATUSES,
     AccountSnapshot,
     AssetClass,
     Bar,
@@ -175,6 +176,17 @@ class Broker(ABC):
                 if order.request.side == Side.SELL and order.request.stop_loss is not None:
                     stops.append(order.request.stop_loss)
         if pos is None or pos.qty <= 0:
+            return None
+        # Another close (a monitor exit, KILL, an approved close) may have sent its market
+        # sell while this one was cancelling: never send a second one (a short).
+        if any(
+            order.request.instrument.key == instrument.key
+            and order.request.side == Side.SELL
+            and order.request.order_type == OrderType.MARKET
+            and order.request.stop_loss is None
+            and order.status in OPEN_ORDER_STATUSES
+            for order in await self.open_orders()
+        ):
             return None
         req = OrderRequest(
             instrument=instrument,

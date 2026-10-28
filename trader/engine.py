@@ -1152,16 +1152,24 @@ class Engine:
             # Again, immediately before the broker call: Reject holds this lock to cancel.
             self._pending(order_id)
             if order.is_exit:
+                key = order.instrument.key
+                # The monitor's exits do not take the entry lock: check and stamp with no
+                # await in between, before the broker call (as Close and the AI close do).
+                if self._close_in_flight(key, self._now()):
+                    self.db.update_order(
+                        order_id, status=OrderStatus.CANCELLED, message="already being closed"
+                    )
+                    return self._get_order(order_id)
+                seq = self._mark_closing(key, order.reason, self._now())
                 placed = await self.broker.close_position(
                     order.instrument, order.reason, trace_id=order.trace_id
                 )
+                self._note_close(key, placed, seq)
                 if placed is None:
                     self.db.update_order(
                         order_id, status=OrderStatus.CANCELLED, message="no position to close"
                     )
                     return self._get_order(order_id)
-                seq = self._mark_closing(order.instrument.key, order.reason, now)
-                self._note_close(order.instrument.key, placed, seq)
             else:
                 placed = await self._send_entry(order, now)
                 # Journal the target as sent: none when winners run (exits.no_target).

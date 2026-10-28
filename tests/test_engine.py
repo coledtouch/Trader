@@ -1433,7 +1433,9 @@ async def test_a_flatten_that_fails_partway_keeps_its_sent_sell_in_flight(db, co
     await h.engine.monitor_tick()
     h.broker.rest = {"STK:F", "STK:T"}
     h.broker.open_orders_calls = 0
-    h.broker.fail_open_orders_on = {3}  # flatten_all: #1 cancel-all, #2 F, #3 T times out
+    # flatten_all: #1 its own, F: #2 cancels and #3 the last check before the sell,
+    # T: #4 times out
+    h.broker.fail_open_orders_on = {4}
     if via == "kill":
         await h.engine.kill()
         assert "KILL switch FAILED" in h.notes.titles()
@@ -1486,6 +1488,97 @@ async def test_an_ai_close_failing_after_the_kill_stamped_is_ignored(db, config)
     await kill
     assert len(_market_sells(h, "STK:F")) == 1
     await _second_close_is_refused(h)
+
+
+def _working_market_sells(h: H, key: str) -> list[OrderRecord]:
+    return [
+        o
+        for o in h.broker.orders.values()
+        if o.request.instrument.key == key
+        and o.status == OrderStatus.SUBMITTED
+        and o.request.side == Side.SELL
+        and o.request.stop_loss is None
+        and o.request.order_type == OrderType.MARKET
+    ]
+
+
+async def _pending_ai_close(db, config) -> tuple[H, OrderRecord]:
+    h = await _resting(db, config)
+    h.engine.settings.exits.time_stop_minutes = 0
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.engine.settings.autopilot = False
+    h.clock.t = datetime(2026, 10, 21, 19, 45, tzinfo=UTC)  # 15:45 New York
+    h.decider.decisions = [
+        hold("F").model_copy(update={"action": TradeAction.CLOSE, "rationale": "fading"})
+    ]
+    await h.engine.run_cycle()
+    [waiting] = h.orders(OrderStatus.PENDING_APPROVAL)
+    h.broker.rest = {"STK:F"}  # market sells are accepted but have not filled yet
+    return h, waiting
+
+
+def _slow_first_cancel(h: H) -> tuple[asyncio.Event, asyncio.Event]:
+    """The first cancel waits, as IBKR's cancel confirmation can (up to seconds)."""
+    gate, entered = asyncio.Event(), asyncio.Event()
+    real_cancel = h.broker.cancel_order
+    armed = [True]
+
+    async def slow_cancel(oid):
+        if armed[0]:
+            armed[0] = False
+            entered.set()
+            await gate.wait()
+        return await real_cancel(oid)
+
+    h.broker.cancel_order = slow_cancel
+    return gate, entered
+
+
+async def test_flatten_during_an_approved_close_sells_once(db, config) -> None:
+    """Review finding: approve sent its close without checking or stamping the marker
+    first, so the 15:50 flatten running meanwhile sent a second full-size sell."""
+    h, waiting = await _pending_ai_close(db, config)
+    gate, entered = _slow_first_cancel(h)
+    approve = asyncio.create_task(h.engine.approve_order(waiting.id))
+    await entered.wait()
+    h.clock.t = datetime(2026, 10, 21, 19, 50, 1, tzinfo=UTC)  # 15:50:01 New York
+    await h.engine.monitor_tick()  # flatten before close
+    gate.set()
+    await approve
+    assert len(_working_market_sells(h, "STK:F")) == 1
+
+
+async def test_approve_during_a_monitor_exit_is_cancelled(db, config) -> None:
+    h, waiting = await _pending_ai_close(db, config)
+    gate, entered = _slow_first_cancel(h)
+    h.clock.t = datetime(2026, 10, 21, 19, 50, 30, tzinfo=UTC)
+    tick = asyncio.create_task(h.engine.monitor_tick())
+    await entered.wait()
+    rec = await h.engine.approve_order(waiting.id)
+    assert rec.status == OrderStatus.CANCELLED and rec.message == "already being closed"
+    gate.set()
+    await tick
+    assert len(_working_market_sells(h, "STK:F")) == 1
+
+
+async def test_kill_during_a_monitor_exit_sells_once(db, config) -> None:
+    """KILL sold F while the monitor's exit waited on a cancel; the monitor's close must
+    see that sell before sending its own (the broker's last check before the sell)."""
+    h = await _resting(db, config)
+    h.engine.settings.exits.time_stop_minutes = 0
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.broker.rest = {"STK:F"}
+    gate, entered = _slow_first_cancel(h)
+    monitor = asyncio.create_task(
+        h.engine._engine_close(Instrument(symbol="F"), "time stop", h.clock())
+    )
+    await entered.wait()
+    await h.engine.kill()
+    gate.set()
+    await monitor
+    assert len(_working_market_sells(h, "STK:F")) == 1
 
 
 async def test_manual_close_refusals(db, config) -> None:
