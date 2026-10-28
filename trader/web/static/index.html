@@ -383,10 +383,11 @@
     <form id="close-form" method="dialog">
       <h2 id="close-title">Close position</h2>
       <p><strong id="close-what"></strong></p>
-      <p class="small muted">Its stop and target at IBKR are cancelled first, then it is sold at
-        market. The bot will not buy this symbol again today.</p>
+      <p class="small muted">The bot's stop and target for it at IBKR are cancelled first, then it
+        is sold at market. The bot will not buy this symbol again today.</p>
       <p id="close-owner" class="small muted" hidden>You opened this position yourself: the bot
-        does not manage it.</p>
+        does not manage it. A sell order you placed for it in TWS or IBKR Mobile must be
+        cancelled there first.</p>
       <div id="close-error" class="form-error" role="alert"></div>
       <div class="dialog-actions">
         <button id="close-cancel" class="btn" type="button" autofocus>Cancel</button>

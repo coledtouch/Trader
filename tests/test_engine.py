@@ -1328,6 +1328,111 @@ async def test_refused_manual_close_restores_the_stop_and_alerts(db, config) -> 
     assert h.broker.pos == {}
 
 
+def _tws_stop(qty: float, price: float):
+    """A GTC sell stop the owner placed in TWS or IBKR Mobile (another API client)."""
+    from ib_async import Order, Trade
+    from ib_async import OrderStatus as IBOrderStatus
+
+    from tests.test_ibkr import PAPER, stock
+
+    order = Order(
+        orderId=0, clientId=0, permId=555, action="SELL", totalQuantity=qty,
+        orderType="STP", auxPrice=price, tif="GTC", account=PAPER,
+    )  # fmt: skip
+    return Trade(stock(), order, IBOrderStatus(status="Submitted"))
+
+
+async def test_close_refused_while_an_order_from_tws_would_outlive_it(db, config) -> None:
+    """Review finding: the bot cannot cancel another client's order, so the close sold the
+    shares and left the owner's TWS stop working on a flat account (a short if it fired).
+    Now nothing is sent until the owner cancels it there."""
+    from tests.test_ibkr import connected_broker, hold, stock
+
+    broker, fake = await connected_broker()
+    hold(fake, stock(), 3)
+    fake.all_open = [_tws_stop(3, 95.0)]
+    notes = RecordingNotifier()
+    engine = Engine(config, db, broker, FakeDecisionMaker(), notifier=notes, clock=FakeClock(NOW))
+    with pytest.raises(ValueError, match="placed in TWS or IBKR Mobile"):
+        await engine.close_position("STK:AAPL")
+    assert fake.placed == [] and fake.cancelled == []
+    assert not engine._closing_now("STK:AAPL", NOW)
+    assert db.get_kv("owner_closed:STK:AAPL") is None
+    fake.all_open = []  # cancelled in TWS: now it closes
+    rec = await engine.close_position("STK:AAPL")
+    assert rec.request.side == Side.SELL and rec.request.qty == 3
+
+
+async def test_refused_close_never_puts_back_another_clients_stop(db, config) -> None:
+    """Base close_position: a stop it could not cancel is not "restored" as a second one."""
+    from tests.test_ibkr import connected_broker, hold, log_error, stock
+
+    broker, fake = await connected_broker()
+    hold(fake, stock(), 3)
+    fake.all_open = [_tws_stop(3, 95.0)]
+
+    def reject_market(trade) -> None:
+        if trade.order.orderType == "MKT":
+            trade.orderStatus.status = "Cancelled"
+            log_error(trade, 201, "Order rejected - reason: test")
+
+    fake.on_place = reject_market
+    rec = await broker.close_position(Instrument(symbol="AAPL"))
+    assert rec is not None and rec.status == OrderStatus.REJECTED
+    assert [o.orderType for _, o in fake.placed] == ["MKT"]  # no second stop
+    assert "protective stop" not in (rec.message or "")
+
+
+async def test_refused_close_alert_says_when_no_stop_was_put_back(db, config) -> None:
+    """Review finding: the alert always claimed "The stop was put back"."""
+    h = await harness(db, config, native=False)  # engine-managed stops: nothing at IBKR
+    await enter_f(h)
+    h.broker.reject_exits = True
+    with pytest.raises(BrokerError):
+        await h.engine.close_position("STK:F")
+    [(title, body, priority)] = [n for n in h.notes.sent if n[0] == "Close F FAILED"]
+    assert "No stop is working at IBKR" in body and "put back" not in body
+    assert priority == "urgent"
+
+
+async def test_close_click_during_an_ai_close_after_a_long_think_sells_once(db, config) -> None:
+    """Review finding: the AI close stamped its marker with the context time (minutes old
+    after a long LLM call) and sent outside the entry lock, so a Close pressed meanwhile
+    sent a second full-size market sell."""
+    h = await harness(db, config)
+    await enter_f(h)
+    h.clock.advance(minutes=5)
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+    real_open_orders = h.broker.open_orders
+
+    async def slow_open_orders():
+        if not entered.is_set():
+            entered.set()
+            await gate.wait()  # the AI close is mid-flight at the broker
+        return await real_open_orders()
+
+    async def think(ctx: DecisionContext) -> None:
+        h.clock.advance(seconds=90)
+        h.broker.open_orders = slow_open_orders  # the AI close's broker call will stall
+
+    maker = SlowMaker(think)
+    maker.decisions = [
+        hold("F").model_copy(update={"action": TradeAction.CLOSE, "rationale": "fading"})
+    ]
+    h.engine._decider = maker
+    cycle = asyncio.create_task(h.engine.run_cycle())
+    await entered.wait()
+    owner = asyncio.create_task(h.engine.close_position("STK:F"))
+    await asyncio.sleep(0)
+    gate.set()
+    await cycle
+    with pytest.raises((ValueError, LookupError)):
+        await owner
+    sells = [r for r in h.broker.placed if r.side == Side.SELL and r.order_type == OrderType.MARKET]
+    assert len(sells) == 1
+
+
 async def test_two_looks_at_one_bad_equity_print_do_not_halt(db, config) -> None:
     """ENG-5: run_cycle runs its own monitor tick right after the monitor loop's. A single
     bad equity snapshot seen by both at the same moment is not a confirmed loss halt."""

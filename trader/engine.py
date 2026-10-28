@@ -963,6 +963,19 @@ class Engine:
             )
             if held is None:
                 raise LookupError(f"no open {inst.symbol} position")
+            # A sell order placed outside the bot cannot be cancelled from here; left
+            # working after the close, it could sell shares no longer held (a short).
+            if any(
+                o.request.instrument.key == key
+                and o.request.side == Side.SELL
+                and o.status in OPEN_ORDER_STATUSES
+                and not self.broker.can_cancel(o)
+                for o in await self.broker.open_orders()
+            ):
+                raise ValueError(
+                    f"{inst.symbol} has a sell order placed in TWS or IBKR Mobile: cancel it "
+                    "there first, or it could sell again after this close"
+                )
             self._closing[key] = now
             self._close_reasons[key] = reason
             self._cancel_pending(f"cancelled: {reason}", key=key)
@@ -982,12 +995,14 @@ class Engine:
             self._closing.pop(key, None)
             self._close_reasons.pop(key, None)
             log.error("close by %s: the broker refused to close %s", actor, refused)
+            restored = "protective stop re-placed at" in (rec.message or "")
             await self._notify(
                 f"Close {inst.symbol} FAILED",
-                f"The broker refused the sell ({_short(refused)}). The stop was put back. "
-                "Check IBKR now.",
-                priority="high",
-                tags=["warning"],
+                f"The broker refused the sell ({_short(refused)}). "
+                + ("The stop was put back. " if restored else "No stop is working at IBKR. ")
+                + "Check IBKR now.",
+                priority="high" if restored else "urgent",
+                tags=["warning"] if restored else ["rotating_light"],
             )
             raise BrokerError(f"the broker refused to close {refused}")
         # The owner overrode the bot: no new entry in this symbol for the rest of the day.
@@ -3199,11 +3214,14 @@ class Engine:
             )
             await self._notify(f"Approve CLOSE {inst.symbol}?", req.reason, tags=["question"])
             return
-        if self._closing_now(inst.key, now):
-            return
-        self._closing[inst.key] = now
-        self._close_reasons[inst.key] = req.reason
-        rec = await self.broker.close_position(inst, reason=req.reason)
+        # Under the entry lock and on the send-time clock (the models may have thought for
+        # minutes): a Close pressed meanwhile is seen here, and this one is seen there.
+        async with self._entry_lock:
+            if self._closing_now(inst.key, self._now()):
+                return
+            self._closing[inst.key] = self._now()
+            self._close_reasons[inst.key] = req.reason
+            rec = await self.broker.close_position(inst, reason=req.reason)
         if rec is not None:
             if rec.request.trace_id:
                 req = req.model_copy(update={"trace_id": rec.request.trace_id})

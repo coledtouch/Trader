@@ -273,7 +273,7 @@ Exit rules (`exits` settings; they only touch positions the bot opened):
 | Daily loss limit | -6% | Halt and close everything (`flatten_on_halt`) once two consecutive checks agree; resume needs 2FA |
 | Daily target | off ($0) | If configured positive and reached, no new entries today; open positions keep their stops |
 | KILL button | | Cancel every order and close every position |
-| Close button | | Close one position at market from **Open positions** (after a confirm): its IBKR stop and target are cancelled first, the stop is put back if the sell is refused, and the bot buys no new shares of that symbol for the rest of the trading day. It works on any position you hold, in shadow mode and while halted; stocks only while the market is open |
+| Close button | | Close one position at market from **Open positions** (after a confirm): its IBKR stop and target are cancelled first, the stop is put back if the sell is refused, and the bot buys no new shares of that symbol for the rest of the trading day. It works on any position you hold, in shadow mode and while halted; stocks only while the market is open. It is refused while a sell order you placed in TWS or IBKR Mobile works on that symbol (the bot cannot cancel it, and it could sell again after the close): cancel that order there first |
 
 Stops only ever move **up**. P&L, stops and R multiples use the bid, because that is what
 a sale would actually get.

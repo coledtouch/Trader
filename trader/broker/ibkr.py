@@ -1218,6 +1218,10 @@ class IBKRBroker(Broker):
             records.append(self._record(trade, request))
         return records
 
+    def can_cancel(self, order: OrderRecord) -> bool:
+        # Other clients' orders (TWS, IBKR Mobile) are listed as "perm:<permId>".
+        return not (order.broker_order_id or "").startswith("perm:")
+
     async def cancel_order(self, broker_order_id: str) -> None:
         self._require_connected()
         trade = self._find_trade(broker_order_id)

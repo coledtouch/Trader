@@ -986,7 +986,7 @@
       try {
         const result = await api('POST', '/api/positions/close', { instrument: target.key });
         if (result && result.status) mergeStatus(result.status);
-        $('close-dialog').close();
+        if (state.closing === target) $('close-dialog').close();
         toast(`Selling ${target.symbol} at market. The bot will not buy it again today.`);
       } catch (err) {
         const reason = String(err.message || '').replace(/\.$/, '');
@@ -996,7 +996,8 @@
         else if (err.status === 0) {
           message = `${err.message} The sell may still go through: check the positions before trying again.`;
         }
-        $('close-error').textContent = message;
+        if ($('close-dialog').open && state.closing === target) $('close-error').textContent = message;
+        else toast(`${target.symbol}: ${message}`, 'error');
       } finally {
         refreshStatus();
       }
@@ -2830,7 +2831,9 @@
       if (isBusy($('kill-confirm'))) event.preventDefault(); // let a running kill finish
     });
     $('close-form').addEventListener('submit', confirmClose);
-    $('close-cancel').addEventListener('click', () => $('close-dialog').close());
+    $('close-cancel').addEventListener('click', () => {
+      if (!isBusy($('close-confirm'))) $('close-dialog').close(); // let a running close finish
+    });
     $('close-dialog').addEventListener('cancel', (event) => {
       if (isBusy($('close-confirm'))) event.preventDefault(); // let a running close finish
     });

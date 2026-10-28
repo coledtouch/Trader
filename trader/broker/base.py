@@ -111,6 +111,11 @@ class Broker(ABC):
         """True if place_order attaches broker-side stop-loss/take-profit orders."""
         return False
 
+    def can_cancel(self, order: OrderRecord) -> bool:
+        """True if cancel_order can cancel this order. False for an order another client of
+        the broker placed (on IBKR: TWS or IBKR Mobile), which only that client can cancel."""
+        return True
+
     def supports_standalone_stops(self, instrument: Instrument) -> bool:
         """True if place_order rests a stop order for a SELL exit carrying stop_loss (used to
         re-place a missing protective stop). False means such a request is rejected."""
@@ -164,6 +169,8 @@ class Broker(ABC):
         stops = [] if restore_stop is None else [restore_stop]
         for order in await self.open_orders():
             if order.request.instrument.key == instrument.key and order.broker_order_id:
+                if not self.can_cancel(order):
+                    continue  # still working: never counted as a stop to put back
                 await self.cancel_order(order.broker_order_id)
                 if order.request.side == Side.SELL and order.request.stop_loss is not None:
                     stops.append(order.request.stop_loss)

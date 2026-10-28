@@ -503,10 +503,14 @@ def test_close_one_position(env):
     assert "running" in body["status"]
     assert env.engine.calls == ["close_position"]
     assert env.db.list_audit(1)[0]["action"] == "position_close"
-    for bad in ["AXGN", "STK:", "OPT:AXGN", "STK:AX GN", "STK:" + "A" * 21, "STK:../x"]:
+    for good in ["STK:BRK B", "STK:BRK.B", "STK:F", "CRYPTO:BTC"]:  # IBKR share classes
+        response = env.client.post(url, json={"instrument": good}, headers=headers)
+        assert response.status_code == 200, good
+    env.engine.calls.clear()
+    for bad in ["AXGN", "STK:", "OPT:AXGN", "STK: BRK", "STK:BRK ", "STK:" + "A" * 21, "STK:../x"]:
         response = env.client.post(url, json={"instrument": bad}, headers=headers)
         assert response.status_code == 422, bad
-    assert env.engine.calls == ["close_position"]
+    assert env.engine.calls == []
     missing = env.client.post(url, json={"instrument": "STK:NONE"}, headers=headers)
     assert missing.status_code == 409 and missing.json()["detail"] == "no open NONE position"
     shut = env.client.post(url, json={"instrument": "STK:SHUT"}, headers=headers)

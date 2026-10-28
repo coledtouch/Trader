@@ -223,7 +223,10 @@ class SettingsBody(BaseModel):
 
 
 class CloseBody(BaseModel):
-    instrument: str = Field(pattern=r"^(STK|CRYPTO):[A-Za-z0-9.\-]{1,20}$")
+    # IBKR share classes have an inner space ("BRK B"); no leading or trailing one.
+    instrument: str = Field(
+        pattern=r"^(STK|CRYPTO):[A-Za-z0-9](?:[A-Za-z0-9. \-]{0,18}[A-Za-z0-9.\-])?$"
+    )
 
 
 class ResearchBody(BaseModel):
