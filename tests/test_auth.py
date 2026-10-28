@@ -295,6 +295,9 @@ def test_a_strangers_guesses_do_not_block_the_owners_step_ups(db, clock, secret)
             True,
         ),
         ({"login_password_required": False, "broker": "ibkr", "ib_port": 4003}, "DU1234567", True),
+        ({"login_password_required": False, "broker": "ibkr", "ib_port": 4001}, "DU1234567", True),
+        ({"login_password_required": False, "broker": "ibkr", "ib_port": 7496}, "DU1234567", True),
+        ({"login_password_required": False, "broker": "ibkr"}, "du1234567", False),  # lowercase
         (
             {"login_password_required": False, "broker": "ibkr", "ib_account": "DU1234567"},
             "DU1234567",

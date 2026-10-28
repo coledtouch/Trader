@@ -1482,18 +1482,18 @@ class Engine:
         await self._on_account_changed(known, current, now)
 
     def _end_code_only_sessions(self, account: str) -> None:
-        """A session opened with the code alone (paper, Cloudflare Access off) must not carry
-        over to a live account: end every session, so the next sign-in needs the password."""
+        """With Cloudflare Access off, a session opened with the code alone on paper must not
+        carry over to a live account: end every session, so the next sign-in needs the
+        password. Also when the password was turned back on in the same restart (sessions
+        outlive restarts, and how one was opened is not recorded): one extra sign-in."""
         cfg = self.config
-        if cfg.login_password_required or cfg.cf_access_enabled or cfg.broker == "sim":
+        if cfg.cf_access_enabled or cfg.broker == "sim":
             return
         self.db.delete_all_sessions()
-        log.warning(
-            "now on live account %s: every session ended (password required)", _mask(account)
-        )
+        log.warning("now on live account %s: every session ended", _mask(account))
         self.db.audit(
             "sessions_ended",
-            {"account": _mask(account), "reason": "live account: the password is required"},
+            {"account": _mask(account), "reason": "live account without Cloudflare Access"},
             actor="engine",
         )
 

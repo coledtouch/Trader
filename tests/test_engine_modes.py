@@ -406,20 +406,35 @@ async def test_account_change_starts_a_new_journal_epoch(db: Database, config: A
     assert h.broker.pos
 
 
-@pytest.mark.parametrize(("password_required", "ended"), [(False, True), (True, False)])
-async def test_switching_to_a_live_account_ends_code_only_sessions(
-    db: Database, config: AppConfig, password_required: bool, ended: bool
+ACCESS = {"cf_access_team_domain": "team.cloudflareaccess.com", "cf_access_aud": "aud"}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "accounts", "ended"),
+    [
+        # A code-only session opened on paper must not reach the live account (Access off),
+        # also when the same restart turned the password back on (third review).
+        ({"login_password_required": False}, ["DUX123456", "U7654321"], True),
+        ({"login_password_required": True}, ["DUX123456", "U7654321"], True),
+        ({"login_password_required": False}, ["U7654321"], True),  # first connect is live
+        # Sessions stay: paper accounts (first connect, switches, lowercase ids), behind
+        # Cloudflare Access, and the simulator.
+        ({"login_password_required": False}, ["DUX123456"], False),
+        ({"login_password_required": False}, ["dux123456", "DUY987654"], False),
+        ({"login_password_required": False, **ACCESS}, ["DUX123456", "U7654321"], False),
+        ({"login_password_required": False, "broker": "sim"}, ["DUX123456", "U7654321"], False),
+    ],
+)
+async def test_switching_to_a_live_account_ends_sessions_without_access(
+    db: Database, config: AppConfig, overrides: dict, accounts: list[str], ended: bool
 ) -> None:
-    """Re-review: a session opened with the code alone on paper (Access off) must not carry
-    over to the live account; with the password required, sessions stay."""
-    cfg = config.model_copy(update={"broker": "ibkr", "login_password_required": password_required})
+    cfg = config.model_copy(update={"broker": "ibkr", **overrides})
     h = await harness(db, cfg)
-    switch_account(h.broker, "DUX123456")
-    await h.engine.monitor_tick()
     db.create_session("hash-of-a-token", "csrf", "10.0.0.1", "phone")
-    switch_account(h.broker, "U7654321")
-    h.clock.advance(minutes=2)
-    await h.engine.monitor_tick()
+    for account in accounts:
+        switch_account(h.broker, account)
+        h.clock.advance(minutes=2)
+        await h.engine.monitor_tick()
     assert (db.get_session("hash-of-a-token") is None) is ended
     assert any(a["action"] == "sessions_ended" for a in db.list_audit()) is ended
 

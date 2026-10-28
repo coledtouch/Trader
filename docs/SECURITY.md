@@ -68,8 +68,9 @@ With Access off, the password is required anyway when `TRADER_IB_PORT` is a live
 (4003, as in DEPLOY.md Part C, or 4001/7496), when `TRADER_IB_ACCOUNT` or the account the
 app last connected to is not a paper ("DU") account, or when no account is known yet.
 Shadow mode starts without Access, so this is what keeps a live account behind the
-password. When the app first connects to a live account, it also ends every session, so
-none opened with the code alone on paper carries over.
+password. With Access off, the app also ends every session when it first connects to a
+live account (in either mode: sessions outlive restarts), so none opened with the code
+alone on paper carries over. You sign in once more.
 
 What it costs: the code becomes the only secret. At any moment 3 of the 1,000,000 possible
 codes are valid, so a stranger who guesses has odds of 3 in a million per try. To keep
