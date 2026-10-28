@@ -492,13 +492,18 @@ async def test_symbols_quoted_once_per_cycle_are_not_called_stale_between_cycles
 def test_quote_block_reason_names_the_failed_check() -> None:
     from datetime import UTC, datetime, timedelta
 
-    from trader.risk import quote_block_reason
+    from trader.risk import quote_block
 
     now = datetime(2026, 10, 26, 18, 0, tzinfo=UTC)
     good = Quote(instrument=Instrument(symbol="F"), bid=10.00, ask=10.01, last=10.0, ts=now)
 
     def why(**changes):
-        return quote_block_reason(good.model_copy(update=changes), now, 15, 1.0)
+        block = quote_block(good.model_copy(update=changes), now, 15, 1.0)
+        return block.reason if block else None
+
+    def market(**changes):
+        block = quote_block(good.model_copy(update=changes), now, 15, 1.0)
+        return block is not None and block.market
 
     assert why() is None
     assert why(bid=None, ask=None, last=None) == "no price received"
@@ -508,3 +513,30 @@ def test_quote_block_reason_names_the_failed_check() -> None:
     assert why(ts=now - timedelta(seconds=600), delayed=True) is None  # delayed-feed grace
     assert why(halted=True) == "halted"
     assert why(bid=10.2, ask=10.1).startswith("looks wrong: crossed quote")
+    # A halt or a wide spread is the market's doing; everything else is a data problem.
+    assert market(halted=True) and market(ask=10.5)
+    assert not any(
+        market(**changes)
+        for changes in (
+            {"bid": None, "ask": None, "last": None},
+            {"bid": None, "ask": None},
+            {"ts": now - timedelta(seconds=6196)},
+            {"ts": now + timedelta(seconds=30)},
+            {"bid": 10.2, "ask": 10.1},
+        )
+    )
+
+
+async def test_quote_health_flags_wide_spreads_as_market_blocks(db, config) -> None:
+    """The dashboard keeps the feed chip green for a wide spread, and not for stale data."""
+    h = await harness(db, config)
+    h.broker.set_price("T", 20.0, spread=1.0)  # 5% wide, the limit is 0.3%
+    await h.engine.run_cycle()
+    health = {q.symbol: q for q in h.engine.status().quote_health}
+    assert not health["T"].valid and health["T"].market_block
+    assert health["F"].valid and not health["F"].market_block
+    h.clock.advance(minutes=14)  # missed decision cycles: out of date, a data problem
+    health = {q.symbol: q for q in h.engine.status().quote_health}
+    assert set(health) == {"F", "T"}
+    for q in health.values():  # the old spread no longer hides that T is out of date too
+        assert q.problem.startswith("not re-checked") and not q.market_block, q

@@ -74,7 +74,7 @@ from trader.risk import (
     STALE_QUOTE_INTERVALS,
     RiskManager,
     is_soft_halt,
-    quote_block_reason,
+    quote_block,
     sane_exit_price,
 )
 from trader.strategy.consensus import PREFIX as CONSENSUS_PREFIX
@@ -1166,9 +1166,10 @@ class Engine:
         key = quote.instrument.key
         # The quote as the bot saw it when it last fetched it (what an entry check sees).
         quoted_at = self._quoted_at.get(key, now)
-        problem = quote_block_reason(
+        block = quote_block(
             quote, quoted_at, self.settings.monitor_seconds, self.risk.limits.max_spread_pct
         )
+        problem, market = (block.reason, block.market) if block else (None, False)
         # Held positions are re-quoted every monitor tick, other symbols once per decision
         # cycle (an entry always re-quotes first): only a missed round makes it out of date.
         held = any(p.qty > 0 and p.instrument.key == key for p in self._positions)
@@ -1183,8 +1184,10 @@ class Engine:
                 + DECISION_MAX_AGE.total_seconds()
             )
         since = (_aware(now) - _aware(quoted_at)).total_seconds()
-        if problem is None and since > allowed:
-            problem = f"not re-checked for {since:.0f}s"
+        # Out-of-date data outranks a market condition seen in it: the halt or spread may
+        # be long over, and the feed is what needs attention.
+        if (problem is None or market) and since > allowed:
+            problem, market = f"not re-checked for {since:.0f}s", False
         cooldown = self.risk.limits.halt_cooldown_minutes
         halted_at = self._last_halt_at.get(key)
         if problem is None and halted_at is not None and cooldown > 0:
@@ -1193,6 +1196,7 @@ class Engine:
                 problem = (
                     f"halted {since.total_seconds() / 60:.0f} min ago (cooldown {cooldown} min)"
                 )
+                market = True
         is_stock = quote.instrument.asset_class == AssetClass.STOCK
         delayed = quote.delayed or (self.broker.data_delayed and is_stock)
         return {
@@ -1206,6 +1210,7 @@ class Engine:
             "has_price": quote.price is not None and math.isfinite(quote.price),
             "valid": problem is None,
             "problem": problem,
+            "market_block": problem is not None and market,
         }
 
     def _prune_quote_cache(self, now: datetime) -> None:

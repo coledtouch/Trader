@@ -716,6 +716,8 @@ async def test_halted_symbol_not_entered_and_cooldown(db, config) -> None:
     assert batch is not None and batch.candidates == [] and not h.decider.calls
     assert not [r for r in h.broker.placed if r.side == Side.BUY]
     assert "F is halted" in db.list_signals()[0].skip_reason
+    [f] = [q for q in h.engine.status().quote_health if q.symbol == "F"]
+    assert not f.valid and f.problem == "halted" and f.market_block
 
     h.broker.set_price("F", 10.0)  # reopened, but inside the 15 min cooldown
     h.clock.advance(minutes=5)
@@ -725,6 +727,7 @@ async def test_halted_symbol_not_entered_and_cooldown(db, config) -> None:
     # The dashboard says why, instead of calling the fresh quote usable.
     [f] = [q for q in h.engine.status().quote_health if q.symbol == "F"]
     assert not f.valid and f.problem == "halted 5 min ago (cooldown 15 min)"
+    assert f.market_block  # the market's doing, not a data problem
 
     h.clock.advance(minutes=16)
     await h.engine.run_cycle()

@@ -555,6 +555,8 @@ class QuoteHealth(BaseModel):
     delay_blocks_entry: bool = False
     valid: bool = False
     problem: str | None = None  # why the bot would not enter on it (None when usable)
+    # Blocked by the market (a halt or a wide spread), not by a problem with the data.
+    market_block: bool = False
 
 
 class EngineStatus(BaseModel):

@@ -821,7 +821,8 @@
     setChip('chip-market', s.stock_market_open ? 'Market open' : 'Market closed', s.stock_market_open ? 'ok' : null);
     const quotes = asList(s.quote_health || state.data.quote_health);
     const delayed = Boolean(s.data_delayed || quotes.some((q) => q.delayed));
-    const blockedQuotes = quotes.some((q) => !q.valid);
+    // A halt or a wide spread blocks entries in that symbol, but the feed itself is fine.
+    const blockedQuotes = quotes.some((q) => !q.valid && !q.market_block);
     setChip('chip-data', s.broker === 'sim' ? 'Synthetic data' : delayed ? 'Delayed data' : blockedQuotes ? 'Quotes need review' : quotes.length ? 'Real-time feed' : 'Data not verified',
       delayed || blockedQuotes ? 'warn' : s.broker === 'sim' || !quotes.length ? null : 'ok');
     $('market-data-banner').hidden = !delayed;
