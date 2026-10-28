@@ -1387,3 +1387,28 @@ async def test_close_is_not_blocked_by_another_clients_order_listed_as_market(
     rec = await broker.close_position(AAPL, "time stop")
     assert rec is not None and rec.status != OrderStatus.REJECTED
     assert [o.orderType for _, o in fake.placed[before:]] == ["MKT"]
+
+
+async def test_close_puts_the_stop_back_when_its_last_check_fails() -> None:
+    """Review finding: the last open-orders check before the market sell runs after the
+    bracket stop is cancelled; when it timed out the position was left with no stop."""
+    broker, fake, stop = await filled_bracket()
+    real = fake.reqAllOpenOrdersAsync
+    calls = 0
+
+    async def second_call_times_out():
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise TimeoutError
+        return await real()
+
+    fake.reqAllOpenOrdersAsync = second_call_times_out
+    before = len(fake.placed)
+    with pytest.raises(BrokerError):
+        await broker.close_position(AAPL, "time stop")
+    assert stop.orderStatus.status == "Cancelled"
+    new = [o for _, o in fake.placed[before:]]
+    assert [(o.action, o.orderType, o.auxPrice, o.tif) for o in new] == [
+        ("SELL", "STP", 98.12, "GTC")
+    ]

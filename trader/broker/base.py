@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from abc import ABC, abstractmethod
 from datetime import datetime
@@ -23,6 +24,8 @@ from trader.models import (
     Side,
     order_trace_id,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class BrokerError(Exception):
@@ -177,6 +180,32 @@ class Broker(ABC):
                     stops.append(order.request.stop_loss)
         if pos is None or pos.qty <= 0:
             return None
+        req = OrderRequest(
+            instrument=instrument,
+            side=Side.SELL,
+            qty=pos.qty,
+            order_type=OrderType.MARKET,
+            is_exit=True,
+            reason=reason or "close position",
+            trace_id=order_trace_id(existing=trace_id),
+        )
+        try:
+            working = await self.open_orders()
+        except BrokerError:
+            # The stop is already cancelled: never leave the position without it.
+            if stops and self.supports_standalone_stops(instrument):
+                try:
+                    await self.place_order(
+                        req.model_copy(
+                            update={
+                                "stop_loss": max(stops),
+                                "reason": "protective stop (exit check failed)",
+                            }
+                        )
+                    )
+                except BrokerError as exc:
+                    logger.warning("re-placing the stop for %s failed: %s", instrument.key, exc)
+            raise
         # Another close of this app (a monitor exit, KILL, an approved close) may have sent
         # its market sell while this one was cancelling: never send a second one (a short).
         # Only this client's orders count: another client's (TWS, IBKR Mobile) may be listed
@@ -188,18 +217,9 @@ class Broker(ABC):
             and order.request.stop_loss is None
             and order.status in OPEN_ORDER_STATUSES
             and self.can_cancel(order)
-            for order in await self.open_orders()
+            for order in working
         ):
             return None
-        req = OrderRequest(
-            instrument=instrument,
-            side=Side.SELL,
-            qty=pos.qty,
-            order_type=OrderType.MARKET,
-            is_exit=True,
-            reason=reason or "close position",
-            trace_id=order_trace_id(existing=trace_id),
-        )
         record = await self.place_order(req)
         if (
             record.status == OrderStatus.REJECTED
