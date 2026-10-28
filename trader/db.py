@@ -398,6 +398,12 @@ class Database:
             )
         return int(row["n"]) if row else 0
 
+    def delete_failed_logins(self) -> int:
+        """Remove every failed attempt (the CLI `unlock`). Returns how many were removed."""
+        row = self._one("SELECT COUNT(*) AS n FROM login_attempts WHERE success = 0")
+        self._exec("DELETE FROM login_attempts WHERE success = 0")
+        return int(row["n"]) if row else 0
+
     def purge_login_attempts(self, before: datetime) -> None:
         self._exec("DELETE FROM login_attempts WHERE ts < ?", (_iso(before),))
 

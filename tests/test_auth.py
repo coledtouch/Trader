@@ -255,12 +255,86 @@ def test_code_only_login_caps_failures_per_day(db, clock, secret):
         with pytest.raises(InvalidCredentials):
             auth.login("", _wrong_code(secret, clock), f"10.3.0.{i}")
         clock.advance(minutes=20)
-    with pytest.raises(RateLimited):
+    with pytest.raises(RateLimited) as limited:
         auth.login("", code(secret, clock), "10.4.0.1")  # even the right code, from anywhere
-    with pytest.raises(RateLimited):
-        auth.step_up(code(secret, clock), "10.4.0.1")
+    assert limited.value.daily
     clock.advance(hours=24)  # the failures age out
     auth.login("", code(secret, clock), "10.4.0.1")
+
+
+def test_a_strangers_guesses_do_not_block_the_owners_step_ups(db, clock, secret):
+    """Review finding: the daily cap also refused step-ups in the owner's open session, so
+    ~20 guesses a day from anyone kept resume and loosening limits locked."""
+    config = make_config(login_password_required=False, login_daily_failures=4)
+    auth = Authenticator(config, db, hasher=FAST, clock=clock)
+    auth.set_owner(PASSWORD, secret)
+    for i in range(4):
+        with pytest.raises(InvalidCredentials):
+            auth.login("", _wrong_code(secret, clock), f"10.7.0.{i}")
+        clock.advance(minutes=20)
+    with pytest.raises(RateLimited):
+        auth.login("", code(secret, clock), "10.8.0.1")
+    auth.step_up(code(secret, clock), "10.8.0.1")  # the owner, signed in, is not blocked
+    clock.advance(seconds=30)
+    assert auth.unlock() == 4  # the CLI `unlock`: sign-in works again at once
+    auth.login("", code(secret, clock), "10.8.0.1")
+
+
+@pytest.mark.parametrize(
+    ("overrides", "account", "required"),
+    [
+        ({}, None, True),  # the default keeps the password
+        ({"login_password_required": False}, None, False),  # simulator
+        ({"login_password_required": False, "broker": "ibkr"}, "DU1234567", False),  # paper
+        ({"login_password_required": False, "broker": "ibkr"}, "U1234567", True),  # live
+        ({"login_password_required": False, "broker": "ibkr"}, None, True),  # unknown yet
+        (
+            {
+                "login_password_required": False,
+                "broker": "ibkr",
+                "cf_access_team_domain": "team.cloudflareaccess.com",
+                "cf_access_aud": "aud",
+            },
+            "U1234567",
+            False,  # behind Cloudflare Access, the live account may use the code alone
+        ),
+    ],
+)
+def test_code_only_applies_only_behind_access_or_on_paper(
+    db, clock, secret, overrides, account, required
+):
+    """Review finding: shadow mode (a live account, TRADER_ALLOW_LIVE=false) starts without
+    Cloudflare Access, so the code alone must not open a live account's dashboard there."""
+    auth = Authenticator(make_config(**overrides), db, hasher=FAST, clock=clock)
+    auth.set_owner(PASSWORD, secret)
+    if account:
+        db.set_kv("broker_account", account)
+    assert auth.password_required() is required
+    if required:
+        with pytest.raises(InvalidCredentials):
+            auth.login("", code(secret, clock), "10.9.0.1")
+    else:
+        auth.login("", code(secret, clock), "10.9.0.1")
+
+
+def test_cli_unlock_forgets_failed_attempts(tmp_path, monkeypatch, capsys):
+    env_file = tmp_path / ".env"
+    key = crypto.generate_secret_key()
+    env_file.write_text(f"TRADER_SECRET_KEY={key}\nTRADER_BROKER=sim\n", encoding="utf-8")
+    monkeypatch.delenv("TRADER_SECRET_KEY", raising=False)
+    monkeypatch.setenv("TRADER_DATA_DIR", str(tmp_path / "data"))
+    (tmp_path / "data").mkdir()
+    db = Database(tmp_path / "data" / "trader.db")
+    for _ in range(3):
+        db.record_login_attempt("10.0.0.1", success=False)
+    db.record_login_attempt("10.0.0.1", success=True)
+    db.close()
+    assert cli.main(["unlock", "--env-file", str(env_file)]) == 0
+    assert "3 failed attempt(s) forgotten" in capsys.readouterr().out
+    db = Database(tmp_path / "data" / "trader.db")
+    assert db.count_failed_logins(datetime.now(UTC) - timedelta(days=1)) == 0
+    assert [row["action"] for row in db.list_audit(5)][0] == "unlock"
+    db.close()
 
 
 def test_the_daily_cap_applies_only_without_a_password(auth, secret, clock):

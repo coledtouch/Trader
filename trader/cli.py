@@ -1,7 +1,7 @@
 """Command line interface: `python -m trader <command>`.
 
-Commands: serve, setup, reset-password, reset-2fa, logout-all, disarm, status, notify-test,
-paper-test, backup, watchdog, backtest, research.
+Commands: serve, setup, reset-password, reset-2fa, logout-all, unlock, disarm, status,
+notify-test, paper-test, backup, watchdog, backtest, research.
 reset-password, reset-2fa, logout-all and disarm also clear the live-trading arm (the
 compromise response): real-money orders then need a fresh Arm with a 2FA code.
 
@@ -387,6 +387,22 @@ def cmd_logout_all(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_unlock(args: argparse.Namespace) -> int:
+    """Forget failed sign-ins and 2FA codes: ends a sign-in lockout (for example the
+    code-only daily cap kept tripped by a stranger's guesses)."""
+    config = _config(args)
+    db = Database(config.db_path)
+    try:
+        removed = Authenticator(config, db).unlock()
+        db.audit("unlock", {"failures_removed": removed}, actor="cli")
+    finally:
+        db.close()
+    print(f"Sign-in unlocked: {removed} failed attempt(s) forgotten.")
+    if removed:
+        print("The audit log lists each failed attempt with the address it came from.")
+    return 0
+
+
 def cmd_push_devices(args: argparse.Namespace) -> int:
     """List the devices that get phone alerts (no endpoints or keys)."""
     config = _config(args)
@@ -680,6 +696,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser(
         "logout-all", parents=[common], help="sign out every session (also disarms live trading)"
     ).set_defaults(func=cmd_logout_all)
+    sub.add_parser(
+        "unlock", parents=[common], help="end a sign-in lockout (forget failed attempts)"
+    ).set_defaults(func=cmd_unlock)
     sub.add_parser(
         "push-devices", parents=[common], help="list the devices that get phone alerts"
     ).set_defaults(func=cmd_push_devices)

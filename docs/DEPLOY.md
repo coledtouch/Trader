@@ -303,6 +303,9 @@ new entry is recorded as BLOCKED ("shadow mode") and nothing is bought. This che
 data, balances and the day-trade counter without risk. (Shadow mode still lets the bot
 close positions *it* opened; at this stage it has none.)
 
+If you removed Cloudflare Access for code-only sign-in on paper (SECURITY.md, "Code-only
+sign-in"), put it back first, with both `TRADER_CF_ACCESS_*` values.
+
 1. Edit `.env`:
    ```
    TWS_USERID=YOUR-LIVE-USERNAME
@@ -385,6 +388,7 @@ All of these start with `cd ~/Trader`.
 | Stop phone alerts to one device (lost phone) | `docker compose exec trader python -m trader push-remove DEVICE-ID` |
 | Reset phone alerts (new key; devices subscribe again on their next start) | `docker compose exec trader python -m trader push-reset` |
 | Check the bot's orders reach IBKR with their stop-loss (paper only, cannot fill) | `docker compose exec trader python -m trader paper-test` |
+| End a sign-in lockout (forget failed attempts) | `docker compose exec trader python -m trader unlock` |
 | Back up the database now (also done every night) | `docker compose exec trader python -m trader backup` |
 | Restart only the app (gateway stays logged in) | `docker compose restart trader` (keeps the old `.env` values) |
 | Apply `.env` changes | `docker compose up -d` (`docker compose restart` does **not** reload `.env`) |

@@ -630,9 +630,10 @@ def create_app(
             token, session = await run_in_threadpool(
                 auth.login, body.password, body.totp, ip, request.headers.get("user-agent")
             )
-        except RateLimited:
-            audit(request, "login_rate_limited")
-            raise HTTPException(status_code=429, detail="too many failed attempts") from None
+        except RateLimited as exc:
+            audit(request, "login_rate_limited", {"daily": True} if exc.daily else None)
+            detail = "too many failed codes today" if exc.daily else "too many failed attempts"
+            raise HTTPException(status_code=429, detail=detail) from None
         except InvalidCredentials:
             audit(request, "login_failed")
             raise HTTPException(status_code=401, detail="invalid credentials") from None
@@ -657,7 +658,7 @@ def create_app(
         session = auth.get_session(request.cookies.get(auth.cookie_name))
         if session is None:
             # The sign-in page asks for a password only when one is required.
-            return {"authenticated": False, "password": auth.config.login_password_required}
+            return {"authenticated": False, "password": auth.password_required()}
         return {"authenticated": True, "csrf": session.csrf_token}
 
     # ------------------------------------------------------------ read-only data

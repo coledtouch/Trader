@@ -36,6 +36,7 @@ MIN_PASSWORD_LENGTH = 12
 MAX_PASSWORD_LENGTH = 1024
 LOGIN_WINDOW = timedelta(minutes=15)  # rate limit and lockout window
 LOGIN_DAY = timedelta(days=1)  # daily cap on failed codes when no password is required
+BROKER_ACCOUNT_KEY = "broker_account"  # kv written by the engine (engine.ACCOUNT_KEY)
 TOTP_VALID_WINDOW = 1  # accept the previous, current and next 30 s step
 TOTP_ISSUER = "AI Trader"
 TOTP_ACCOUNT = "owner"
@@ -57,7 +58,12 @@ class InvalidCredentials(AuthError):
 
 
 class RateLimited(AuthError):
-    """Too many failed attempts from this IP, or the global lockout is active."""
+    """Too many failed attempts from this IP, or the global lockout is active. `daily`:
+    the code-only daily cap tripped (it lasts until failures age out or `unlock`)."""
+
+    def __init__(self, message: str, *, daily: bool = False) -> None:
+        super().__init__(message)
+        self.daily = daily
 
 
 class StepUpRequired(AuthError):
@@ -222,23 +228,44 @@ class Authenticator:
             crypto.decrypt(self.config.secret_key, auth["totp_secret_enc"])
 
     # ------------------------------------------------------------ login and step-up
+    def password_required(self) -> bool:
+        """Whether signing in needs the password as well as the code.
+
+        Code-only sign-in (login_password_required off) applies only behind Cloudflare
+        Access or on a paper or simulator account. With Access off and a live or not yet
+        known IBKR account (shadow mode starts without Access), the password stays required.
+        """
+        if self.config.login_password_required:
+            return True
+        if self.config.cf_access_enabled or self.config.broker == "sim":
+            return False
+        # The account the engine last connected to; IBKR paper accounts start with "DU".
+        account = (self.db.get_kv(BROKER_ACCOUNT_KEY) or self.config.ib_account).strip()
+        return not account.upper().startswith("DU")
+
     def rate_limited(self, ip: str, now: datetime | None = None) -> bool:
         now = now or self._clock()
         since = now - LOGIN_WINDOW
         if self.db.count_failed_logins(since) >= self.config.login_lockout_failures:
             return True
-        # Without a password a guesser needs only the code: 3 of a million are valid at
-        # any time. The 15-minute lockout alone would allow ~960 guesses a day.
-        if not self.config.login_password_required and (
-            self.db.count_failed_logins(now - LOGIN_DAY) >= self.config.login_daily_failures
-        ):
-            return True
         return self.db.count_failed_logins(since, ip=ip) >= self.config.login_max_attempts_per_ip
+
+    def daily_cap_reached(self, now: datetime) -> bool:
+        """Without a password a guesser needs only the code: 3 of a million are valid at any
+        time, and the 15-minute lockout alone would allow ~960 guesses a day. Sign-ins only:
+        a stranger's guesses must not block the owner's step-ups in an open session."""
+        failures = self.db.count_failed_logins(now - LOGIN_DAY)
+        return failures >= self.config.login_daily_failures
+
+    def unlock(self) -> int:
+        """Forget failed sign-ins and step-ups (CLI `unlock`). Returns how many."""
+        with self._lock:
+            return self.db.delete_failed_logins()
 
     def login(
         self, password: str, totp: str, ip: str, user_agent: str | None = None
     ) -> tuple[str, Session]:
-        """Verify password + TOTP (the code alone when login_password_required is off) and
+        """Verify password + TOTP (the code alone when password_required() is False) and
         open a new session. Returns (cookie token, session).
 
         Raises RateLimited before checking anything when limited (such attempts are not
@@ -247,12 +274,14 @@ class Authenticator:
         failure. When a password is required its hash is always computed, even when no
         owner exists, so timing does not reveal why a login failed.
         """
-        need_password = self.config.login_password_required
+        need_password = self.password_required()
         with self._lock:  # check, verify and record atomically (no burst past the limits)
             now = self._clock()
             self.db.purge_login_attempts(now - LOGIN_DAY)
             if self.rate_limited(ip, now):
                 raise RateLimited("too many failed attempts; try again later")
+            if not need_password and self.daily_cap_reached(now):
+                raise RateLimited("too many failed codes today", daily=True)
             auth = self.db.get_auth()
             password_ok = self._check_password(auth, password) if need_password else True
             secret = self._totp_secret(auth)

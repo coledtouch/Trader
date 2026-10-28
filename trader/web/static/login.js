@@ -74,6 +74,33 @@
     if (document.activeElement === password || document.activeElement === document.body) code.focus();
   }
 
+  /** Back to password + code (the server changed mode while this page was open). */
+  function passwordMode() {
+    passwordField.hidden = false;
+    password.required = true;
+    $('login-intro').textContent = 'Sign in with your password and the 6-digit code from your authenticator app.';
+  }
+
+  /** True when the server now asks for a password too. */
+  async function serverWantsPassword() {
+    try {
+      const res = await request('GET', '/api/session');
+      if (!res.ok || !isJson(res)) return false;
+      const data = await res.json();
+      return Boolean(data) && data.authenticated === false && data.password !== false;
+    } catch {
+      return false;
+    }
+  }
+
+  async function detailOf(res) {
+    try {
+      return isJson(res) ? ((await res.json()) || {}).detail : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   async function signIn(event) {
     event.preventDefault();
     if (submit.disabled) return;
@@ -98,8 +125,13 @@
       }
       code.value = '';
       if (proxyBlocked(res)) showError('Session expired - reload to sign in again');
-      else if (res.status === 401) showError(passwordField.hidden ? 'Incorrect code.' : 'Incorrect password or code.', code);
-      else if (res.status === 429) showError('Too many failed attempts. Wait 15 minutes, then try again (after many failures, up to a day).');
+      else if (res.status === 401 && passwordField.hidden && await serverWantsPassword()) {
+        passwordMode();
+        showError('Sign-in now needs your password too. Enter it and a new code.', password);
+      } else if (res.status === 401) showError(passwordField.hidden ? 'Incorrect code.' : 'Incorrect password or code.', code);
+      else if (res.status === 429 && (await detailOf(res)) === 'too many failed codes today') {
+        showError('Too many wrong codes in the last 24 hours, so sign-in is locked. It reopens as they age out, or run "python -m trader unlock" on the server.');
+      } else if (res.status === 429) showError('Too many failed attempts. Wait 15 minutes, then try again.');
       else showError(`Sign-in failed (HTTP ${res.status}). Try again.`, code);
     } catch (err) {
       const timedOut = err && err.name === 'AbortError';

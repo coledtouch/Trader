@@ -201,7 +201,7 @@ def test_healthz_and_no_docs(env):
         assert env.client.get(path).status_code == 404
 
 
-@pytest.mark.parametrize("asset", ["app.js?v=19", "login.js?v=19", "styles.css?v=19", "sw.js"])
+@pytest.mark.parametrize("asset", ["app.js?v=20", "login.js?v=20", "styles.css?v=20", "sw.js"])
 def test_executable_shell_assets_revalidate_on_deploy(env, asset):
     response = env.client.get(f"/static/{asset}")
     assert response.status_code == 200
@@ -386,6 +386,22 @@ def test_code_only_sign_in():
         response = client.post("/api/auth/login", json={"totp": ctx.code()})
         assert response.status_code == 200, response.text
         assert client.get("/api/session").json()["authenticated"] is True
+    ctx.db.close()
+
+
+def test_code_only_daily_lock_and_live_account_over_http():
+    ctx = build(login_password_required=False, login_daily_failures=2, broker="ibkr")
+    ctx.db.set_kv("broker_account", "DU1234567")  # paper: the code alone signs in
+    with TestClient(ctx.app) as client:
+        assert client.get("/api/session").json() == {"authenticated": False, "password": False}
+        wrong = "000000" if ctx.code() != "000000" else "111111"
+        for _ in range(2):
+            assert client.post("/api/auth/login", json={"totp": wrong}).status_code == 401
+        locked = client.post("/api/auth/login", json={"totp": ctx.code()})
+        assert locked.status_code == 429
+        assert locked.json() == {"detail": "too many failed codes today"}
+        ctx.db.set_kv("broker_account", "U1234567")  # now a live account, no Access
+        assert client.get("/api/session").json() == {"authenticated": False, "password": True}
     ctx.db.close()
 
 

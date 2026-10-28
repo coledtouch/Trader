@@ -231,7 +231,7 @@ This takes about 10 minutes and needs no IBKR account. Commands are for PowerShe
 Other commands: `python -m trader status` (settings check, never prints secrets),
 `notify-test` (sends a test phone alert), `paper-test` (checks that IBKR accepts the bot's
 orders with their stop-loss, paper only, cannot fill), `backup` (also nightly), `reset-password`, `reset-2fa`, `logout-all`, `disarm` (the last four also disarm live
-trading).
+trading), `unlock` (ends a sign-in lockout).
 
 For offline research using recorded observations, run:
 

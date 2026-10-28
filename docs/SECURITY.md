@@ -63,27 +63,38 @@ Anthropic (Claude Console), xAI (console.x.ai) and your e-mail.
 `TRADER_LOGIN_PASSWORD_REQUIRED=false` drops the password: the 6-digit code from your
 authenticator app is enough to sign in. The sign-in page then shows only the code box.
 
+**Where it applies.** Only behind Cloudflare Access, or on a paper or simulator account.
+With Access off and the gateway logged in to your live account (shadow mode starts without
+Access) or to an account the app has not seen yet, the password is required anyway.
+
 What it costs: the code becomes the only secret. At any moment 3 of the 1,000,000 possible
 codes are valid, so a stranger who guesses has odds of 3 in a million per try. To keep
-that small, failed codes (sign-ins and step-ups from all addresses together) are capped at
-`TRADER_LOGIN_DAILY_FAILURES` (default 20) per 24 hours, on top of the 15-minute limits.
-At 20 guesses a day that is about a 2% chance per year that a determined guesser gets in.
+that small, failed codes are capped at `TRADER_LOGIN_DAILY_FAILURES` (default 20) per
+24 hours, counted over all addresses, on top of the 15-minute limits. At 20 guesses a day
+that is about a 2% chance per year that a determined guesser gets in.
 
-- **The lockout also blocks you.** Someone can lock new sign-ins for a day by failing 20
-  times. Sessions you already have keep working (up to `TRADER_SESSION_MAX_HOURS`), and the
-  audit log shows the failures (`login_failed`).
-- **Step-up codes are unchanged.** Loosening risk, arming live trading and the other
-  sensitive actions still need a fresh code, and each code works only once.
-- **Live trading still needs Cloudflare Access.** With `TRADER_ALLOW_LIVE=true` the app
-  refuses to start unless `TRADER_CF_ACCESS_TEAM_DOMAIN` and `TRADER_CF_ACCESS_AUD` are
-  set, so a code-only page open to the internet is possible only on paper or the simulator.
+- **The lockout also blocks you, and a stranger can keep it going.** Once 20 codes have
+  failed in 24 hours, every sign-in is refused, even with the right code, until failures
+  age out. Someone sending about 20 wrong codes a day can keep it that way. Sessions you
+  already have keep working, including the 2FA codes for loosening limits and resuming
+  (the daily cap counts against sign-ins only), until they end (`TRADER_SESSION_IDLE_MINUTES`
+  without use, or `TRADER_SESSION_MAX_HOURS`). The audit log lists every failure
+  (`login_failed`) with its address.
+- **To end a lockout:** run `docker compose exec trader python -m trader unlock` (it
+  forgets the failed attempts). If it keeps happening, someone has your address: put
+  Cloudflare Access back, or set `TRADER_LOGIN_PASSWORD_REQUIRED=true` and run
+  `docker compose up -d`.
+- **2FA codes for sensitive actions are unchanged.** Loosening risk, arming live trading
+  and the other sensitive actions still need a fresh code, and each code works only once.
 
 To also drop the Cloudflare PIN (paper only): delete the `desk.kaxo.dev` application in
 Cloudflare Zero Trust (Access, Applications), then remove `TRADER_CF_ACCESS_TEAM_DOMAIN`
 and `TRADER_CF_ACCESS_AUD` from `.env` and run `docker compose up -d`. Leaving them set
 makes the app refuse every request, because Cloudflare no longer sends the Access token.
-The tunnel stays, so the site is still reachable, now by anyone. Put Access back (and the
-two values) before setting `TRADER_ALLOW_LIVE=true`.
+The tunnel stays, so the site is still reachable, now by anyone. **Put Access back before
+you switch the gateway to your live username** (DEPLOY.md Part C, shadow mode), not only
+before `TRADER_ALLOW_LIVE=true`: create the Access application again and put its new
+Audience (AUD) tag in `TRADER_CF_ACCESS_AUD` (a new application has a new tag).
 
 ## Where secrets live
 
