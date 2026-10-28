@@ -1351,3 +1351,39 @@ async def test_competing_warning_expires_and_reconnect_clears_it() -> None:
     await broker.connect()
     now["t"] = NOW - timedelta(seconds=1)
     assert (await broker.quote(AAPL)).last == 100.0  # new session, new subscription
+
+
+UNSET_PRICE = 1.7976931348623157e308  # ib_async's "no price"
+
+
+@pytest.mark.parametrize(
+    "order_type, extra",
+    [
+        ("MIT", {"auxPrice": 110.0}),
+        ("LIT", {"lmtPrice": 110.0, "auxPrice": 110.5}),
+        ("LOC", {"lmtPrice": 110.0}),
+        ("TRAIL", {"auxPrice": UNSET_PRICE, "trailingPercent": 5.0}),
+        ("MOC", {}),
+    ],
+)
+async def test_close_is_not_blocked_by_another_clients_order_listed_as_market(
+    order_type, extra
+) -> None:
+    """Review finding (regression): the last check before the market sell mistook an
+    owner's MIT/LIT/LOC/%-trailing sell from IBKR Mobile (read back as MARKET with no
+    stop) for this app's own close in flight, so after cancelling the bot's bracket stop
+    it sent nothing. Only this client's orders count for that check."""
+    broker, fake, stop = await filled_bracket()
+    owner = Trade(
+        stock(),
+        Order(
+            orderId=0, clientId=0, permId=555, action="SELL", totalQuantity=1,
+            orderType=order_type, account=PAPER, **extra,
+        ),
+        IBOrderStatus(status="PreSubmitted"),
+    )  # fmt: skip
+    fake.all_open = [owner]
+    before = len(fake.placed)
+    rec = await broker.close_position(AAPL, "time stop")
+    assert rec is not None and rec.status != OrderStatus.REJECTED
+    assert [o.orderType for _, o in fake.placed[before:]] == ["MKT"]

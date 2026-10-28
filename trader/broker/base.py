@@ -177,14 +177,17 @@ class Broker(ABC):
                     stops.append(order.request.stop_loss)
         if pos is None or pos.qty <= 0:
             return None
-        # Another close (a monitor exit, KILL, an approved close) may have sent its market
-        # sell while this one was cancelling: never send a second one (a short).
+        # Another close of this app (a monitor exit, KILL, an approved close) may have sent
+        # its market sell while this one was cancelling: never send a second one (a short).
+        # Only this client's orders count: another client's (TWS, IBKR Mobile) may be listed
+        # as a market sell without being one (MIT, LOC, a %-trailing stop, ...).
         if any(
             order.request.instrument.key == instrument.key
             and order.request.side == Side.SELL
             and order.request.order_type == OrderType.MARKET
             and order.request.stop_loss is None
             and order.status in OPEN_ORDER_STATUSES
+            and self.can_cancel(order)
             for order in await self.open_orders()
         ):
             return None

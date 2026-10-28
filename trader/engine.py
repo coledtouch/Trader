@@ -990,7 +990,9 @@ class Engine:
             # the entry lock, so the marker is checked again here, with no await before
             # the stamp.
             selling = any(
-                o.request.order_type == OrderType.MARKET and o.request.stop_loss is None
+                o.request.order_type == OrderType.MARKET
+                and o.request.stop_loss is None
+                and self.broker.can_cancel(o)
                 for o in sells
             )
             if selling or self._close_in_flight(key, self._now()):
