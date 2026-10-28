@@ -879,6 +879,8 @@ class SimBroker(Broker):
 
     def _validate(self, req: OrderRequest) -> str | None:
         """Reason to reject the order, or None. Ordinary rejections never raise."""
+        if req.order_type == OrderType.OTHER:
+            return "order type OTHER is only read back from a broker, never sent"
         if req.order_type == OrderType.LIMIT and (req.limit_price is None or req.limit_price <= 0):
             return "limit order needs a positive limit_price"
         key = req.instrument.key

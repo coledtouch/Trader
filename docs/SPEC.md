@@ -415,7 +415,12 @@ supported) - implement what is supported, return REJECTED with a clear message
 otherwise, and report `supports_native_stops(crypto)` truthfully. Fills via
 `reqExecutionsAsync` + commission reports (only the latest revision of a corrected
 execution); order status from `trades()`/`openTrades()` (an order completed while the app
-was down is found through its executions' permId).
+was down is found through its executions' permId). An order read back from IBKR (another
+client's, or this client's after a restart) maps MKT and STP to MARKET, LMT and STP LMT to
+LIMIT, and every other type (MIT, LIT, LOC, MOC, REL, TRAIL, ...) to `OrderType.OTHER`,
+which is never a market exit and is never sent (`place_order` rejects it). `stop_loss` is
+the STP types' auxPrice, and a TRAIL / TRAIL LIMIT's trailStopPrice when IBKR reports one
+(its auxPrice is the trailing amount).
 Event handlers: `disconnectedEvent`, `errorEvent` (log codes; 1100/1102 connectivity; 1101
 forces a full reconnect before any data is trusted again),
 `orderStatusEvent`. Estimate commissions via `trader.fees` with `config.commission_plan`. Optional
@@ -836,9 +841,10 @@ Contracts changed by the confirmed review findings (each has a regression test).
   opened by the bot"); such positions alone are not worth an LLM call; the prompt marks a
   position without a stop "not opened by the bot: never CLOSE". An owner-approved pending
   CLOSE is unaffected.
-- **Re-protect** (ENG-4): `_reprotect` subtracts the unfilled quantity of working market
-  SELL exits (e.g. a close queued for the open) and protects only the remainder; bracket
-  take-profit limits do not count.
+- **Re-protect** (ENG-4): `_reprotect` subtracts the unfilled quantity of this app's working
+  market SELL exits (e.g. a close queued for the open) and protects only the remainder;
+  bracket take-profit limits and another client's orders (an owner's MIT or LOC from TWS or
+  IBKR Mobile, which may never execute) do not count.
 - **Breach spacing** (ENG-5): see 7.4 (`BREACH_MIN_SPACING`).
 - **Entry TTL** (ENG-6): measured from when the order was sent (7.3).
 - **IBKR 1101** (BRK-1): `connected` is False and data/order calls raise `BrokerError` until

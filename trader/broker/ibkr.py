@@ -934,6 +934,8 @@ class IBKRBroker(Broker):
             raise _Reject("short selling is not allowed (long-only)")
         if req.side == Side.BUY and req.is_exit:
             raise _Reject("exit orders must be SELL (long-only)")
+        if req.order_type == OrderType.OTHER:
+            raise _Reject("order type OTHER is only read back from IBKR, never sent")
         if req.order_type == OrderType.LIMIT and _price(req.limit_price) is None:
             raise _Reject("limit order needs a positive limit_price")
         if req.instrument.asset_class == AssetClass.STOCK and req.qty != math.floor(req.qty):
@@ -1470,8 +1472,19 @@ def _request_from_trade(trade: Trade) -> OrderRequest | None:
     if inst is None or qty <= 0 or order.action not in ("BUY", "SELL"):
         return None
     side = Side(order.action)
-    is_stop = order.orderType.startswith(("STP", "TRAIL"))
-    is_limit = order.orderType in ("LMT", "STP LMT")
+    trailing = order.orderType in ("TRAIL", "TRAIL LIMIT")
+    is_stop = order.orderType.startswith("STP") or trailing
+    # MARKET and LIMIT as this app sends them (a stop is one carrying stop_loss); any other
+    # type (MIT, LIT, LOC, MOC, REL, trailing, ...) is OTHER, never taken for a market exit.
+    if order.orderType in ("MKT", "STP"):
+        order_type = OrderType.MARKET
+    elif order.orderType in ("LMT", "STP LMT"):
+        order_type = OrderType.LIMIT
+    else:
+        order_type = OrderType.OTHER
+    # A trailing order's auxPrice is the trailing amount (unset for a percent), not a
+    # price: its stop is trailStopPrice, when IBKR reports one.
+    stop_price = order.trailStopPrice if trailing else order.auxPrice
     ref = getattr(order, "orderRef", None) or ""
     trace_id = ref if isinstance(ref, str) and ref.startswith("ai-trader-") else None
     if side == Side.SELL:
@@ -1482,9 +1495,9 @@ def _request_from_trade(trade: Trade) -> OrderRequest | None:
         instrument=inst,
         side=side,
         qty=qty,
-        order_type=OrderType.LIMIT if is_limit else OrderType.MARKET,
-        limit_price=_price(order.lmtPrice) if is_limit else None,
-        stop_loss=_price(order.auxPrice) if is_stop else None,
+        order_type=order_type,
+        limit_price=_price(order.lmtPrice) if order_type == OrderType.LIMIT else None,
+        stop_loss=_price(stop_price) if is_stop else None,
         is_exit=side == Side.SELL,  # long-only: every SELL reduces a long position
         reason=reason,
         trace_id=trace_id,

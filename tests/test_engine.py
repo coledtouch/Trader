@@ -2698,6 +2698,34 @@ async def test_reconnect_never_adds_a_stop_next_to_a_queued_exit(db, config) -> 
     assert sum(broker.orders[o].request.qty for o in working) == held
 
 
+@pytest.mark.parametrize(("order_type", "fields"), [("MIT", {"auxPrice": 110.0}), ("MKT", {})])
+async def test_reconnect_replaces_the_stop_next_to_an_owners_sell(
+    db, config, order_type, fields
+) -> None:
+    """Review finding: IBKR read an owner's MIT sell from IBKR Mobile back as a market
+    sell, so after a reconnect the re-protect step took it for a queued exit of the bot's
+    and left the position without a stop (an MIT may never trigger). Only this app's own
+    market exits count: the bot's stop is re-placed next to the owner's order."""
+    from tests.test_ibkr import NOW as IB_NOW
+    from tests.test_ibkr import av, connected_broker, hold, owner_sell, stock
+
+    broker, fake = await connected_broker()
+    fake.summary = [av("NetLiquidation", "1000"), av("TotalCashValue", "700")]
+    hold(fake, stock(), 3)
+    db.set_position_meta(
+        "STK:AAPL", stop_loss=95.0, take_profit=110.0, entry_price=100.0, opened_at=IB_NOW
+    )  # a bot position whose bracket stop is gone
+    fake.all_open = [owner_sell(order_type, 3, **fields)]
+    notes, clock = RecordingNotifier(), FakeClock(IB_NOW)
+    engine = Engine(config, db, broker, FakeDecisionMaker(), notifier=notes, clock=clock)
+    fake.disconnect()
+    await engine.monitor_tick()  # reconnects, then runs the re-protect step
+    assert [(o.orderType, o.action, o.totalQuantity, o.auxPrice) for _, o in fake.placed] == [
+        ("STP", "SELL", 3, 95.0)
+    ]
+    assert any(a["action"] == "reprotect" for a in db.list_audit())
+
+
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:
     h = await harness(db, config)
     h.broker.standalone_stops = False

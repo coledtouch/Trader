@@ -228,6 +228,7 @@
 
   function orderType(req) {
     if (req.order_type === 'LMT') return isNum(req.limit_price) ? `Limit ${price(req.limit_price)}` : 'Limit';
+    if (req.order_type === 'OTHER') return 'Other';
     return 'Market';
   }
 

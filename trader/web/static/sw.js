@@ -13,7 +13,7 @@
  */
 'use strict';
 
-const VERSION = 'v24';
+const VERSION = 'v25';
 const ASSET_VERSION = VERSION.slice(1);
 const CACHE = `trader-shell-${VERSION}`;
 const SHELL = [

@@ -800,6 +800,7 @@ async def test_exit_guard_uses_the_smaller_of_lagging_position_streams() -> None
         ({"qty": 1.5}, "fractional"),
         ({"limit_price": None}, "positive limit_price"),
         ({"stop_loss": 100.235}, "within one tick"),
+        ({"order_type": OrderType.OTHER}, "never sent"),
     ],
 )
 async def test_invalid_requests_are_rejected_without_sending(
@@ -1356,6 +1357,73 @@ async def test_competing_warning_expires_and_reconnect_clears_it() -> None:
 UNSET_PRICE = 1.7976931348623157e308  # ib_async's "no price"
 
 
+def owner_sell(order_type: str, qty: float = 1, **fields) -> Trade:
+    """A working SELL the owner placed in TWS or IBKR Mobile (another API client)."""
+    order = Order(
+        orderId=0, clientId=0, permId=555, action="SELL", totalQuantity=qty,
+        orderType=order_type, account=PAPER, **fields,
+    )  # fmt: skip
+    return Trade(stock(), order, IBOrderStatus(status="PreSubmitted"))
+
+
+@pytest.mark.parametrize(
+    ("order_type", "fields", "kind", "limit", "stop"),
+    [
+        ("MKT", {}, OrderType.MARKET, None, None),
+        ("LMT", {"lmtPrice": 110.0}, OrderType.LIMIT, 110.0, None),
+        ("STP", {"auxPrice": 95.0}, OrderType.MARKET, None, 95.0),
+        ("STP LMT", {"auxPrice": 95.0, "lmtPrice": 94.5}, OrderType.LIMIT, 94.5, 95.0),
+        ("MIT", {"auxPrice": 110.0}, OrderType.OTHER, None, None),
+        ("LIT", {"lmtPrice": 110.0, "auxPrice": 110.5}, OrderType.OTHER, None, None),
+        ("LOC", {"lmtPrice": 110.0}, OrderType.OTHER, None, None),
+        ("MOC", {}, OrderType.OTHER, None, None),
+        ("REL", {"auxPrice": 0.01}, OrderType.OTHER, None, None),
+        ("TRAIL", {"auxPrice": UNSET_PRICE, "trailingPercent": 5.0}, OrderType.OTHER, None, None),
+        ("TRAIL", {"auxPrice": 2.0}, OrderType.OTHER, None, None),  # $2 is no stop price
+        ("TRAIL", {"auxPrice": 2.0, "trailStopPrice": 97.5}, OrderType.OTHER, None, 97.5),
+        (
+            "TRAIL LIMIT",
+            {"auxPrice": 2.0, "trailStopPrice": 97.5, "lmtPrice": 97.0},
+            OrderType.OTHER,
+            None,
+            97.5,
+        ),
+    ],
+)
+async def test_other_clients_order_types_are_classified_precisely(
+    order_type, fields, kind, limit, stop
+) -> None:
+    """Review finding: every IBKR type but LMT and STP LMT was read back as MARKET, so the
+    engine took an owner's MIT, LOC or %-trailing sell for a queued market exit. Only MKT
+    and a STP (how this app's stops rest) are MARKET; a type this app never sends is OTHER,
+    and a trailing stop's price is its trailStopPrice, never the trailing amount."""
+    broker, fake = await connected_broker()
+    fake.all_open = [owner_sell(order_type, **fields)]
+    [order] = await broker.open_orders()
+    req = order.request
+    assert (req.order_type, req.limit_price, req.stop_loss) == (kind, limit, stop)
+    assert req.side is Side.SELL and req.is_exit and not broker.can_cancel(order)
+
+
+async def test_own_orders_read_back_after_a_restart_keep_their_type() -> None:
+    """A new process reads this client's working orders back from IBKR: a market sell
+    queued for the open is still a market exit, and the stop still a stop."""
+    broker, fake = await connected_broker()
+    hold(fake, stock(), 3)
+    sell = OrderRequest(
+        instrument=AAPL, side=Side.SELL, qty=3, order_type=OrderType.MARKET, is_exit=True
+    )
+    await broker.place_order(sell)
+    await broker.place_order(sell.model_copy(update={"stop_loss": 95.0}))
+    restarted, _ = await connected_broker(fake)
+    orders = await restarted.open_orders()
+    assert [(o.request.order_type, o.request.stop_loss) for o in orders] == [
+        (OrderType.MARKET, None),
+        (OrderType.MARKET, 95.0),
+    ]
+    assert all(restarted.can_cancel(o) for o in orders)
+
+
 @pytest.mark.parametrize(
     "order_type, extra",
     [
@@ -1374,15 +1442,7 @@ async def test_close_is_not_blocked_by_another_clients_order_listed_as_market(
     stop) for this app's own close in flight, so after cancelling the bot's bracket stop
     it sent nothing. Only this client's orders count for that check."""
     broker, fake, stop = await filled_bracket()
-    owner = Trade(
-        stock(),
-        Order(
-            orderId=0, clientId=0, permId=555, action="SELL", totalQuantity=1,
-            orderType=order_type, account=PAPER, **extra,
-        ),
-        IBOrderStatus(status="PreSubmitted"),
-    )  # fmt: skip
-    fake.all_open = [owner]
+    fake.all_open = [owner_sell(order_type, **extra)]
     before = len(fake.placed)
     rec = await broker.close_position(AAPL, "time stop")
     assert rec is not None and rec.status != OrderStatus.REJECTED

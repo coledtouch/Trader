@@ -39,6 +39,10 @@ class Side(StrEnum):
 class OrderType(StrEnum):
     MARKET = "MKT"
     LIMIT = "LMT"
+    # Only read back from the broker, never sent: a type this app does not place (an IBKR
+    # MIT, LIT, LOC, MOC, REL or trailing order from TWS or IBKR Mobile). Never a market
+    # exit or a limit; a protective stop only when it carries stop_loss.
+    OTHER = "OTHER"
 
 
 class OrderStatus(StrEnum):
