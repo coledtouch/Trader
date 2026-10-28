@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 from abc import ABC, abstractmethod
@@ -176,10 +177,27 @@ class Broker(ABC):
 
         If the broker rejects that sell, the protective stop that was cancelled (or
         `restore_stop`, for callers that cancelled it already) is re-placed when the broker
-        supports standalone stops, so a failed exit never leaves the position unprotected."""
+        supports standalone stops, so a failed exit never leaves the position unprotected.
+        Closes of one instrument run one at a time: each sees what the one before it left
+        (its sell, or the stop it put back), never a half-finished close."""
+        locks: dict[str, asyncio.Lock] = self.__dict__.setdefault("_close_locks", {})
+        async with locks.setdefault(instrument.key, asyncio.Lock()):
+            return await self._close_position(
+                instrument, reason, restore_stop=restore_stop, trace_id=trace_id
+            )
+
+    async def _close_position(
+        self,
+        instrument: Instrument,
+        reason: str,
+        *,
+        restore_stop: float | None,
+        trace_id: str | None,
+    ) -> OrderRecord | None:
         positions = {p.instrument.key: p for p in await self.positions()}
         pos = positions.get(instrument.key)
         stops = [] if restore_stop is None else [restore_stop]
+        cancelled: set[str] = set()
         req = OrderRequest(
             instrument=instrument,
             side=Side.SELL,
@@ -195,6 +213,7 @@ class Broker(ABC):
                     if not self.can_cancel(order):
                         continue  # still working: never counted as a stop to put back
                     await self.cancel_order(order.broker_order_id)
+                    cancelled.add(order.broker_order_id)
                     if order.request.side == Side.SELL and order.request.stop_loss is not None:
                         stops.append(order.request.stop_loss)
             if pos is None or pos.qty <= 0:
@@ -202,14 +221,10 @@ class Broker(ABC):
             working = await self.open_orders()
         except BrokerError:
             # A stop may already be cancelled (here, or by flatten_all's cancel_all): never
-            # leave a held position without it, unless another close of this app is
-            # selling it meanwhile (a stop next to that sell could sell the shares twice).
+            # leave a held position without it, nor with two (a stop next to another sell
+            # or stop of this app's could sell the shares twice).
             if stops and pos is not None and pos.qty > 0:
-                try:
-                    selling = self._own_market_sell(await self.open_orders(), instrument)
-                except BrokerError:
-                    selling = False
-                if not selling:
+                if not await self._covered(instrument, cancelled):
                     await self._put_stop_back(req, max(stops))
             raise
         # Another close of this app (a monitor exit, KILL, an approved close) may have sent
@@ -242,6 +257,7 @@ class Broker(ABC):
                     update={"stop_loss": stop, "reason": "protective stop (exit was rejected)"}
                 )
             )
+            self._note_put_back(instrument, restored)
             outcome = (
                 f"protective stop re-placed at {stop:g}"
                 if restored.status != OrderStatus.REJECTED
@@ -298,10 +314,42 @@ class Broker(ABC):
         if not self.supports_standalone_stops(req.instrument):
             return
         try:
-            await self.place_order(
+            placed = await self.place_order(
                 req.model_copy(
                     update={"stop_loss": stop, "reason": "protective stop (exit check failed)"}
                 )
             )
         except BrokerError as exc:
             logger.warning("re-placing the stop for %s failed: %s", req.instrument.key, exc)
+            return
+        self._note_put_back(req.instrument, placed)
+
+    def _note_put_back(self, instrument: Instrument, rec: OrderRecord) -> None:
+        if rec.status != OrderStatus.REJECTED and rec.broker_order_id:
+            self.__dict__.setdefault("_put_back", {})[instrument.key] = rec.broker_order_id
+
+    async def _covered(self, instrument: Instrument, cancelled: set[str]) -> bool:
+        """Whether this app already has a sell working for the held position: a market sell
+        or a protective stop (one this close did not just cancel). Without a fresh order
+        list, the last stop this broker put back for it counts while still working."""
+        try:
+            listed = await self.open_orders()
+        except BrokerError:
+            last = self.__dict__.get("_put_back", {}).get(instrument.key)
+            if last is None:
+                return False
+            try:
+                rec = await self.order_status(last)
+            except BrokerError:
+                return False
+            return rec is not None and rec.status in OPEN_ORDER_STATUSES
+        return self._own_market_sell(listed, instrument) or any(
+            order.request.instrument.key == instrument.key
+            and order.request.side == Side.SELL
+            and order.request.stop_loss is not None
+            and order.status in OPEN_ORDER_STATUSES
+            and order.broker_order_id
+            and order.broker_order_id not in cancelled
+            and self.can_cancel(order)
+            for order in listed
+        )

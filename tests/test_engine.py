@@ -1543,9 +1543,12 @@ async def test_flatten_during_an_approved_close_sells_once(db, config) -> None:
     approve = asyncio.create_task(h.engine.approve_order(waiting.id))
     await entered.wait()
     h.clock.t = datetime(2026, 10, 21, 19, 50, 1, tzinfo=UTC)  # 15:50:01 New York
-    await h.engine.monitor_tick()  # flatten before close
+    tick = asyncio.create_task(h.engine.monitor_tick())  # flatten before close
+    for _ in range(20):
+        await asyncio.sleep(0)
     gate.set()
     await approve
+    await tick
     assert len(_working_market_sells(h, "STK:F")) == 1
 
 
@@ -1575,9 +1578,12 @@ async def test_kill_during_a_monitor_exit_sells_once(db, config) -> None:
         h.engine._engine_close(Instrument(symbol="F"), "time stop", h.clock())
     )
     await entered.wait()
-    await h.engine.kill()
+    kill = asyncio.create_task(h.engine.kill())  # its close of F waits for the monitor's
+    for _ in range(20):
+        await asyncio.sleep(0)
     gate.set()
     await monitor
+    await kill
     assert len(_working_market_sells(h, "STK:F")) == 1
 
 
@@ -1616,13 +1622,45 @@ async def test_a_failed_check_puts_no_stop_next_to_a_kill_sell(db, config) -> No
         h.engine._engine_close(Instrument(symbol="F"), "time stop", h.clock())
     )
     await entered.wait()
-    await h.engine.kill()
-    h.broker.fail_open_orders_on = {h.broker.open_orders_calls + 1}  # its last check
+    kill = asyncio.create_task(h.engine.kill())  # its close of F waits for the monitor's
+    for _ in range(20):
+        await asyncio.sleep(0)
+    h.broker.fail_open_orders_on = {h.broker.open_orders_calls + 1}  # the monitor's check
     gate.set()
     with pytest.raises(BrokerError):
         await monitor
+    await kill
+    # The monitor put the stop back; KILL's close then cancelled it and sold once.
     assert len(_working_market_sells(h, "STK:F")) == 1
     assert h.broker.working("STK:F", "stop") == []
+
+
+async def test_two_failed_closes_put_back_only_one_stop(db, config) -> None:
+    """Review finding: KILL during a monitor exit, then IBKR stalls (every open-orders read
+    times out): both closes put a full-size stop back, so two stops could sell twice the
+    position. Closes of one instrument now run one at a time, and a stop already put back
+    counts as cover."""
+    h = await _resting(db, config)
+    h.engine.settings.exits.time_stop_minutes = 0
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    gate, entered = _slow_first_cancel(h)
+    monitor = asyncio.create_task(
+        h.engine._engine_close(Instrument(symbol="F"), "time stop", h.clock())
+    )
+    await entered.wait()
+    kill = asyncio.create_task(h.engine.kill())
+    for _ in range(20):
+        await asyncio.sleep(0)  # KILL has cancelled everything; its close of F waits
+    n = h.broker.open_orders_calls
+    h.broker.fail_open_orders_on = set(range(n + 1, n + 50))  # the gateway stalls
+    gate.set()
+    with pytest.raises(BrokerError):
+        await monitor
+    await kill
+    assert "KILL switch FAILED" in h.notes.titles()
+    assert len(h.broker.working("STK:F", "stop")) == 1
+    assert _working_market_sells(h, "STK:F") == []
 
 
 async def test_a_close_cancels_a_stop_put_back_after_its_own_cancels(db, config) -> None:
