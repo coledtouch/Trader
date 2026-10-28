@@ -325,7 +325,8 @@ loop continues; exponential backoff on broker errors; never crash the app):
   snapshot of the day; wins/losses/loss_streak/fees/realized), record equity point at
   most every 5 min, evaluate `halt_reason` (halt + flatten per settings + notify),
   engine-side stop/target check for positions without native stops (and as a backup
-  for stocks: only if price breaches stop by > 0.5% and no protective order is working;
+  for stocks: only if price breaches stop by > 0.5% and no protective stop of this app
+  is working; an owner's stop or stop-limit from TWS does not count;
   every engine-side exit and the daily halts need two consecutive ticks, see 7.4),
   re-place missing protective stops for stock positions after reconnect, and flatten
   stocks at close − 10 min when `flatten_stocks_before_close`.
@@ -844,7 +845,11 @@ Contracts changed by the confirmed review findings (each has a regression test).
 - **Re-protect** (ENG-4): `_reprotect` subtracts the unfilled quantity of this app's working
   market SELL exits (e.g. a close queued for the open) and protects only the remainder;
   bracket take-profit limits and another client's orders (an owner's MIT or LOC from TWS or
-  IBKR Mobile, which may never execute) do not count.
+  IBKR Mobile, which may never execute) do not count. Likewise only this app's own working
+  stops count as protection (an owner's stop-limit or trailing limit may rest unfilled after
+  a gap, or cover only part of the position), and only this app's own working BUYs hold a
+  position back from re-protect or a flat position's cleanup (which cancels its leftover
+  stop); an owner's buy from TWS does neither.
 - **Breach spacing** (ENG-5): see 7.4 (`BREACH_MIN_SPACING`).
 - **Entry TTL** (ENG-6): measured from when the order was sent (7.3).
 - **IBKR 1101** (BRK-1): `connected` is False and data/order calls raise `BrokerError` until

@@ -2736,7 +2736,16 @@ async def test_reconnect_never_adds_a_stop_next_to_a_queued_exit(db, config) -> 
     assert sum(broker.orders[o].request.qty for o in working) == held
 
 
-@pytest.mark.parametrize(("order_type", "fields"), [("MIT", {"auxPrice": 110.0}), ("MKT", {})])
+@pytest.mark.parametrize(
+    ("order_type", "fields"),
+    [
+        ("MIT", {"auxPrice": 110.0}),
+        ("MKT", {}),
+        ("STP", {"auxPrice": 97.5}),
+        ("STP LMT", {"auxPrice": 97.5, "lmtPrice": 97.0}),
+        ("TRAIL LIMIT", {"auxPrice": 2.0, "trailStopPrice": 97.5, "lmtPrice": 97.0}),
+    ],
+)
 async def test_reconnect_replaces_the_stop_next_to_an_owners_sell(
     db, config, order_type, fields
 ) -> None:
@@ -2762,6 +2771,131 @@ async def test_reconnect_replaces_the_stop_next_to_an_owners_sell(
         ("STP", "SELL", 3, 95.0)
     ]
     assert any(a["action"] == "reprotect" for a in db.list_audit())
+
+
+def _owner_buy():
+    """A GTC buy the owner placed in TWS or IBKR Mobile (another API client)."""
+    from ib_async import Order, Trade
+    from ib_async import OrderStatus as IBOrderStatus
+
+    from tests.test_ibkr import PAPER, stock
+
+    order = Order(
+        orderId=0, clientId=0, permId=888, action="BUY", totalQuantity=1,
+        orderType="LMT", lmtPrice=90.0, tif="GTC", account=PAPER,
+    )  # fmt: skip
+    return Trade(stock(), order, IBOrderStatus(status="Submitted"))
+
+
+async def test_reconnect_replaces_the_stop_next_to_an_owners_buy(db, config) -> None:
+    """Review finding: any working BUY counted as an entry of the bot's still on its way
+    (its bracket would protect the shares), so an owner's buy from TWS left a bot position
+    with no stop re-placed and no alert."""
+    from tests.test_ibkr import NOW as IB_NOW
+    from tests.test_ibkr import av, connected_broker, hold, stock
+
+    broker, fake = await connected_broker()
+    fake.summary = [av("NetLiquidation", "1000"), av("TotalCashValue", "700")]
+    hold(fake, stock(), 3)
+    db.set_position_meta(
+        "STK:AAPL", stop_loss=95.0, take_profit=110.0, entry_price=100.0, opened_at=IB_NOW
+    )  # a bot position whose bracket stop is gone
+    fake.all_open = [_owner_buy()]
+    engine = Engine(
+        config, db, broker, FakeDecisionMaker(), notifier=RecordingNotifier(),
+        clock=FakeClock(IB_NOW),
+    )  # fmt: skip
+    fake.disconnect()
+    await engine.monitor_tick()  # reconnects, then runs the re-protect step
+    assert [(o.orderType, o.action, o.totalQuantity, o.auxPrice) for _, o in fake.placed] == [
+        ("STP", "SELL", 3, 95.0)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("order_type", "fields"),
+    [
+        ("STP LMT", {"auxPrice": 97.5, "lmtPrice": 97.0}),
+        ("TRAIL LIMIT", {"auxPrice": 2.0, "trailStopPrice": 97.5, "lmtPrice": 97.0}),
+    ],
+)
+async def test_backup_stop_fires_next_to_an_owners_stop_limit(
+    db, config, order_type, fields
+) -> None:
+    """Review finding: an owner's stop-limit (or trailing limit) sell from TWS counted as
+    the position's broker stop. Triggered above the bot's stop and resting unfilled after
+    a gap down, it switched off the engine's backup stop: nothing could sell the shares."""
+    from tests.test_ibkr import NOW as IB_NOW
+    from tests.test_ibkr import av, connected_broker, hold, owner_sell, stock
+
+    broker, fake = await connected_broker()
+    fake.summary = [av("NetLiquidation", "1000"), av("TotalCashValue", "700")]
+    hold(fake, stock(), 3)
+    db.set_position_meta(
+        "STK:AAPL", stop_loss=95.0, take_profit=110.0, entry_price=100.0, opened_at=IB_NOW
+    )  # a bot position whose bracket stop is gone
+    fake.all_open = [owner_sell(order_type, 3, **fields)]
+    fake.ticker_values[stock().conId] = {"bid": 90.0, "ask": 90.05, "last": 90.0}
+    clock = FakeClock(IB_NOW)
+    engine = Engine(
+        config, db, broker, FakeDecisionMaker(), notifier=RecordingNotifier(), clock=clock
+    )
+    engine._reprotect_pending = False  # only the monitor's exit rules
+    for _ in range(3):
+        await engine.monitor_tick()
+        clock.advance(seconds=30)
+    assert [(o.orderType, o.action, o.totalQuantity) for _, o in fake.placed] == [
+        ("MKT", "SELL", 3)
+    ]
+
+
+async def test_leftover_stop_is_cancelled_next_to_an_owners_buy(db, config) -> None:
+    """Review finding: an owner's working buy from TWS held back the cleanup of a flat bot
+    position, so its leftover stop stayed working (it would sell shares not held)."""
+    from ib_async import CommissionReport
+    from ib_async import Fill as IBFill
+
+    from tests.test_ibkr import CLIENT_ID, av, connected_broker, execution, hold, stock
+    from tests.test_ibkr import NOW as IB_NOW
+
+    broker, fake = await connected_broker()
+    fake.summary = [av("NetLiquidation", "10000"), av("TotalCashValue", "7000")]
+    hold(fake, stock(), 3)
+    opened = IB_NOW - timedelta(minutes=30)
+    bought = execution(
+        "e1", "BOT", opened, shares=3, price=100.0, orderId=50, clientId=CLIENT_ID, permId=9
+    )
+    fake.executions = [IBFill(stock(), bought, CommissionReport(), opened)]
+    stop = await broker.place_order(
+        OrderRequest(
+            instrument=Instrument(symbol="AAPL"),
+            side=Side.SELL,
+            qty=3,
+            order_type=OrderType.MARKET,
+            stop_loss=95.0,
+            is_exit=True,
+            reason="protective stop",
+        )
+    )
+    db.set_position_meta(
+        "STK:AAPL", stop_loss=95.0, take_profit=110.0, entry_price=100.0, opened_at=opened
+    )
+    fake.all_open = [_owner_buy()]
+    fake.ticker_values[stock().conId] = {"bid": 98.0, "ask": 98.05, "last": 98.0}
+    clock = FakeClock(IB_NOW)
+    engine = Engine(
+        config, db, broker, FakeDecisionMaker(), notifier=RecordingNotifier(), clock=clock
+    )
+    await engine.monitor_tick()
+    clock.advance(minutes=1)
+    fake.position_items.clear()  # the owner sold the 3 shares in TWS
+    sold = execution("e2", "SLD", clock(), shares=3, price=98.0, orderId=0, clientId=0, permId=77)
+    fake.executions.append(IBFill(stock(), sold, CommissionReport(), clock()))
+    for _ in range(3):
+        await engine.monitor_tick()
+        clock.advance(minutes=1)
+    assert int(stop.broker_order_id or 0) in fake.cancelled
+    assert db.get_position_meta("STK:AAPL") is None
 
 
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:

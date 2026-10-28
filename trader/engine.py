@@ -1909,9 +1909,11 @@ class Engine:
         self.db.audit("engine_close", {"instrument": inst.key, "reason": reason}, actor="engine")
         await self._notify(f"Closing {inst.symbol}", reason)
 
-    @staticmethod
-    def _native_stops(open_orders: list[OrderRecord]) -> dict[str, float]:
-        """Highest working broker-side protective stop per instrument."""
+    def _native_stops(self, open_orders: list[OrderRecord]) -> dict[str, float]:
+        """Highest working broker-side protective stop of this app per instrument. An
+        owner's stop from TWS or IBKR Mobile does not count (a stop-limit or trailing limit
+        may never fill, and it may cover only part of the position), nor does a stop this
+        app asked to cancel."""
         stops: dict[str, float] = {}
         for order in open_orders:
             req = order.request
@@ -1919,6 +1921,8 @@ class Engine:
                 order.status in OPEN_ORDER_STATUSES
                 and req.side == Side.SELL
                 and req.stop_loss is not None
+                and self.broker.can_cancel(order)
+                and not self.broker.cancel_requested(order)
             ):
                 key = req.instrument.key
                 stops[key] = max(stops.get(key, 0.0), req.stop_loss)
@@ -1944,12 +1948,16 @@ class Engine:
                 queued[key] = queued.get(key, 0.0) + max(0.0, req.qty - order.filled_qty)
         return queued
 
-    @staticmethod
-    def _working_buys(open_orders: list[OrderRecord]) -> set[str]:
+    def _working_buys(self, open_orders: list[OrderRecord]) -> set[str]:
+        """Instruments with a working entry of this app. An owner's BUY from TWS or IBKR
+        Mobile is no entry of this app and holds nothing back. An entry this app asked to
+        cancel still counts: it can fill until IBKR confirms the cancel."""
         return {
             o.request.instrument.key
             for o in open_orders
-            if o.status in OPEN_ORDER_STATUSES and o.request.side == Side.BUY
+            if o.status in OPEN_ORDER_STATUSES
+            and o.request.side == Side.BUY
+            and self.broker.can_cancel(o)
         }
 
     def _extra(self, key: str) -> dict[str, float]:
@@ -2184,7 +2192,8 @@ class Engine:
         (`supports_standalone_stops`) get one; otherwise, or when the broker rejects it, the
         owner is notified and the engine's backup stop guards the position. Shares a working
         market exit of this app will already sell are not protected again (never sell
-        twice); an owner's conditional sell (MIT, LOC, ...) from TWS does not count."""
+        twice); an owner's order from TWS (a conditional sell, a stop-limit, a buy) does
+        not count."""
         if not self._reprotect_pending:
             return
         self._reprotect_pending = False
