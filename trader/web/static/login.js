@@ -130,7 +130,7 @@
         showError('Sign-in now needs your password too. Enter it and a new code.', password);
       } else if (res.status === 401) showError(passwordField.hidden ? 'Incorrect code.' : 'Incorrect password or code.', code);
       else if (res.status === 429 && (await detailOf(res)) === 'too many failed codes today') {
-        showError('Too many wrong codes in the last 24 hours, so sign-in is locked. It reopens as they age out, or run "python -m trader unlock" on the server.');
+        showError('Too many wrong codes in the last 24 hours, so sign-in is locked. It reopens as they age out, or run "docker compose exec trader python -m trader unlock" on the server.');
       } else if (res.status === 429) showError('Too many failed attempts. Wait 15 minutes, then try again.');
       else showError(`Sign-in failed (HTTP ${res.status}). Try again.`, code);
     } catch (err) {
