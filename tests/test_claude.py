@@ -9,7 +9,7 @@ from typing import Any
 import anthropic
 import httpx2
 import pytest
-from pydantic import ValidationError
+from pydantic import TypeAdapter
 
 from tests.test_decide import NOW, cand, make_ctx, pos
 from trader.models import (
@@ -46,11 +46,13 @@ REQ = httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
 class FakeStream:
     """What `client.beta.messages.stream(...)` returns: an async context manager."""
 
-    def __init__(self, result: Any, delay: float = 0.0):
-        self.result, self.delay = result, delay
+    def __init__(self, result: Any, delay: float = 0.0, open_delay: float = 0.0):
+        self.result, self.delay, self.open_delay = result, delay, open_delay
         self.closed = False
 
     async def __aenter__(self) -> "FakeStream":
+        if self.open_delay:  # still connecting (or in the SDK's retry backoff)
+            await asyncio.sleep(self.open_delay)
         return self
 
     async def __aexit__(self, *exc: Any) -> None:
@@ -65,20 +67,20 @@ class FakeStream:
 
 
 class FakeMessages:
-    def __init__(self, result: Any, delay: float = 0.0):
-        self.result, self.delay = result, delay
+    def __init__(self, result: Any, delay: float = 0.0, open_delay: float = 0.0):
+        self.result, self.delay, self.open_delay = result, delay, open_delay
         self.calls: list[dict[str, Any]] = []
         self.streams: list[FakeStream] = []
 
     def stream(self, **kwargs: Any) -> FakeStream:
         self.calls.append(kwargs)
-        self.streams.append(FakeStream(self.result, self.delay))
+        self.streams.append(FakeStream(self.result, self.delay, self.open_delay))
         return self.streams[-1]
 
 
 class FakeClient:
-    def __init__(self, result: Any, delay: float = 0.0):
-        self.messages = FakeMessages(result, delay)
+    def __init__(self, result: Any, delay: float = 0.0, open_delay: float = 0.0):
+        self.messages = FakeMessages(result, delay, open_delay)
         self.beta = SimpleNamespace(messages=self.messages)
 
 
@@ -116,13 +118,13 @@ def response(
     use: SimpleNamespace | None = None,
     stop_details: Any = None,
 ) -> SimpleNamespace:
+    text = [SimpleNamespace(type="text", text=parsed.model_dump_json())] if parsed else []
     return SimpleNamespace(
-        parsed_output=parsed,
         stop_reason=stop_reason,
         stop_details=stop_details,
         model=model,
         usage=use or usage(),
-        content=[],
+        content=text,
     )
 
 
@@ -184,15 +186,19 @@ async def test_request_parameters():
     (kwargs,) = client.messages.calls
     assert kwargs["model"] == "claude-opus-5-5"
     assert kwargs["max_tokens"] == MAX_TOKENS == 16000
-    assert kwargs["output_format"] is ClaudeDecisions
-    assert kwargs["output_config"] == {"effort": "high"}
+    # The schema the SDK's output_format helper would send; the bot parses the answer.
+    schema = anthropic.transform_schema(TypeAdapter(ClaudeDecisions).json_schema())
+    assert kwargs["output_config"] == {
+        "effort": "high",
+        "format": {"type": "json_schema", "schema": schema},
+    }
     assert kwargs["betas"] == [FALLBACK_BETA] == ["server-side-fallback-2026-07-01"]
     assert kwargs["fallbacks"] == "default"
     assert kwargs["system"] == [
         {"type": "text", "text": SYSTEM_PROMPT, "cache_control": {"type": "ephemeral", "ttl": "1h"}}
     ]
     assert kwargs["messages"] == [{"role": "user", "content": render_context(ctx)}]
-    for forbidden in ("temperature", "top_p", "top_k", "thinking", "tool_choice"):
+    for forbidden in ("temperature", "top_p", "top_k", "thinking", "tool_choice", "output_format"):
         assert forbidden not in kwargs
 
 
@@ -462,16 +468,30 @@ async def test_transient_error_with_failing_fallback_is_safe():
     assert "fallback failed" in (batch.error or "")
 
 
-async def test_validation_error_inside_parse_charges_worst_case():
-    try:
-        ClaudeDecisions.model_validate_json('{"market_view": "cut')
-    except ValidationError as exc:
-        truncated = exc
-    batch = await maker(FakeClient(truncated)).decide(base_ctx())
+async def test_invalid_json_answer_fails_safe_with_its_real_cost():
+    bad = response()
+    bad.content = [SimpleNamespace(type="text", text='{"market_view": "cut')]
+    batch = await maker(FakeClient(bad)).decide(base_ctx())
     assert batch.decisions == []
-    assert "estimated" in (batch.error or "")
-    assert batch.output_tokens == MAX_TOKENS
-    assert batch.cost_usd >= MAX_TOKENS * 20 / 1e6
+    assert "not valid JSON" in (batch.error or "")
+    assert batch.cost_usd == pytest.approx((1000 * 4 + 500 * 20) / 1e6)
+
+
+async def test_deadline_while_still_connecting_charges_nothing():
+    """Review finding: no stream ever opened (connecting, or the SDK's retry backoff), so
+    nothing was billed and the daily AI budget must not lose a phantom worst case."""
+    client = FakeClient(response(output(decision("BUY", "AMD"))), open_delay=5)
+    m = ClaudeDecisionMaker(
+        API_KEY,
+        "claude-opus-5-5",
+        "high",
+        FakeFallback(DecisionBatch(maker="rules")),
+        client,
+        deadline_s=0.05,
+    )
+    batch = await m.decide(base_ctx())
+    assert "did not answer within" in (batch.error or "")
+    assert batch.cost_usd == 0 and batch.output_tokens == 0
 
 
 async def test_no_answer_within_the_deadline_keeps_exits_and_charges_worst_case():
@@ -555,15 +575,17 @@ def sse(message: dict[str, Any]) -> bytes:
         if block["type"] == "thinking":
             empty = {"type": "thinking", "thinking": "", "signature": ""}
             delta = {"type": "signature_delta", "signature": block["signature"]}
-        else:
+        elif block["type"] == "text":
             empty = {"type": "text", "text": ""}
             delta = {"type": "text_delta", "text": block["text"]}
+        else:  # e.g. a fallback hand-off: whole in its start event
+            empty, delta = block, None
         start_block = {"type": "content_block_start", "index": i, "content_block": empty}
-        events += [
-            ("content_block_start", start_block),
-            ("content_block_delta", {"type": "content_block_delta", "index": i, "delta": delta}),
-            ("content_block_stop", {"type": "content_block_stop", "index": i}),
-        ]
+        events.append(("content_block_start", start_block))
+        if delta is not None:
+            body = {"type": "content_block_delta", "index": i, "delta": delta}
+            events.append(("content_block_delta", body))
+        events.append(("content_block_stop", {"type": "content_block_stop", "index": i}))
     final = {
         "stop_reason": message["stop_reason"],
         "stop_sequence": None,
@@ -654,8 +676,104 @@ async def test_real_sdk_truncated_output_fails_safe():
     content = [{"type": "text", "text": '{"market_view": "Strong tape", "decisions": [{"act'}]
     batch = await sdk_maker(api_message(content, "max_tokens"), {}).decide(base_ctx())
     assert batch.decisions == []
-    assert "likely cut off" in (batch.error or "")
-    assert batch.cost_usd >= MAX_TOKENS * 20 / 1e6
+    assert "max_tokens" in (batch.error or "")
+    assert batch.cost_usd == pytest.approx((2000 * 4 + 900 * 20 + 1500 * 0.2) / 1e6)
+
+
+async def test_real_sdk_refusal_mid_answer_keeps_the_fallback_models_answer():
+    """Review finding: with server-side fallback, a refusal part way through leaves the
+    declined model's partial text, then a `fallback` block, then the fallback model's
+    answer. Parsing every text block lost the valid answer."""
+    answer = output(decision("BUY", "AMD", size_fraction=0.5), view="Constructive.")
+    hand_off = {
+        "type": "fallback",
+        "from": {"model": "claude-opus-5-5"},
+        "to": {"model": "claude-opus-4-8"},
+        "trigger": {"type": "refusal", "category": "cyber"},
+    }
+    content = [
+        {"type": "text", "text": '{"market_view": "Constr'},
+        hand_off,
+        {"type": "text", "text": answer.model_dump_json()},
+    ]
+    batch = await sdk_maker(api_message(content, "end_turn"), {}).decide(base_ctx())
+    assert batch.error is None, batch.error
+    assert batch.model == "claude-opus-4-8"
+    assert [(d.action, d.symbol) for d in batch.decisions] == [(TradeAction.BUY, "AMD")]
+
+
+def broken_sdk_maker(
+    chunks: list[bytes], exc: Exception | None, fallback: Any
+) -> ClaudeDecisionMaker:
+    """The SSE body yields `chunks`, then raises `exc` (a connection lost mid-answer)."""
+
+    class Body(httpx2.AsyncByteStream):
+        async def __aiter__(self):
+            for chunk in chunks:
+                yield chunk
+            if exc is not None:
+                raise exc
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        headers = {"request-id": "req_1", "content-type": "text/event-stream"}
+        return httpx2.Response(200, stream=Body(), headers=headers)
+
+    client = anthropic.AsyncAnthropic(
+        api_key=API_KEY,
+        max_retries=0,
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+    )
+    return ClaudeDecisionMaker(API_KEY, "claude-opus-5-5", "medium", fallback, client=client)
+
+
+def _start_event() -> bytes:
+    start = api_message([], "end_turn")
+    start.update(content=[], stop_reason=None)
+    event = {"type": "message_start", "message": start}
+    return f"event: message_start\ndata: {json.dumps(event)}\n\n".encode()
+
+
+async def _exits_fallback() -> tuple[DecisionContext, FakeFallback]:
+    ctx = base_ctx()
+    rules_batch = await RuleBasedDecisionMaker().decide(
+        make_ctx(
+            candidates=ctx.candidates,
+            positions=[pos("AMD")],
+            market={"STK:AMD": {"price": 99.0, "vwap": 100.0}},
+        )
+    )
+    return ctx, FakeFallback(rules_batch)
+
+
+async def test_real_sdk_overloaded_error_mid_stream_keeps_exits():
+    """Review finding: an `event: error` after the 200 arrives as APIStatusError(200); it
+    must count as transient, like the 529 it replaces."""
+    error = {"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}}
+    chunks = [_start_event(), f"event: error\ndata: {json.dumps(error)}\n\n".encode()]
+    ctx, fallback = await _exits_fallback()
+    batch = await broken_sdk_maker(chunks, None, fallback).decide(ctx)
+    assert fallback.calls == 1
+    assert [d.action for d in batch.decisions] == [TradeAction.CLOSE]
+    assert "exits only" in (batch.error or "")
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        httpx2.RemoteProtocolError("peer closed connection"),
+        httpx2.ReadTimeout("read timed out"),
+        None,
+    ],
+)
+async def test_real_sdk_answer_broken_off_mid_stream_keeps_exits_and_charges(exc):
+    """Review finding: a connection lost, stalled or ended while reading the open stream
+    came out as an 'unexpected error' (no exits, no cost). None: the body just ends."""
+    ctx, fallback = await _exits_fallback()
+    batch = await broken_sdk_maker([_start_event()], exc, fallback).decide(ctx)
+    assert fallback.calls == 1
+    assert [d.action for d in batch.decisions] == [TradeAction.CLOSE]
+    assert "broke off" in (batch.error or "")
+    assert batch.output_tokens == MAX_TOKENS and batch.cost_usd >= MAX_TOKENS * 20 / 1e6
 
 
 async def test_real_sdk_refusal():

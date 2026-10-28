@@ -26,8 +26,9 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 import anthropic
-from anthropic import AsyncAnthropic
-from pydantic import BaseModel, ValidationError
+import httpx2
+from anthropic import AsyncAnthropic, transform_schema
+from pydantic import TypeAdapter, ValidationError
 
 from trader.models import DecisionBatch, DecisionContext
 from trader.strategy.common import (
@@ -59,6 +60,15 @@ DECISION_DEADLINE_S = 140.0
 # Anthropic recommends for the refusal category, inside the same call.
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 TRANSIENT_STATUS = frozenset({408, 409, 429})
+# An `event: error` inside a streamed 200 response arrives as an APIStatusError with status
+# 200; these error types are the ones a non-streamed call would have got as 429/5xx/529.
+STREAM_TRANSIENT_ERRORS = frozenset(
+    {"overloaded_error", "api_error", "rate_limit_error", "timeout_error"}
+)
+# The answer's JSON schema, sent as output_config.format. The bot parses the finished
+# answer itself (not the SDK's output_format, which parses every text block as it closes:
+# after a mid-answer refusal that includes the declined model's partial text).
+OUTPUT_SCHEMA = transform_schema(TypeAdapter(ModelDecisions).json_schema())
 # The system prompt is cached for an hour: decision cycles are often more than 5 minutes
 # apart (the LLM is skipped when nothing qualifies), so a 5-minute entry would expire.
 # A 1-hour write costs 2x the base input price (5-minute: 1.25x), reads are unchanged.
@@ -210,30 +220,27 @@ class ClaudeDecisionMaker:
         except Exception as exc:
             log.exception("could not render the decision context")
             return self._failed(ctx, f"could not render context: {type(exc).__name__}")
+        opened: list[bool] = []
         try:
-            response = await asyncio.wait_for(self._call(user_text), self.deadline_s)
-        except ValidationError as exc:
-            # The SDK validates the JSON as the answer completes; with constrained decoding
-            # this only fails on incomplete JSON (cut off at max_tokens). Usage is lost with
-            # the response, so charge a worst-case estimate rather than nothing.
-            log.warning("Claude output failed validation (%d errors)", exc.error_count())
-            return self._failed(
-                ctx,
-                "Claude output was not valid JSON for the schema (likely cut off); "
-                "tokens and cost are estimated",
-                spend=self._worst_case(user_text),
-            )
+            response = await asyncio.wait_for(self._call(user_text, opened), self.deadline_s)
         except anthropic.AnthropicError as exc:
             error = _describe(exc)
             log.warning("Claude request failed: %s", error)
             if _is_transient(exc):
                 return await self._exits_only(ctx, error)
             return self._failed(ctx, error)
-        except TimeoutError:
-            # The stream was cancelled mid-answer: what it cost is unknown, so charge a
-            # worst-case estimate (the daily AI budget must not under-count).
-            error = f"Claude did not answer within {self.deadline_s:.0f}s"
-            log.warning("%s; the decision would be stale", error)
+        except (TimeoutError, httpx2.TransportError, _StreamEnded) as exc:
+            # No answer in time (TimeoutError), or the open stream broke off: the SDK maps
+            # transport errors only before the response headers, never while reading.
+            if isinstance(exc, TimeoutError):
+                error = f"Claude did not answer within {self.deadline_s:.0f}s"
+            else:
+                error = f"Claude's answer broke off ({type(exc).__name__})"
+            log.warning("%s; exits only this cycle", error)
+            if not opened:  # still connecting or between the SDK's retries: nothing billed
+                return await self._exits_only(ctx, error)
+            # Accepted and then cut off: its usage is lost, so charge a worst-case estimate
+            # (the daily AI budget must not under-count).
             return await self._exits_only(
                 ctx, f"{error}; tokens and cost are estimated", spend=self._worst_case(user_text)
             )
@@ -255,9 +262,13 @@ class ClaudeDecisionMaker:
             )
 
     # ------------------------------------------------------------------ request
-    async def _call(self, user_text: str) -> Any:
+    async def _call(self, user_text: str, opened: list[bool]) -> Any:
         async with self._client.beta.messages.stream(**self._request(user_text)) as stream:
-            return await stream.get_final_message()
+            opened.append(True)  # accepted (HTTP 200): from here on the call may be billed
+            message = await stream.get_final_message()
+        if message.stop_reason is None:  # the body ended before message_delta/message_stop
+            raise _StreamEnded("the answer ended without a stop reason")
+        return message
 
     def _worst_case(self, user_text: str) -> _Spend:
         """An estimate for a call whose usage was lost: the whole output budget spent."""
@@ -275,8 +286,10 @@ class ClaudeDecisionMaker:
                 {"type": "text", "text": SYSTEM_PROMPT, "cache_control": dict(CACHE_CONTROL)}
             ],
             "messages": [{"role": "user", "content": user_text}],
-            "output_format": ModelDecisions,
-            "output_config": {"effort": self.effort},
+            "output_config": {
+                "effort": self.effort,
+                "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA},
+            },
         }
         # Haiku has no server-side fallback; the docs say not to send the parameter.
         if not self.model.startswith("claude-haiku"):
@@ -303,12 +316,14 @@ class ClaudeDecisionMaker:
                 ctx, f"response stopped early ({response.stop_reason})", spend=spend
             )
 
-        parsed = response.parsed_output
-        if parsed is None:
+        text = _answer_text(response.content)
+        if not text.strip():
             return self._failed(ctx, "response contained no structured output", spend=spend)
-        output = ModelDecisions.model_validate(
-            parsed.model_dump() if isinstance(parsed, BaseModel) else parsed
-        )
+        try:
+            output = ModelDecisions.model_validate_json(text)
+        except ValidationError as exc:
+            log.warning("Claude output failed validation (%d errors)", exc.error_count())
+            return self._failed(ctx, "Claude output was not valid JSON for the schema", spend=spend)
         decisions, dropped = convert_decisions(output, ctx, source="Claude")
         return DecisionBatch(
             ts=ctx.now,
@@ -363,10 +378,28 @@ class ClaudeDecisionMaker:
 
 
 # ---------------------------------------------------------------------- helpers
+class _StreamEnded(Exception):
+    """The streamed answer ended before its stop reason (a cut-off body)."""
+
+
+def _answer_text(content: Any) -> str:
+    """The final model's JSON: the text after the last fallback hand-off. A refusal part
+    way through leaves the declined model's partial text before the `fallback` block."""
+    blocks = list(content or [])
+    last = max(
+        (i for i, b in enumerate(blocks) if getattr(b, "type", None) == "fallback"), default=-1
+    )
+    return "".join(b.text for b in blocks[last + 1 :] if getattr(b, "type", None) == "text")
+
+
 def _is_transient(exc: Exception) -> bool:
     if isinstance(exc, anthropic.APIConnectionError):  # includes timeouts
         return True
     if isinstance(exc, anthropic.APIStatusError):
+        if exc.status_code < 400:  # an `event: error` inside a streamed 200 response
+            body = exc.body if isinstance(exc.body, dict) else {}
+            err = body.get("error") if isinstance(body.get("error"), dict) else {}
+            return err.get("type") in STREAM_TRANSIENT_ERRORS
         return exc.status_code in TRANSIENT_STATUS or exc.status_code >= 500
     return False
 
