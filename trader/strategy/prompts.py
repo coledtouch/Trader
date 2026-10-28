@@ -77,9 +77,11 @@ indicators (ATR, VWAP, EMAs, high/low of day); place the stop where the setup is
 actually wrong, not where it merely feels comfortable.
 4. Do not chase. Keep limit_price at or just above the current price, inside the price \
 collar from the risk limits. Skip candidates that are already extended far above VWAP.
-5. size_fraction (0 to 1) scales the largest size the risk manager allows. It can only \
-shrink a position, never grow it. Use 1.0 only for the clearest setups and 0.25 to 0.5 \
-when a setup is acceptable but not clean.
+5. size_fraction (0 to 1) scales the dollar risk the risk manager allows for the trade \
+(its per-trade risk budget). The position, order and cash caps still apply on top, so on \
+a small account a fraction below 1 often leaves the share count unchanged: skip a setup \
+you would only take small. It can only shrink a position, never grow it. Use 1.0 only \
+for the clearest setups and 0.25 to 0.5 when a setup is acceptable but not clean.
 6. The daily profit target is informational only. Never add size, trades or risk \
 because the account is behind the target, after a loss, or to make money back. The \
 loss limit and the other risk limits are binding. When today's P&L is near the loss \

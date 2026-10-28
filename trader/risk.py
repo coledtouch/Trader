@@ -236,7 +236,7 @@ class RiskManager:
             notes.append(f"size fraction {decision.size_fraction:.2f}")
         if day.loss_streak >= lim.loss_streak_halve_after:
             risk_usd *= STREAK_FACTOR
-            notes.append(f"{day.loss_streak} losses in a row: size halved")
+            notes.append(f"{day.loss_streak} losses in a row: risk budget halved")
 
         committed = working_buy_notional(open_orders or [])
         reserved_fees = working_buy_fees(open_orders or [], broker)
