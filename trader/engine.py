@@ -1924,12 +1924,12 @@ class Engine:
                 stops[key] = max(stops.get(key, 0.0), req.stop_loss)
         return stops
 
-    @staticmethod
-    def _queued_exits(open_orders: list[OrderRecord]) -> dict[str, float]:
-        """Unfilled quantity of working market SELL exits per instrument: closes the broker
-        holds until it can execute them (e.g. a kill or flatten sent after hours, or an exit
-        queued during a halt). A protective stop next to one could sell the shares twice.
-        Bracket take-profit children are limit orders and do not count."""
+    def _queued_exits(self, open_orders: list[OrderRecord]) -> dict[str, float]:
+        """Unfilled quantity of this app's working market SELL exits per instrument: closes
+        the broker holds until it can execute them (e.g. a kill or flatten sent after hours,
+        or an exit queued during a halt). A protective stop next to one could sell the
+        shares twice. Bracket take-profit children are limit orders and do not count, nor
+        does an owner's order from TWS or IBKR Mobile (an MIT or LOC may never execute)."""
         queued: dict[str, float] = {}
         for order in open_orders:
             req = order.request
@@ -1938,6 +1938,7 @@ class Engine:
                 and req.side == Side.SELL
                 and req.stop_loss is None
                 and req.order_type == OrderType.MARKET
+                and self.broker.can_cancel(order)
             ):
                 key = req.instrument.key
                 queued[key] = queued.get(key, 0.0) + max(0.0, req.qty - order.filled_qty)
@@ -2182,7 +2183,8 @@ class Engine:
         none working. Only brokers that rest a stop for a SELL request carrying stop_loss
         (`supports_standalone_stops`) get one; otherwise, or when the broker rejects it, the
         owner is notified and the engine's backup stop guards the position. Shares a working
-        market exit will already sell are not protected again (never sell twice)."""
+        market exit of this app will already sell are not protected again (never sell
+        twice); an owner's conditional sell (MIT, LOC, ...) from TWS does not count."""
         if not self._reprotect_pending:
             return
         self._reprotect_pending = False

@@ -297,8 +297,7 @@ class Broker(ABC):
 
     def _own_market_sell(self, orders: list[OrderRecord], instrument: Instrument) -> bool:
         """A market sell of this app's for the instrument is working. Only this client's
-        orders count: another client's (TWS, IBKR Mobile) may be listed as a market sell
-        without being one (MIT, LOC, a %-trailing stop, ...)."""
+        orders count: another client's (TWS, IBKR Mobile) is not a close of this app."""
         return any(
             order.request.instrument.key == instrument.key
             and order.request.side == Side.SELL
