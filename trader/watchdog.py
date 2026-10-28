@@ -27,7 +27,7 @@ import signal
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 from trader.broker.base import BrokerError
@@ -56,6 +56,9 @@ HEARTBEAT_KEY = "engine_heartbeat"
 KILL_REASON = "kill switch"
 TAG_PREFIX = "ai-trader-wd-"
 APP_TAG_PREFIX = "ai-trader-"  # every order the app or this watchdog sends (order_trace_id)
+# kv: a bot position this watchdog sold flat (value: position_marker of its meta). The app
+# forgets the meta only once it runs again; until then a buy of the symbol is not the bot's.
+WATCHDOG_CLOSED_PREFIX = "watchdog_closed:"
 # One bad bid must not sell. The app uses the same idea (two monitor ticks).
 STOP_CONFIRM_TICKS = 2
 QTY_EPS = 1e-8
@@ -220,6 +223,30 @@ def _killed(stats: DayStats | None) -> bool:
     return bool(stats and stats.halted and (stats.halt_reason or "").startswith(KILL_REASON))
 
 
+def position_marker(meta: dict[str, Any]) -> str:
+    """Identifies one bot position: its positions_meta opened_at (a new entry rewrites it)."""
+    opened = meta.get("opened_at")
+    return opened.isoformat() if isinstance(opened, datetime) else str(opened)
+
+
+def sold_by_watchdog(db: Database, key: str, meta: dict[str, Any]) -> bool:
+    """The watchdog sold this bot position flat while the app was down: whatever is held
+    under the symbol now (the owner's buy since) is not the bot's."""
+    return db.get_kv(WATCHDOG_CLOSED_PREFIX + key) == position_marker(meta)
+
+
+def _app_buys(orders: list[OrderRecord]) -> set[str]:
+    """Instruments with a working entry the app sent (not this watchdog, not the owner)."""
+    return {
+        order.request.instrument.key
+        for order in orders
+        if order.status in OPEN_ORDER_STATUSES
+        and order.request.side == Side.BUY
+        and (order.request.trace_id or "").startswith(APP_TAG_PREFIX)
+        and not (order.request.trace_id or "").startswith(TAG_PREFIX)
+    }
+
+
 def _working_sell_qty(orders: list[OrderRecord], key: str) -> float:
     """Unfilled quantity of the working market sells the app or this watchdog sent for the
     instrument. An owner's order from TWS or IBKR Mobile (a limit far above the market may
@@ -267,6 +294,8 @@ class CryptoWatchdog:
         self._started_at = started if started.tzinfo else started.replace(tzinfo=UTC)
         self._below_stop: dict[str, int] = {}
         self._attempt_at: dict[str, datetime] = {}
+        # Bot positions this process sent a sell for (key -> position_marker), until seen flat.
+        self._sold: dict[str, str] = {}
         # When this process's broker connection last came (back) up. After a gateway
         # outage both processes reconnect, and the app's reconnect backoff (up to
         # MAX_BACKOFF) can lag this poll loop, so the heartbeat is stale for a while
@@ -292,13 +321,19 @@ class CryptoWatchdog:
         positions = await self.broker.positions()
         open_orders = await self.broker.open_orders()
         metas = self.db.all_position_meta()
+        held = {p.instrument.key for p in positions if p.qty > QTY_EPS}
+        self._note_sold_flat(metas, held, _app_buys(open_orders))
         managed = [
             pos
             for pos in positions
             if pos.qty > QTY_EPS
             and pos.instrument.asset_class == AssetClass.CRYPTO
             and pos.instrument.key in metas
+            and not sold_by_watchdog(self.db, pos.instrument.key, metas[pos.instrument.key])
         ]
+        # A key no longer managed (sold, or not the bot's) starts its stop count afresh.
+        keys = {p.instrument.key for p in managed}
+        self._below_stop = {k: n for k, n in self._below_stop.items() if k in keys}
         marks = await self._marks(managed)
         # The broker answered: note when this connection came up (a gap of several polls
         # without a successful tick counts as an outage too, e.g. IBKR error 1100/1102).
@@ -346,10 +381,25 @@ class CryptoWatchdog:
                 result.skipped.append(f"not sending: {why}")
             return result
         for close in closes:
+            self._sold[close.instrument.key] = position_marker(metas[close.instrument.key])
             sent = await self._send(close, now, result)
             if sent is not None:
                 result.closes.append(sent)
         return result
+
+    def _note_sold_flat(
+        self, metas: dict[str, dict[str, Any]], held: set[str], app_buying: set[str]
+    ) -> None:
+        """A bot position this process sold is now flat: mark it sold, so a later buy of the
+        symbol (the owner's, while the app is down) is never taken for it."""
+        for key, marker in list(self._sold.items()):
+            meta = metas.get(key)
+            if meta is None or position_marker(meta) != marker:
+                del self._sold[key]  # the app forgot or replaced that position
+            elif key not in held and key not in app_buying:
+                self.db.set_kv(WATCHDOG_CLOSED_PREFIX + key, marker)
+                del self._sold[key]
+                log.info("%s: sold flat by the watchdog; a later buy is not the bot's", key)
 
     def note_broker_down(self) -> None:
         """The broker connection failed: the next successful tick starts a new

@@ -89,7 +89,7 @@ from trader.timeutil import (
     trading_day,
     trading_day_start,
 )
-from trader.watchdog import write_heartbeat
+from trader.watchdog import WATCHDOG_CLOSED_PREFIX, sold_by_watchdog, write_heartbeat
 
 log = logging.getLogger(__name__)
 
@@ -1474,9 +1474,16 @@ class Engine:
             await self._ensure_connected(now)
             account = await self.broker.account()
             await self._check_account(account, now)
+            close_seq = dict(self._close_seq)  # a close stamped after this is not in the reads
             raw_positions = await self.broker.positions()
             open_orders = await self.broker.open_orders()
-            metas = self.db.all_position_meta()
+            # A bot position the crypto watchdog sold while the app was down: what is held
+            # under the symbol now (the owner's buy since) is not the bot's.
+            metas = {
+                key: meta
+                for key, meta in self.db.all_position_meta().items()
+                if not sold_by_watchdog(self.db, key, meta)
+            }
             quotes = await self._quotes([p.instrument for p in raw_positions if p.qty > 0], now)
             self._note_data_warning()
             positions = self._mark_positions(raw_positions, quotes, metas)
@@ -1537,7 +1544,9 @@ class Engine:
             if "monitor:exits" not in self._errors:
                 write_heartbeat(self.db, now)
             await self._step("flatten", self._flatten_before_close(now, positions, metas))
-            await self._step("re-protect", self._reprotect(now, positions, open_orders, metas))
+            await self._step(
+                "re-protect", self._reprotect(now, positions, open_orders, metas, close_seq)
+            )
             await self._step("journal", self._sync_journal(now, positions, open_orders))
             await self._step("signals", self._evaluate_signals(now))
 
@@ -2189,6 +2198,7 @@ class Engine:
         positions: list[Position],
         open_orders: list[OrderRecord],
         metas: dict[str, dict[str, Any]],
+        close_seq: dict[str, int],
     ) -> None:
         """After a (re)connect: re-place a broker stop for engine stock positions that have
         none working. Only brokers that rest a stop for a SELL request carrying stop_loss
@@ -2197,7 +2207,9 @@ class Engine:
         market exit of this app will already sell are not protected again (never sell
         twice); an owner's order from TWS (a conditional sell, a stop-limit, a buy) does
         not count. A position with a close attempt under way (or in its CLOSE_RETRY
-        window) is looked at again on a later tick, from fresh orders."""
+        window), or one stamped since this tick read the orders (`close_seq`: e.g. a
+        refused owner Close that put the stop back and dropped its marker), is looked at
+        again on a later tick, from fresh orders."""
         if not self._reprotect_pending:
             return
         self._reprotect_pending = False
@@ -2209,9 +2221,9 @@ class Engine:
             meta = metas.get(key)
             stop = meta.get("stop_loss") if meta else None
             qty = round(pos.qty - queued.get(key, 0.0), 8)
-            if self._closing_now(key, now):
-                # This tick's orders may predate the close (a stop it has since cancelled):
-                # decide once the attempt is over.
+            if self._closing_now(key, now) or self._close_seq.get(key, 0) != close_seq.get(key, 0):
+                # This tick's orders may predate the close (a stop it has since cancelled,
+                # or put back): decide once the attempt is over.
                 self._reprotect_pending = True
                 continue
             if (
@@ -2557,7 +2569,10 @@ class Engine:
         held = {p.instrument.key for p in positions if p.qty > 0}
         buying = self._working_buys(open_orders)
         for key, meta in self.db.all_position_meta().items():
-            if key in held or key in buying or key in self._pending_trades:
+            # Sold by the crypto watchdog while the app was down: shares held now are not
+            # the bot's (they may be the owner's buy since, which the fills journal counts).
+            sold = sold_by_watchdog(self.db, key, meta)
+            if (key in held and not sold) or key in buying or key in self._pending_trades:
                 continue
             opened = meta.get("opened_at")
             last_exit = self._last_exit_for(key)
@@ -2569,7 +2584,7 @@ class Engine:
                 await self._reconstruct(key, now)
                 if key in self._pending_trades:
                     continue
-            if self._open_qty.get(key, 0.0) > EPS:
+            if self._open_qty.get(key, 0.0) > EPS and not sold:
                 if key not in self._mismatch_logged:
                     self._mismatch_logged.add(key)
                     log.warning("%s: broker shows no position but the fills journal does", key)
@@ -2587,6 +2602,7 @@ class Engine:
                     log.info("cancelled leftover exit order %s for %s", order.broker_order_id, key)
             self.db.delete_position_meta(key)
             self.db.set_kv(EXTRA_PREFIX + key, "{}")
+            self.db.delete_kv(WATCHDOG_CLOSED_PREFIX + key)
             self._closing.pop(key, None)
             self._open_qty.pop(key, None)
 

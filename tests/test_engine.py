@@ -3006,6 +3006,68 @@ async def test_stop_comes_back_after_an_exit_lost_to_a_link_blip(db, config) -> 
     assert _stops(fake) == [95.0]
 
 
+async def test_refused_owner_close_during_a_tick_leaves_one_stop(db, config) -> None:
+    """Review finding: the owner pressed Close while a monitor tick was between its order
+    read and re-protect. IBKR refused the sell, so the close put the stop back and dropped
+    its marker; re-protect then worked from the tick's older order list (the first stop
+    cancelled, the put-back one not listed yet) and placed a second stop."""
+    from tests.test_ibkr import log_error
+
+    broker, fake, engine, clock = await _time_stop_with_own_stop(db, config)
+    _set_bid(broker, fake, 103.0)  # 0.6R: no exit of its own
+    engine._reprotect_pending = False
+
+    def reject_market(trade) -> None:
+        if trade.order.orderType == "MKT":
+            trade.orderStatus.status = "Cancelled"
+            log_error(trade, 201, "Order rejected - reason: test")
+
+    fake.on_place = reject_market
+    manage = engine._manage_positions
+
+    async def manage_then_owner_close(*args, **kwargs):
+        await manage(*args, **kwargs)
+        with pytest.raises(BrokerError):
+            await engine.close_position("STK:AAPL")
+
+    engine._manage_positions = manage_then_owner_close
+    await engine.monitor_tick()
+    assert _stops(fake) == [95.0]  # put back by the refused close
+    engine._manage_positions = manage
+    for _ in range(6):
+        clock.advance(seconds=15)
+        await engine.monitor_tick()
+    assert _stops(fake) == [95.0]
+
+
+async def test_crypto_the_watchdog_sold_is_not_managed_after_a_restart(db, config) -> None:
+    """Review finding: the watchdog sold the bot's BTC while the app was down and the
+    owner bought BTC since. The app came back with the old position's meta and managed the
+    owner's BTC as the bot's (its stop, its time stop)."""
+    from trader.watchdog import WATCHDOG_CLOSED_PREFIX, position_marker
+
+    h = await harness(db, config, trade_crypto=True)
+    h.broker.set_price("BTC", 60000.0, asset_class=AssetClass.CRYPTO)
+    key = "CRYPTO:BTC"
+    db.set_position_meta(
+        key,
+        stop_loss=59000.0,
+        take_profit=62000.0,
+        entry_price=60000.0,
+        opened_at=NOW - timedelta(hours=2),
+    )
+    db.set_kv(WATCHDOG_CLOSED_PREFIX + key, position_marker(db.all_position_meta()[key]))
+    h.broker.pos[key] = [0.5, 58000.0]  # the owner's buy, after the watchdog's sale
+    h.broker.set_price("BTC", 50000.0, asset_class=AssetClass.CRYPTO)  # far below the stop
+    for _ in range(3):
+        await h.engine.monitor_tick()
+        h.clock.advance(seconds=15)
+    assert not [r for r in h.broker.placed if r.instrument.key == key]
+    assert h.broker.pos[key][0] == 0.5
+    assert key not in db.all_position_meta()  # forgotten: the owner's position
+    assert not db.get_kv(WATCHDOG_CLOSED_PREFIX + key)
+
+
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:
     h = await harness(db, config)
     h.broker.standalone_stops = False

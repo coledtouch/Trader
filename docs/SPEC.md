@@ -849,7 +849,10 @@ Contracts changed by the confirmed review findings (each has a regression test).
   stops count as protection (an owner's stop-limit or trailing limit may rest unfilled after
   a gap, or cover only part of the position), and only this app's own working BUYs hold a
   position back from re-protect or a flat position's cleanup (which cancels its leftover
-  stop); an owner's buy from TWS does neither.
+  stop); an owner's buy from TWS does neither. Every close attempt arms re-protect; a
+  position with a close under way, in its CLOSE_RETRY window, or stamped after the tick
+  read its orders (a refused owner Close puts the stop back and drops its marker) is left
+  to a later tick's fresh orders.
 - **Breach spacing** (ENG-5): see 7.4 (`BREACH_MIN_SPACING`).
 - **Entry TTL** (ENG-6): measured from when the order was sent (7.3).
 - **IBKR 1101** (BRK-1): `connected` is False and data/order calls raise `BrokerError` until
@@ -976,7 +979,11 @@ IB client id (`TRADER_WATCHDOG_CLIENT_ID`, required to differ from `TRADER_IB_CL
   immediately flatten.
 
 Only `positions_meta` rows are managed (the bot opened them). Stocks and the owner's own
-crypto are left alone. Orders are SELL exits whose `trace_id` (IBKR `orderRef`) is
+crypto are left alone. Once the watchdog's sells have taken a bot position flat it marks
+it sold (kv `watchdog_closed:<key>` = the meta's `opened_at`, while no entry of the app's
+works): only the app deletes the meta, so until then a later buy of the symbol (the
+owner's, while the app is down) is not managed, by the watchdog nor by the engine when it
+comes back, which forgets that meta. A new bot entry rewrites `opened_at`. Orders are SELL exits whose `trace_id` (IBKR `orderRef`) is
 `ai-trader-wd-<symbol>-<kind>-<id>`.
 A working market sell of the app or the watchdog (orderRef `ai-trader-...`), or a send newer than
 `TRADER_WATCHDOG_RETRY_SECONDS`, suppresses a duplicate; an owner's order from TWS or IBKR

@@ -712,3 +712,58 @@ async def test_a_stop_breach_is_not_delayed_by_a_reconnect(db: Database) -> None
         await watchdog.tick()
         clock.advance(seconds=10)
     assert len(sells(broker)) == 1 and "-stop-" in (sells(broker)[0].trace_id or "")
+
+
+def _filled(broker: FakeBroker) -> None:
+    """The watchdog's sells filled: the bot's crypto is gone."""
+    broker.positions_list.clear()
+    broker.orders.clear()
+
+
+@pytest.mark.parametrize(("age", "bid"), [(60, 94.0), (200, 100.0)])  # stop, then flatten
+async def test_a_buy_after_the_watchdog_sold_the_bot_position_is_not_the_bots(
+    db: Database, age: float, bid: float
+) -> None:
+    """Review finding: while the app was down the watchdog sold the bot's BTC, but the
+    position's meta stayed (only the app deletes it). The owner then bought BTC in IBKR
+    Mobile, and the next poll sold it as the bot's, without even confirming the stop."""
+    clock = Clock()
+    broker = FakeBroker()
+    instrument = hold(db, broker, qty=0.02, bid=bid, last=bid)
+    beat(db, clock, age=age)
+    watchdog, _notes = make(db, broker, clock)
+    for _ in range(STOP_CONFIRM_TICKS):
+        await watchdog.tick()
+        clock.advance(seconds=10)
+    assert [s.qty for s in sells(broker)] == [pytest.approx(0.02)]
+    _filled(broker)
+    await watchdog.tick()  # flat: the watchdog notes it sold the bot's position
+    clock.advance(seconds=30)
+    broker.positions_list.append(Position(instrument=instrument, qty=0.5, avg_cost=94.0))
+    for _ in range(3):
+        await watchdog.tick()
+        clock.advance(seconds=30)
+    assert len(sells(broker)) == 1
+
+
+async def test_a_new_bot_entry_after_a_watchdog_sale_is_managed_again(db: Database) -> None:
+    clock = Clock()
+    broker = FakeBroker()
+    instrument = hold(db, broker, qty=0.02, bid=94.0, last=94.0)
+    beat(db, clock, age=60)
+    watchdog, _notes = make(db, broker, clock)
+    for _ in range(STOP_CONFIRM_TICKS):
+        await watchdog.tick()
+        clock.advance(seconds=10)
+    _filled(broker)
+    await watchdog.tick()
+    clock.advance(seconds=10)
+    # The app came back and bought again: its new entry rewrites the meta.
+    db.set_position_meta(
+        instrument.key, stop_loss=95.0, take_profit=110.0, entry_price=100.0, opened_at=NOW
+    )
+    broker.positions_list.append(Position(instrument=instrument, qty=0.03, avg_cost=100.0))
+    for _ in range(STOP_CONFIRM_TICKS):
+        await watchdog.tick()
+        clock.advance(seconds=10)
+    assert [s.qty for s in sells(broker)] == [pytest.approx(0.02), pytest.approx(0.03)]
