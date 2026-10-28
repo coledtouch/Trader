@@ -601,8 +601,7 @@ class Engine:
             if callable(take):
                 lost += take()
         if lost > 0:
-            day.llm_cost = round(day.llm_cost + lost, 6)
-            self._save_day()
+            self._add_llm_cost(day.day, lost)
             log.warning(
                 "AI call cut off by a stop or restart: $%.2f (estimated) added to today's AI spend",
                 lost,
@@ -612,6 +611,15 @@ class Engine:
         if self._day is not None and self._day.day == day:
             return self._day
         return self.db.get_day(day) or DayStats(day=day)
+
+    def _add_llm_cost(self, day: str, cost: float) -> None:
+        """Add AI spend to the trading day the call was made on, by date: the day can roll
+        over while a call runs (crypto at midnight), and self._day then holds the next."""
+        if cost <= 0:
+            return
+        stats = self._stats_for(day)
+        stats.llm_cost = round(stats.llm_cost + cost, 6)
+        self.db.upsert_day(stats)
 
     def _add_fee(self, ts: datetime, amount: float) -> None:
         if abs(amount) < EPS:
@@ -2748,7 +2756,7 @@ class Engine:
                 cycle_settings,
                 quoted_at,
             )
-        day.llm_cost = round(day.llm_cost + batch.cost_usd, 6)
+        self._add_llm_cost(day.day, batch.cost_usd)
         self._save_day()
         # Orders must not be interrupted halfway (e.g. by stop()): shield the execution.
         outcomes, holds = await asyncio.shield(self._execute(batch, ctx, now))

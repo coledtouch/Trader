@@ -213,8 +213,9 @@ class RuleBasedDecisionMaker:   # name = "rules"; __init__(settings: BotSettings
   ended early) keeps the fallback's exits and is charged a worst-case estimate (prompt
   estimate + `max_tokens` output); one never accepted is charged nothing. A call cancelled
   by Stop or shutdown after it was accepted leaves the same estimate in
-  `take_abandoned_cost()`; the engine adds it to `DayStats.llm_cost`, since the cancelled
-  cycle journals no batch.
+  `take_abandoned_cost()` (consensus does the same for a side that had already answered);
+  the engine adds it to `DayStats.llm_cost` of the cycle's trading day (by date: a call can
+  outlast midnight), since the cancelled cycle journals no batch.
 - Handle `stop_reason == "refusal"` (→ `refused=True`, no decisions), `max_tokens`
   (→ error, no decisions), API errors with the typed exception chain (→ error, no
   decisions). On any failure the batch has **no BUY decisions** (fail safe), but the

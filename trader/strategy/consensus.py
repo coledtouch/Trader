@@ -92,6 +92,7 @@ class ConsensusDecisionMaker:
             raise ValueError("consensus needs two different decision makers")
         self.primary = primary
         self.secondary = secondary
+        self._abandoned_cost = 0.0  # see take_abandoned_cost
 
     @property
     def model(self) -> str:
@@ -100,8 +101,24 @@ class ConsensusDecisionMaker:
         )
 
     async def decide(self, ctx: DecisionContext) -> DecisionBatch:
-        first, second = await asyncio.gather(_ask(self.primary, ctx), _ask(self.secondary, ctx))
+        asks = [asyncio.ensure_future(_ask(m, ctx)) for m in (self.primary, self.secondary)]
+        try:
+            first, second = await asyncio.gather(*asks)
+        except asyncio.CancelledError:
+            # Stop or shutdown: a side that already answered was billed, but the cancelled
+            # cycle journals no batch (a side cut off mid-call reports its own estimate).
+            self._abandoned_cost += sum(
+                ask.result().cost_usd
+                for ask in asks
+                if ask.done() and not ask.cancelled() and ask.exception() is None
+            )
+            raise
         return merge(_Side(self.primary.name, first), _Side(self.secondary.name, second), ctx)
+
+    def take_abandoned_cost(self) -> float:
+        """The cost of answers thrown away by a cancelled cycle (see `decide`). Resets it."""
+        cost, self._abandoned_cost = self._abandoned_cost, 0.0
+        return cost
 
 
 async def _ask(maker: DecisionMaker, ctx: DecisionContext) -> DecisionBatch:

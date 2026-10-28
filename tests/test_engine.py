@@ -1698,6 +1698,71 @@ async def test_stopping_mid_consensus_counts_both_calls(db, config) -> None:
     assert db.list_decisions() == []
 
 
+async def test_stopping_mid_consensus_counts_the_side_that_already_answered(db, config) -> None:
+    """Review finding: Grok had answered (and was billed) while Claude was still thinking;
+    Stop threw Grok's batch away with its cost."""
+    from trader.strategy.consensus import ConsensusDecisionMaker
+
+    h = await harness(db, config)
+    claude, grok = StalledMaker("claude", 0.33), FakeDecisionMaker("grok", 0.05)
+    consensus = ConsensusDecisionMaker(claude, grok)
+    h.engine._decider = consensus
+    h.engine._decision_task = asyncio.create_task(h.engine.run_cycle())
+    await claude.started.wait()
+    await asyncio.sleep(0)
+    assert grok.calls  # answered
+    await h.engine.stop()
+    assert h.day().llm_cost == pytest.approx(0.38)
+    assert consensus.take_abandoned_cost() == 0  # charged once
+
+
+class CrossMidnight(FakeDecisionMaker):
+    """A call made at 23:58 New York that the monitor loop's day rollover overtakes."""
+
+    def __init__(self, h: H, stall: bool, cost: float = 0.30) -> None:
+        super().__init__("claude", cost)
+        self.h, self.stall = h, stall
+        self.started = asyncio.Event()
+        self.abandoned = 0.0
+
+    async def decide(self, ctx: DecisionContext) -> DecisionBatch:
+        self.h.clock.advance(minutes=2.5)
+        await self.h.engine.monitor_tick()  # the concurrent monitor loop rolls the day over
+        if self.stall:
+            self.abandoned = self.cost
+            self.started.set()
+            await asyncio.Event().wait()
+        return await super().decide(ctx)
+
+    def take_abandoned_cost(self) -> float:
+        cost, self.abandoned = self.abandoned, 0.0
+        return cost
+
+
+@pytest.mark.parametrize("stall", [False, True])
+async def test_ai_cost_of_a_call_across_midnight_lands_on_its_day(db, config, stall) -> None:
+    """Review finding: the cost went onto the captured day object, but the save wrote the
+    new day, so neither day's AI spend counted the call."""
+    late = datetime(2026, 10, 22, 3, 58, tzinfo=UTC)  # 23:58 New York, Wednesday Oct 21
+    h = await harness(db, config, now=late, trade_crypto=True)
+    h.broker.set_price("BTC", 60000.0, asset_class=AssetClass.CRYPTO)
+    btc = cand("BTC", price=60000.0, stop=59000.0, target=62000.0)
+    crypto = Instrument(symbol="BTC", asset_class=AssetClass.CRYPTO)
+    h.scanner.candidates["CRYPTO:BTC"] = [btc.model_copy(update={"instrument": crypto})]
+    maker = CrossMidnight(h, stall)
+    h.engine._decider = maker
+    if stall:
+        h.engine._decision_task = asyncio.create_task(h.engine.run_cycle())
+        await maker.started.wait()
+        await h.engine.stop()
+    else:
+        batch = await h.engine.run_cycle()
+        assert batch is not None and batch.cost_usd == pytest.approx(0.30)
+    old, new = db.get_day("2026-10-21"), db.get_day("2026-10-22")
+    assert old is not None and old.llm_cost == pytest.approx(0.30)
+    assert new is None or new.llm_cost == 0
+
+
 async def test_decision_maker_exception_is_journaled(db, config) -> None:
     h = await harness(db, config)
 
