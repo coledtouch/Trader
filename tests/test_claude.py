@@ -517,6 +517,40 @@ async def test_no_answer_within_the_deadline_keeps_exits_and_charges_worst_case(
     assert batch.output_tokens == MAX_TOKENS and batch.cost_usd >= MAX_TOKENS * 20 / 1e6
 
 
+@pytest.mark.parametrize("delay", [0.2, 5])  # answers, or passes the deadline
+async def test_model_change_mid_call_keeps_the_calls_model(caplog, delay):
+    """Review finding: Settings swapped the model while a call ran, and the call was priced
+    and labelled at the new model. The call keeps the model and effort it started with."""
+    client = FakeClient(response(output(decision("BUY", "AMD"))), delay=delay)
+    fallback = FakeFallback(DecisionBatch(maker="rules"))
+    m = ClaudeDecisionMaker(API_KEY, "claude-opus-5-5", "high", fallback, client, deadline_s=0.5)
+    opened = client.messages.stream
+
+    def open_then_switch(**kwargs: Any) -> FakeStream:
+        stream = opened(**kwargs)
+        m.model, m.effort = "claude-haiku-5-5", "low"  # saved in Settings mid-call
+        return stream
+
+    client.messages.stream = open_then_switch
+    with caplog.at_level(logging.INFO):
+        batch = await m.decide(base_ctx())
+    request = client.messages.calls[0]
+    assert request["model"] == "claude-opus-5-5"
+    assert request["output_config"]["effort"] == "high"
+    assert "fallbacks" in request  # Opus, so the server-side fallback stays on
+    assert batch.model == "claude-opus-5-5"
+    assert "fallback model" not in caplog.text
+    if delay > m.deadline_s:
+        assert "did not answer within" in (batch.error or "")
+        prompt_tokens = batch.input_tokens
+        assert batch.cost_usd == pytest.approx(
+            estimate_cost("claude-opus-5-5", prompt_tokens, MAX_TOKENS)
+        )
+    else:
+        assert batch.error is None and len(batch.decisions) == 1
+        assert batch.cost_usd == pytest.approx((1000 * 4 + 500 * 20) / 1e6)
+
+
 async def test_unexpected_exception_is_safe():
     batch = await maker(FakeClient(KeyError("weird"))).decide(base_ctx())
     assert batch.decisions == []

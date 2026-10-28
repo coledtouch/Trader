@@ -106,6 +106,7 @@ class ConsensusDecisionMaker:
 
 async def _ask(maker: DecisionMaker, ctx: DecisionContext) -> DecisionBatch:
     """The maker's batch; an exception becomes a failed batch (no decisions)."""
+    model = getattr(maker, "model", None)  # before the call: Settings may change it meanwhile
     try:
         return await maker.decide(ctx)
     except Exception as exc:
@@ -113,7 +114,7 @@ async def _ask(maker: DecisionMaker, ctx: DecisionContext) -> DecisionBatch:
         return DecisionBatch(
             ts=ctx.now,
             maker=maker.name,
-            model=getattr(maker, "model", None),
+            model=model,
             candidates=ctx.candidates,
             error=f"unexpected error: {type(exc).__name__}",
         )

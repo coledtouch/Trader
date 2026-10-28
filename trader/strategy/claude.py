@@ -215,20 +215,24 @@ class ClaudeDecisionMaker:
         self._client = client
 
     async def decide(self, ctx: DecisionContext) -> DecisionBatch:
+        # Settings can change the model mid-call: this call keeps the one it started with.
+        model, effort = self.model, self.effort
         try:
             user_text = render_context(ctx)
         except Exception as exc:
             log.exception("could not render the decision context")
-            return self._failed(ctx, f"could not render context: {type(exc).__name__}")
+            return self._failed(ctx, f"could not render context: {type(exc).__name__}", model=model)
         opened: list[bool] = []
         try:
-            response = await asyncio.wait_for(self._call(user_text, opened), self.deadline_s)
+            response = await asyncio.wait_for(
+                self._call(user_text, opened, model, effort), self.deadline_s
+            )
         except anthropic.AnthropicError as exc:
             error = _describe(exc)
             log.warning("Claude request failed: %s", error)
             if _is_transient(exc):
-                return await self._exits_only(ctx, error)
-            return self._failed(ctx, error)
+                return await self._exits_only(ctx, error, model=model)
+            return self._failed(ctx, error, model=model)
         except (TimeoutError, httpx2.TransportError, _StreamEnded) as exc:
             # No answer in time (TimeoutError), or the open stream broke off: the SDK maps
             # transport errors only before the response headers, never while reading.
@@ -238,32 +242,38 @@ class ClaudeDecisionMaker:
                 error = f"Claude's answer broke off ({type(exc).__name__})"
             log.warning("%s; exits only this cycle", error)
             if not opened:  # still connecting or between the SDK's retries: nothing billed
-                return await self._exits_only(ctx, error)
+                return await self._exits_only(ctx, error, model=model)
             # Accepted and then cut off: its usage is lost, so charge a worst-case estimate
             # (the daily AI budget must not under-count).
             return await self._exits_only(
-                ctx, f"{error}; tokens and cost are estimated", spend=self._worst_case(user_text)
+                ctx,
+                f"{error}; tokens and cost are estimated",
+                model=model,
+                spend=self._worst_case(user_text, model),
             )
         except Exception as exc:
             log.exception("unexpected error calling Claude")
-            return self._failed(ctx, f"unexpected error: {type(exc).__name__}")
+            return self._failed(ctx, f"unexpected error: {type(exc).__name__}", model=model)
 
         try:
-            spend = _spend(response, self.model)
+            spend = _spend(response, model)
         except Exception as exc:
             log.exception("could not read usage from Claude response")
-            return self._failed(ctx, f"could not process response: {type(exc).__name__}")
+            return self._failed(
+                ctx, f"could not process response: {type(exc).__name__}", model=model
+            )
         try:
-            return self._from_response(response, ctx, spend)
+            return self._from_response(response, ctx, spend, model)
         except Exception as exc:
             log.exception("could not process Claude response")
             return self._failed(
-                ctx, f"could not process response: {type(exc).__name__}", spend=spend
+                ctx, f"could not process response: {type(exc).__name__}", model=model, spend=spend
             )
 
     # ------------------------------------------------------------------ request
-    async def _call(self, user_text: str, opened: list[bool]) -> Any:
-        async with self._client.beta.messages.stream(**self._request(user_text)) as stream:
+    async def _call(self, user_text: str, opened: list[bool], model: str, effort: str) -> Any:
+        request = self._request(user_text, model, effort)
+        async with self._client.beta.messages.stream(**request) as stream:
             opened.append(True)  # accepted (HTTP 200): from here on the call may be billed
             try:
                 message = await stream.get_final_message()
@@ -273,36 +283,38 @@ class ClaudeDecisionMaker:
             raise _StreamEnded("the answer ended without a stop reason")
         return message
 
-    def _worst_case(self, user_text: str) -> _Spend:
+    def _worst_case(self, user_text: str, model: str) -> _Spend:
         """An estimate for a call whose usage was lost: the whole output budget spent."""
         prompt_tokens = (len(SYSTEM_PROMPT) + len(user_text)) // CHARS_PER_TOKEN
-        cost = estimate_cost(self.model, prompt_tokens, MAX_TOKENS)
-        return _Spend(self.model, prompt_tokens, MAX_TOKENS, cost)
+        cost = estimate_cost(model, prompt_tokens, MAX_TOKENS)
+        return _Spend(model, prompt_tokens, MAX_TOKENS, cost)
 
-    def _request(self, user_text: str) -> dict[str, Any]:
+    def _request(self, user_text: str, model: str, effort: str) -> dict[str, Any]:
         # Thinking stays at the model default (adaptive); no sampling parameters, no
         # prefill. Effort is set explicitly because the default differs per model.
         request: dict[str, Any] = {
-            "model": self.model,
+            "model": model,
             "max_tokens": MAX_TOKENS,
             "system": [
                 {"type": "text", "text": SYSTEM_PROMPT, "cache_control": dict(CACHE_CONTROL)}
             ],
             "messages": [{"role": "user", "content": user_text}],
             "output_config": {
-                "effort": self.effort,
+                "effort": effort,
                 "format": {"type": "json_schema", "schema": OUTPUT_SCHEMA},
             },
         }
         # Haiku has no server-side fallback; the docs say not to send the parameter.
-        if not self.model.startswith("claude-haiku"):
+        if not model.startswith("claude-haiku"):
             request["betas"] = [FALLBACK_BETA]
             request["fallbacks"] = "default"
         return request
 
     # ------------------------------------------------------------------ response
-    def _from_response(self, response: Any, ctx: DecisionContext, spend: _Spend) -> DecisionBatch:
-        if spend.model != self.model:
+    def _from_response(
+        self, response: Any, ctx: DecisionContext, spend: _Spend, model: str
+    ) -> DecisionBatch:
+        if spend.model != model:
             log.info("Claude request served by fallback model %s", spend.model)
         if response.stop_reason == "refusal":
             details = getattr(response, "stop_details", None)
@@ -311,17 +323,20 @@ class ClaudeDecisionMaker:
             return self._failed(
                 ctx,
                 f"Claude declined the request (category: {category})",
+                model=model,
                 refused=True,
                 spend=spend,
             )
         if response.stop_reason != "end_turn":
             return self._failed(
-                ctx, f"response stopped early ({response.stop_reason})", spend=spend
+                ctx, f"response stopped early ({response.stop_reason})", model=model, spend=spend
             )
 
         candidates = _answer_texts(response.content)
         if not candidates[0].strip():
-            return self._failed(ctx, "response contained no structured output", spend=spend)
+            return self._failed(
+                ctx, "response contained no structured output", model=model, spend=spend
+            )
         output = None
         for text in candidates:
             try:
@@ -330,7 +345,9 @@ class ClaudeDecisionMaker:
             except ValidationError as exc:
                 log.warning("Claude output failed validation (%d errors)", exc.error_count())
         if output is None:
-            return self._failed(ctx, "Claude output was not valid JSON for the schema", spend=spend)
+            return self._failed(
+                ctx, "Claude output was not valid JSON for the schema", model=model, spend=spend
+            )
         decisions, dropped = convert_decisions(output, ctx, source="Claude")
         return DecisionBatch(
             ts=ctx.now,
@@ -350,11 +367,12 @@ class ClaudeDecisionMaker:
         ctx: DecisionContext,
         error: str,
         *,
+        model: str,
         refused: bool = False,
         spend: _Spend | None = None,
     ) -> DecisionBatch:
         """A batch with no decisions (fail safe), still carrying whatever the call cost."""
-        spend = spend or _Spend(self.model, 0, 0, 0.0)
+        spend = spend or _Spend(model, 0, 0, 0.0)
         return failed_batch(
             ctx,
             self.name,
@@ -367,10 +385,10 @@ class ClaudeDecisionMaker:
         )
 
     async def _exits_only(
-        self, ctx: DecisionContext, error: str, *, spend: _Spend | None = None
+        self, ctx: DecisionContext, error: str, *, model: str, spend: _Spend | None = None
     ) -> DecisionBatch:
         """Transient outage: keep the fallback's risk-reducing CLOSEs, never its BUYs."""
-        spend = spend or _Spend(self.model, 0, 0, 0.0)
+        spend = spend or _Spend(model, 0, 0, 0.0)
         return await exits_only(
             ctx,
             maker=self.name,
