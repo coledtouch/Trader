@@ -551,6 +551,31 @@ async def test_model_change_mid_call_keeps_the_calls_model(caplog, delay):
         assert batch.cost_usd == pytest.approx((1000 * 4 + 500 * 20) / 1e6)
 
 
+@pytest.mark.parametrize("accepted", [True, False])
+async def test_cancelled_call_leaves_its_estimate_for_the_engine(accepted):
+    """Review finding: Stop or shutdown cancels decide() mid-answer, so no batch carries the
+    cost. A call Claude had accepted leaves its worst-case estimate (taken once) for the
+    engine to charge; one still connecting was never billed and leaves nothing."""
+    client = FakeClient(
+        response(output(decision("BUY", "AMD"))),
+        delay=5 if accepted else 0,
+        open_delay=0 if accepted else 5,
+    )
+    m = maker(client)
+    ctx = base_ctx()
+    task = asyncio.create_task(m.decide(ctx))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert client.messages.streams[0].closed == accepted  # an opened stream is closed
+    if accepted:
+        expected = m._worst_case(render_context(ctx), "claude-opus-5-5").cost
+        assert expected >= MAX_TOKENS * 20 / 1e6
+        assert m.take_abandoned_cost() == pytest.approx(expected)
+    assert m.take_abandoned_cost() == 0
+
+
 async def test_unexpected_exception_is_safe():
     batch = await maker(FakeClient(KeyError("weird"))).decide(base_ctx())
     assert batch.decisions == []
@@ -795,6 +820,38 @@ async def _exits_fallback() -> tuple[DecisionContext, FakeFallback]:
         )
     )
     return ctx, FakeFallback(rules_batch)
+
+
+async def test_real_sdk_stop_mid_answer_leaves_the_estimate():
+    """Review finding, with the real SDK: message_start arrived (the call is billed), then
+    Stop cancels the cycle. The stream closes and the estimate waits for the engine."""
+    asked_for_more = asyncio.Event()
+
+    class Body(httpx2.AsyncByteStream):
+        async def __aiter__(self):
+            yield _start_event()
+            asked_for_more.set()  # the SDK read message_start and waits for the answer
+            await asyncio.Event().wait()
+            yield b""  # unreachable
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        headers = {"request-id": "req_1", "content-type": "text/event-stream"}
+        return httpx2.Response(200, stream=Body(), headers=headers)
+
+    client = anthropic.AsyncAnthropic(
+        api_key=API_KEY,
+        max_retries=0,
+        http_client=httpx2.AsyncClient(transport=httpx2.MockTransport(handler)),
+    )
+    m = ClaudeDecisionMaker(API_KEY, "claude-opus-5-5", "medium", FakeFallback(), client=client)
+    ctx = base_ctx()
+    task = asyncio.create_task(m.decide(ctx))
+    await asyncio.wait_for(asked_for_more.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    expected = m._worst_case(render_context(ctx), "claude-opus-5-5").cost
+    assert m.take_abandoned_cost() == pytest.approx(expected)
 
 
 async def test_real_sdk_overloaded_error_mid_stream_keeps_exits():

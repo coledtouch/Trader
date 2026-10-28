@@ -202,9 +202,19 @@ class RuleBasedDecisionMaker:   # name = "rules"; __init__(settings: BotSettings
   fallback maker's CLOSE decisions only, with `error` set; refusals, other 4xx errors and
   parse failures return no decisions. `DecisionBatch.model` is the model that served the
   response (it can be a server-side fallback model).
-- Structured output: `client.beta.messages.parse(..., output_format=<pydantic model>,
-  betas=["server-side-fallback-2026-07-01"], fallbacks="default")` - verified present in
-  anthropic 2.1.0. Validate the parsed result again and convert to `AIDecision`s.
+- Streamed call: `client.beta.messages.stream(...)` + `get_final_message()` with
+  `output_config.format` (a JSON schema from `anthropic.transform_schema`),
+  `betas=["server-side-fallback-2026-07-01"], fallbacks="default"` (not on Haiku), inside
+  an `asyncio.wait_for` deadline of 140 s (`DECISION_DEADLINE_S`). The answer is the text
+  blocks joined across fallback blocks (then the text after the last fallback as a second
+  try), validated against `ModelDecisions` and converted to `AIDecision`s. Model and effort
+  are read once per call (Settings may change them meanwhile).
+- A call accepted (stream opened) and then lost (deadline, connection broken off, stream
+  ended early) keeps the fallback's exits and is charged a worst-case estimate (prompt
+  estimate + `max_tokens` output); one never accepted is charged nothing. A call cancelled
+  by Stop or shutdown after it was accepted leaves the same estimate in
+  `take_abandoned_cost()`; the engine adds it to `DayStats.llm_cost`, since the cancelled
+  cycle journals no batch.
 - Handle `stop_reason == "refusal"` (→ `refused=True`, no decisions), `max_tokens`
   (→ error, no decisions), API errors with the typed exception chain (→ error, no
   decisions). On any failure the batch has **no BUY decisions** (fail safe), but the
@@ -217,8 +227,7 @@ class RuleBasedDecisionMaker:   # name = "rules"; __init__(settings: BotSettings
   write 8.0), sonnet-5-5 2/10 (0.20, 2.5, 4.0), haiku-5-5 0.10/0.50 (0.01, 0.125, 0.20);
   1-hour writes cost 2x base input. `usage.cache_creation` splits writes into
   `ephemeral_5m_input_tokens` / `ephemeral_1h_input_tokens`; writes it does not explain
-  are charged at the 1-hour price. Unknown model → opus prices. `max_tokens` 16000
-  (non-streaming parse).
+  are charged at the 1-hour price. Unknown model → opus prices. `max_tokens` 16000.
 - The output model (`ModelDecision(s)`, aliased `ClaudeDecision(s)`), `convert_decisions`
   and the failure helpers live in `strategy/common.py` and are shared with Grok.
 - The system prompt makes Claude a disciplined intraday risk manager: may only BUY

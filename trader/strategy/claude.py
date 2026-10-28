@@ -213,6 +213,7 @@ class ClaudeDecisionMaker:
         self.fallback = fallback
         self.deadline_s = deadline_s
         self._client = client
+        self._abandoned_cost = 0.0  # see take_abandoned_cost
 
     async def decide(self, ctx: DecisionContext) -> DecisionBatch:
         # Settings can change the model mid-call: this call keeps the one it started with.
@@ -227,6 +228,10 @@ class ClaudeDecisionMaker:
             response = await asyncio.wait_for(
                 self._call(user_text, opened, model, effort), self.deadline_s
             )
+        except asyncio.CancelledError:
+            if opened:  # accepted, then cut off by Stop or shutdown: billed, never journaled
+                self._abandoned_cost += self._worst_case(user_text, model).cost
+            raise
         except anthropic.AnthropicError as exc:
             error = _describe(exc)
             log.warning("Claude request failed: %s", error)
@@ -269,6 +274,12 @@ class ClaudeDecisionMaker:
             return self._failed(
                 ctx, f"could not process response: {type(exc).__name__}", model=model, spend=spend
             )
+
+    def take_abandoned_cost(self) -> float:
+        """The estimated cost of calls cancelled after Claude accepted them (Stop, shutdown).
+        They journal no batch, so the engine adds this to the day's AI spend. Resets it."""
+        cost, self._abandoned_cost = self._abandoned_cost, 0.0
+        return cost
 
     # ------------------------------------------------------------------ request
     async def _call(self, user_text: str, opened: list[bool], model: str, effort: str) -> Any:

@@ -591,6 +591,23 @@ class Engine:
         if self._day is not None:
             self.db.upsert_day(self._day)
 
+    def _charge_abandoned_calls(self, day: DayStats) -> None:
+        """A cancelled cycle (Stop, shutdown) journals no batch, but an AI call it cut off
+        after the provider accepted it is still billed: add the makers' estimates to the
+        day's AI spend so the daily budget does not under-count."""
+        lost = 0.0
+        for maker in self._all_makers():
+            take = getattr(maker, "take_abandoned_cost", None)
+            if callable(take):
+                lost += take()
+        if lost > 0:
+            day.llm_cost = round(day.llm_cost + lost, 6)
+            self._save_day()
+            log.warning(
+                "AI call cut off by a stop or restart: $%.2f (estimated) added to today's AI spend",
+                lost,
+            )
+
     def _stats_for(self, day: str) -> DayStats:
         if self._day is not None and self._day.day == day:
             return self._day
@@ -2696,6 +2713,9 @@ class Engine:
         maker, why, entries_ok = self._pick_maker(ctx)
         try:
             batch = await maker.decide(ctx)
+        except asyncio.CancelledError:
+            self._charge_abandoned_calls(day)
+            raise
         except Exception as exc:
             log.exception("decision maker %s failed", maker.name)
             batch = DecisionBatch(maker=maker.name, error=f"{type(exc).__name__}: {exc}")

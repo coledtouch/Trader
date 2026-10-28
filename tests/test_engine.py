@@ -1645,6 +1645,59 @@ async def test_llm_skipped_when_disabled_or_nothing_worth_it(db, config) -> None
     assert h2.db.list_signals()[0].skip_reason == "score 0.30 < 0.50"
 
 
+class StalledMaker(FakeDecisionMaker):
+    """An AI call the provider accepted and is still answering when the cycle is cancelled;
+    it reports `abandoned` as the cut-off call's estimated cost (once)."""
+
+    def __init__(self, name: str = "claude", abandoned: float = 0.33) -> None:
+        super().__init__(name)
+        self.abandoned = abandoned
+        self.started = asyncio.Event()
+
+    async def decide(self, ctx: DecisionContext) -> DecisionBatch:
+        self.calls.append(ctx)
+        self.started.set()
+        await asyncio.Event().wait()  # never answers
+        raise AssertionError("unreachable")
+
+    def take_abandoned_cost(self) -> float:
+        cost, self.abandoned = self.abandoned, 0.0
+        return cost
+
+
+@pytest.mark.parametrize("how", ["stop", "shutdown"])
+async def test_stopping_mid_ai_call_still_counts_its_cost(db, config, how) -> None:
+    """Review finding: Stop (or an app restart) mid-answer journaled no batch, so the cut-off
+    call's cost never reached the daily AI budget."""
+    h = await harness(db, config)
+    h.decider.cost = 0.10
+    await h.engine.run_cycle()
+    assert h.day().llm_cost == pytest.approx(0.10)
+    h.clock.advance(minutes=5)
+    stalled = StalledMaker()
+    h.engine._decider = stalled
+    h.engine._decision_task = asyncio.create_task(h.engine.run_cycle())
+    await stalled.started.wait()
+    await getattr(h.engine, how)()
+    assert h.day().llm_cost == pytest.approx(0.43)
+    assert len(db.list_decisions()) == 1  # the cancelled cycle journaled nothing
+    assert stalled.take_abandoned_cost() == 0  # charged once
+
+
+async def test_stopping_mid_consensus_counts_both_calls(db, config) -> None:
+    from trader.strategy.consensus import ConsensusDecisionMaker
+
+    h = await harness(db, config)
+    claude, grok = StalledMaker("claude", 0.33), StalledMaker("grok", 0.05)
+    h.engine._decider = ConsensusDecisionMaker(claude, grok)
+    h.engine._decision_task = asyncio.create_task(h.engine.run_cycle())
+    await claude.started.wait()
+    await grok.started.wait()
+    await h.engine.stop()
+    assert h.day().llm_cost == pytest.approx(0.38)
+    assert db.list_decisions() == []
+
+
 async def test_decision_maker_exception_is_journaled(db, config) -> None:
     h = await harness(db, config)
 
