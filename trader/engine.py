@@ -36,7 +36,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
-from trader.broker.base import Broker, BrokerError
+from trader.broker.base import Broker, BrokerError, PartialFlattenError
 from trader.config import AppConfig
 from trader.db import EQUITY_SINCE_KEY, Database
 from trader.models import (
@@ -896,6 +896,10 @@ class Engine:
                     await self.broker.connect()
                 records = await self.broker.flatten_all(KILL_REASON)  # cancels everything
         except Exception as exc:
+            for rec in getattr(exc, "records", []):  # sent before another position failed
+                self._journal_order(rec, now)
+                key = rec.request.instrument.key
+                self._note_close(key, rec, seqs.get(key))
             log.exception("kill switch could not finish")
             self._set_error("kill", f"kill switch failed: {exc}")
             await self._notify(
@@ -1799,7 +1803,14 @@ class Engine:
             for pos in self._positions
         }
         async with self._entry_lock:  # no entry can slip in after the flatten
-            records = await self.broker.flatten_all(reason)  # cancels everything first
+            try:
+                records = await self.broker.flatten_all(reason)  # cancels everything first
+            except PartialFlattenError as exc:
+                for rec in exc.records:  # sent before another position failed
+                    self._journal_order(rec, now)
+                    key = rec.request.instrument.key
+                    self._note_close(key, rec, seqs.get(key))
+                raise
         for rec in records:
             self._journal_order(rec, now)
             key = rec.request.instrument.key

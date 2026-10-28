@@ -1581,6 +1581,28 @@ async def test_kill_during_a_monitor_exit_sells_once(db, config) -> None:
     assert len(_working_market_sells(h, "STK:F")) == 1
 
 
+async def test_kill_that_fails_on_one_position_still_closes_and_journals_the_rest(
+    db, config
+) -> None:
+    """Review finding: KILL stopped at the first position whose close failed, leaving the
+    others unsold and (after the cancel-all) without their stops; what it had sent was
+    not journaled."""
+    h = await _resting(db, config)
+    await enter_f(h)
+    h.broker.pos["STK:T"] = [10.0, 20.0]
+    await h.engine.monitor_tick()
+    h.broker.rest = {"STK:F", "STK:T"}
+    h.broker.open_orders_calls = 0
+    # flatten_all: #1 its own read; F: #2 cancels, #3 its last check times out
+    h.broker.fail_open_orders_on = {3}
+    await h.engine.kill()
+    assert "KILL switch FAILED" in h.notes.titles()
+    assert h.broker.working("STK:F", "stop")  # F's stop put back
+    assert len(_market_sells(h, "STK:T")) == 1  # T still sold
+    journaled = [o.request.instrument.key for o in h.orders() if o.request.side == Side.SELL]
+    assert "STK:T" in journaled
+
+
 async def test_manual_close_refusals(db, config) -> None:
     h = await harness(db, config)
     with pytest.raises(LookupError, match="no open F position"):

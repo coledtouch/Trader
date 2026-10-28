@@ -32,7 +32,7 @@ from ib_async import OrderStatus as IBOrderStatus
 from ib_async import Position as IBPosition
 
 from trader import fees
-from trader.broker.base import BrokerError
+from trader.broker.base import BrokerError, PartialFlattenError
 from trader.broker.ibkr import (
     IBKRBroker,
     MarketDataUnavailable,
@@ -1412,3 +1412,68 @@ async def test_close_puts_the_stop_back_when_its_last_check_fails() -> None:
     assert [(o.action, o.orderType, o.auxPrice, o.tif) for o in new] == [
         ("SELL", "STP", 98.12, "GTC")
     ]
+
+
+def _time_out_open_orders_on(fake: FakeIB, n: int) -> None:
+    real = fake.reqAllOpenOrdersAsync
+    calls = 0
+
+    async def wrapped():
+        nonlocal calls
+        calls += 1
+        if calls == n:
+            raise TimeoutError
+        return await real()
+
+    fake.reqAllOpenOrdersAsync = wrapped
+
+
+def _working(fake: FakeIB, order_type: str) -> list[tuple[str, float]]:
+    return [
+        (t.contract.symbol, t.order.auxPrice if order_type == "STP" else t.order.totalQuantity)
+        for t in fake.trade_list
+        if t.order.action == "SELL"
+        and t.order.orderType == order_type
+        and t.orderStatus.status not in DONE
+    ]
+
+
+async def _two_brackets() -> tuple[IBKRBroker, FakeIB]:
+    msft = Instrument(symbol="MSFT")
+    broker, fake = await connected_broker()
+    fake.details["MSFT"] = [ContractDetails(contract=stock("MSFT", 272093), minTick=0.01)]
+    await broker.place_order(entry())
+    await broker.place_order(
+        entry(instrument=msft, limit_price=400.0, stop_loss=390.0, take_profit=420.0)
+    )
+    for t in fake.trade_list:
+        if t.order.action == "BUY":
+            t.orderStatus.status, t.orderStatus.filled = "Filled", 3
+    hold(fake, stock(), 3)
+    hold(fake, stock("MSFT", 272093), 3)
+    return broker, fake
+
+
+async def test_flatten_puts_the_stop_back_when_a_close_cannot_read_orders() -> None:
+    """Review finding: flatten_all cancels every stop, then a position's close failed on
+    its first open-orders read (a timeout) and the stop was never put back."""
+    broker, fake, _ = await filled_bracket()
+    _time_out_open_orders_on(fake, 2)  # 1: flatten_all's read, 2: the close's first read
+    with pytest.raises(PartialFlattenError) as failed:
+        await broker.flatten_all("kill switch")
+    assert failed.value.records == []
+    assert _working(fake, "STP") == [("AAPL", 98.12)]
+    assert _working(fake, "MKT") == []
+
+
+async def test_flatten_carries_on_past_one_failed_position() -> None:
+    """Review finding: the first failure ended flatten_all, so MSFT (whose stop cancel_all
+    had removed) was neither sold nor protected."""
+    broker, fake = await _two_brackets()
+    _time_out_open_orders_on(fake, 3)  # AAPL's last check before its sell
+    with pytest.raises(PartialFlattenError) as failed:
+        await broker.flatten_all("kill switch")
+    assert "AAPL" in str(failed.value)
+    assert [r.request.instrument.symbol for r in failed.value.records] == ["MSFT"]
+    assert _working(fake, "STP") == [("AAPL", 98.12)]  # put back
+    assert _working(fake, "MKT") == [("MSFT", 3.0)]  # sold

@@ -32,6 +32,15 @@ class BrokerError(Exception):
     """Raised for broker failures the engine should log and survive (not crash on)."""
 
 
+class PartialFlattenError(BrokerError):
+    """flatten_all could not close every position. `records` holds the orders it did send
+    (to be journaled); the failed positions had their stops put back where possible."""
+
+    def __init__(self, message: str, records: list[OrderRecord]) -> None:
+        super().__init__(message)
+        self.records = records
+
+
 class Broker(ABC):
     name: str = "base"
 
@@ -171,40 +180,31 @@ class Broker(ABC):
         positions = {p.instrument.key: p for p in await self.positions()}
         pos = positions.get(instrument.key)
         stops = [] if restore_stop is None else [restore_stop]
-        for order in await self.open_orders():
-            if order.request.instrument.key == instrument.key and order.broker_order_id:
-                if not self.can_cancel(order):
-                    continue  # still working: never counted as a stop to put back
-                await self.cancel_order(order.broker_order_id)
-                if order.request.side == Side.SELL and order.request.stop_loss is not None:
-                    stops.append(order.request.stop_loss)
-        if pos is None or pos.qty <= 0:
-            return None
         req = OrderRequest(
             instrument=instrument,
             side=Side.SELL,
-            qty=pos.qty,
+            qty=pos.qty if pos is not None and pos.qty > 0 else 1.0,
             order_type=OrderType.MARKET,
             is_exit=True,
             reason=reason or "close position",
             trace_id=order_trace_id(existing=trace_id),
         )
         try:
+            for order in await self.open_orders():
+                if order.request.instrument.key == instrument.key and order.broker_order_id:
+                    if not self.can_cancel(order):
+                        continue  # still working: never counted as a stop to put back
+                    await self.cancel_order(order.broker_order_id)
+                    if order.request.side == Side.SELL and order.request.stop_loss is not None:
+                        stops.append(order.request.stop_loss)
+            if pos is None or pos.qty <= 0:
+                return None
             working = await self.open_orders()
         except BrokerError:
-            # The stop is already cancelled: never leave the position without it.
-            if stops and self.supports_standalone_stops(instrument):
-                try:
-                    await self.place_order(
-                        req.model_copy(
-                            update={
-                                "stop_loss": max(stops),
-                                "reason": "protective stop (exit check failed)",
-                            }
-                        )
-                    )
-                except BrokerError as exc:
-                    logger.warning("re-placing the stop for %s failed: %s", instrument.key, exc)
+            # A stop may already be cancelled (here, or by flatten_all's cancel_all): never
+            # leave a held position without it.
+            if stops and pos is not None and pos.qty > 0:
+                await self._put_stop_back(req, max(stops))
             raise
         # Another close of this app (a monitor exit, KILL, an approved close) may have sent
         # its market sell while this one was cancelling: never send a second one (a short).
@@ -251,11 +251,33 @@ class Broker(ABC):
                 stops[key] = max(stops.get(key, 0.0), req.stop_loss)
         await self.cancel_all()
         results: list[OrderRecord] = []
+        errors: list[str] = []
         for pos in await self.positions():
             if pos.qty > 0:
-                rec = await self.close_position(
-                    pos.instrument, reason, restore_stop=stops.get(pos.instrument.key)
-                )
+                # One failure must not leave the rest unsold and, since cancel_all, without
+                # their stops: carry on, and report every failure at the end.
+                try:
+                    rec = await self.close_position(
+                        pos.instrument, reason, restore_stop=stops.get(pos.instrument.key)
+                    )
+                except BrokerError as exc:
+                    errors.append(f"{pos.instrument.symbol}: {exc}")
+                    continue
                 if rec is not None:
                     results.append(rec)
+        if errors:
+            raise PartialFlattenError("; ".join(errors), results)
         return results
+
+    async def _put_stop_back(self, req: OrderRequest, stop: float) -> None:
+        """Best effort: re-place a protective stop a failed close had already removed."""
+        if not self.supports_standalone_stops(req.instrument):
+            return
+        try:
+            await self.place_order(
+                req.model_copy(
+                    update={"stop_loss": stop, "reason": "protective stop (exit check failed)"}
+                )
+            )
+        except BrokerError as exc:
+            logger.warning("re-placing the stop for %s failed: %s", req.instrument.key, exc)
