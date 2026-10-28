@@ -24,8 +24,12 @@ from trader.models import (
 )
 from trader.strategy.decide import reward_risk
 
-MAX_CANDIDATES = 15  # highest scores first; the rest are summarised as a count
+# Highest scores first; the rest are summarised as a count. Each one shown is weighed by
+# the model, so a long list makes the answer slower (it must arrive within the deadline).
+MAX_CANDIDATES = 10
+# Held positions first, then the candidates shown, then broad-market ETFs, then the rest.
 MAX_MARKET_ROWS = 30
+MARKET_CONTEXT = ("STK:SPY", "STK:QQQ", "STK:IWM", "STK:DIA")
 MAX_EXTRA_FIELDS = 8  # non-standard indicator keys shown per instrument
 MAX_RECENT_TRADES = 5
 
@@ -256,10 +260,14 @@ def _position_line(pos: Position, now: datetime) -> str:
     return " | ".join(parts)
 
 
+def _ranked_candidates(ctx: DecisionContext) -> list[Candidate]:
+    return sorted(ctx.candidates, key=lambda c: (-c.score, c.instrument.key, c.setup))
+
+
 def _candidates(ctx: DecisionContext) -> str:
     if not ctx.candidates:
         return "## Candidates: none (no BUY is possible this cycle)"
-    ranked = sorted(ctx.candidates, key=lambda c: (-c.score, c.instrument.key, c.setup))
+    ranked = _ranked_candidates(ctx)
     shown = ranked[:MAX_CANDIDATES]
     lines = [f"## Candidates (BUY only from this list; {len(ranked)})"]
     lines += [
@@ -328,7 +336,12 @@ def _fee_note(cand: Candidate, ctx: DecisionContext) -> str:
 def _market(ctx: DecisionContext) -> str:
     if not ctx.market:
         return "## Market: no snapshots"
-    keys = sorted(ctx.market)
+    # With a large universe, what the model must judge comes first: alphabetical order
+    # would cut held positions and candidates past the row limit.
+    held = sorted(p.instrument.key for p in ctx.positions if p.qty > 0)
+    shown = [c.instrument.key for c in _ranked_candidates(ctx)[:MAX_CANDIDATES]]
+    first = [k for k in (*held, *shown, *MARKET_CONTEXT) if k in ctx.market]
+    keys = list(dict.fromkeys([*first, *sorted(ctx.market)]))
     header = " ".join(label for _, label in MARKET_COLUMNS)
     lines = [f"## Market (instrument {header})"]
     for key in keys[:MAX_MARKET_ROWS]:

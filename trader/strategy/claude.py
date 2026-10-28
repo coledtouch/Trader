@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -224,6 +225,7 @@ class ClaudeDecisionMaker:
             log.exception("could not render the decision context")
             return self._failed(ctx, f"could not render context: {type(exc).__name__}", model=model)
         opened: list[bool] = []
+        started = time.monotonic()
         try:
             response = await asyncio.wait_for(
                 self._call(user_text, opened, model, effort), self.deadline_s
@@ -267,6 +269,16 @@ class ClaudeDecisionMaker:
             return self._failed(
                 ctx, f"could not process response: {type(exc).__name__}", model=model
             )
+        # How close answers come to the deadline (a long candidate list or a high effort
+        # slows them down; past the deadline a round opens nothing).
+        log.info(
+            "Claude answered in %.0fs of %.0fs (%d in, %d out tokens, $%.4f)",
+            time.monotonic() - started,
+            self.deadline_s,
+            spend.prompt_tokens,
+            spend.output_tokens,
+            spend.cost,
+        )
         try:
             return self._from_response(response, ctx, spend, model)
         except Exception as exc:

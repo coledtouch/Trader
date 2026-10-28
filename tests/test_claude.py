@@ -576,6 +576,12 @@ async def test_cancelled_call_leaves_its_estimate_for_the_engine(accepted):
     assert m.take_abandoned_cost() == 0
 
 
+async def test_answer_time_is_logged(caplog):
+    with caplog.at_level(logging.INFO, logger="trader.strategy.claude"):
+        await maker(FakeClient(response(output(decision("BUY", "AMD"))))).decide(base_ctx())
+    assert re.search(r"Claude answered in \d+s of 140s \(1000 in, 500 out tokens", caplog.text)
+
+
 async def test_unexpected_exception_is_safe():
     batch = await maker(FakeClient(KeyError("weird"))).decide(base_ctx())
     assert batch.decisions == []
@@ -1106,7 +1112,26 @@ def test_render_context_marks_limits_reached_and_tolerates_naive_datetimes():
 def test_render_context_caps_candidates():
     many = [cand(f"S{i:02d}", score=0.5) for i in range(20)]
     text = render_context(make_ctx(candidates=many))
-    assert "(+5 lower-scored candidates omitted)" in text
+    assert "(+10 lower-scored candidates omitted)" in text
+
+
+def test_market_rows_put_positions_and_candidates_first():
+    """With a large universe the row limit cut alphabetically, so a held ZION or a
+    candidate XOM never reached the model. Held, then shown candidates, then index ETFs."""
+    snap = {"price": 10.0, "ema9": 10.0}
+    market = {f"STK:A{i:02d}": dict(snap) for i in range(60)}
+    for key in ("STK:ZION", "STK:XOM", "STK:SPY", "STK:YUM"):
+        market[key] = dict(snap)
+    ctx = make_ctx(
+        positions=[pos("ZION")],
+        candidates=[cand("XOM", score=0.9), cand("YUM", score=0.1)],
+        market=market,
+    )
+    rows = render_context(ctx).split("## Market")[1].splitlines()[1:]
+    keys = [row.split()[0] for row in rows if row.startswith("STK:")]
+    assert keys[:4] == ["STK:ZION", "STK:XOM", "STK:YUM", "STK:SPY"]
+    assert len(keys) == 30 and keys[4] == "STK:A00"
+    assert "(+34 more instruments omitted)" in rows
 
 
 def test_module_constants():
