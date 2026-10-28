@@ -55,6 +55,7 @@ log = logging.getLogger(__name__)
 HEARTBEAT_KEY = "engine_heartbeat"
 KILL_REASON = "kill switch"
 TAG_PREFIX = "ai-trader-wd-"
+APP_TAG_PREFIX = "ai-trader-"  # every order the app or this watchdog sends (order_trace_id)
 # One bad bid must not sell. The app uses the same idea (two monitor ticks).
 STOP_CONFIRM_TICKS = 2
 QTY_EPS = 1e-8
@@ -220,6 +221,9 @@ def _killed(stats: DayStats | None) -> bool:
 
 
 def _working_sell_qty(orders: list[OrderRecord], key: str) -> float:
+    """Unfilled quantity of the working market sells the app or this watchdog sent for the
+    instrument. An owner's order from TWS or IBKR Mobile (a limit far above the market may
+    never fill) covers nothing, as in the engine."""
     total = 0.0
     for order in orders:
         req = order.request
@@ -227,6 +231,9 @@ def _working_sell_qty(orders: list[OrderRecord], key: str) -> float:
             order.status in OPEN_ORDER_STATUSES
             and req.instrument.key == key
             and req.side == Side.SELL
+            and req.order_type == OrderType.MARKET
+            and req.stop_loss is None
+            and (req.trace_id or "").startswith(APP_TAG_PREFIX)
         ):
             total += max(0.0, req.qty - order.filled_qty)
     return total

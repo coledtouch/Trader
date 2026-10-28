@@ -2898,6 +2898,114 @@ async def test_leftover_stop_is_cancelled_next_to_an_owners_buy(db, config) -> N
     assert db.get_position_meta("STK:AAPL") is None
 
 
+async def _time_stop_with_own_stop(db, config):
+    """A bot position past its time stop at 0R, with its own IBKR stop at 95 working."""
+    from tests.test_ibkr import NOW as IB_NOW
+    from tests.test_ibkr import av, connected_broker, hold, stock
+
+    broker, fake = await connected_broker()
+    fake.summary = [av("NetLiquidation", "10000"), av("TotalCashValue", "7000")]
+    hold(fake, stock(), 3)
+    db.set_position_meta(
+        "STK:AAPL",
+        stop_loss=95.0,
+        take_profit=110.0,
+        entry_price=100.0,
+        opened_at=IB_NOW - timedelta(minutes=50),
+    )
+    await broker.place_order(
+        OrderRequest(
+            instrument=Instrument(symbol="AAPL"), side=Side.SELL, qty=3,
+            order_type=OrderType.MARKET, stop_loss=95.0, is_exit=True,
+            reason="protective stop",
+        )
+    )  # fmt: skip
+    fake.ticker_values[stock().conId] = {"bid": 100.0, "ask": 100.05, "last": 100.0}
+    clock = FakeClock(IB_NOW)
+    engine = Engine(
+        config, db, broker, FakeDecisionMaker(), notifier=RecordingNotifier(), clock=clock
+    )
+    engine._reprotect_pending = False  # the start-up pass is done
+    return broker, fake, engine, clock
+
+
+def _set_bid(broker, fake, bid: float) -> None:
+    from tests.test_ibkr import stock
+
+    values = {"bid": bid, "ask": bid + 0.05, "last": bid}
+    fake.ticker_values[stock().conId] = values
+    sub = broker._tickers.get("STK:AAPL")
+    if sub is not None:
+        for name, value in values.items():
+            setattr(sub.ticker, name, value)
+
+
+def _stops(fake) -> list[float]:
+    from tests.test_ibkr import DONE
+
+    return [
+        t.order.auxPrice
+        for t in fake.trade_list
+        if t.order.action == "SELL"
+        and t.order.orderType == "STP"
+        and t.orderStatus.status not in DONE
+    ]
+
+
+async def test_stop_comes_back_after_an_exit_lost_to_a_quick_reconnect(db, config) -> None:
+    """Review finding: a monitor exit cancelled the stop, then the gateway socket dropped
+    before the sell. The next tick reconnected and ran re-protect, which skipped the
+    position (its close marker) and never ran again: once the exit condition cleared,
+    the position kept no IBKR stop until the next reconnect."""
+    broker, fake, engine, clock = await _time_stop_with_own_stop(db, config)
+    place = fake.placeOrder
+
+    def drop_on_market_sell(contract, order):
+        if order.orderType == "MKT" and order.action == "SELL":
+            fake.disconnect()
+            raise ConnectionError("Not connected")
+        return place(contract, order)
+
+    fake.placeOrder = drop_on_market_sell
+    await engine.monitor_tick()  # time stop seen
+    clock.advance(seconds=15)
+    await engine.monitor_tick()  # confirmed: stop cancelled, then the sell fails
+    assert _stops(fake) == []
+    fake.placeOrder = place
+    _set_bid(broker, fake, 103.0)  # 0.6R: the time stop no longer applies
+    for _ in range(6):  # reconnects, then 75 s of ticks
+        clock.advance(seconds=15)
+        await engine.monitor_tick()
+    assert broker.connected
+    assert _stops(fake) == [95.0]
+
+
+async def test_stop_comes_back_after_an_exit_lost_to_a_link_blip(db, config) -> None:
+    """Review finding: IBKR error 1100 (the gateway lost its link) right after the stop's
+    cancel refused the sell, and 1102 restored it before any tick saw a disconnect, so
+    re-protect was never armed. Every close attempt arms it now."""
+    broker, fake, engine, clock = await _time_stop_with_own_stop(db, config)
+    cancel = fake.cancelOrder
+
+    def cancel_then_link_lost(order):
+        trade = cancel(order)
+        fake.errorEvent.emit(-1, 1100, "Connectivity between IB and TWS has been lost.", None)
+        return trade
+
+    fake.cancelOrder = cancel_then_link_lost
+    await engine.monitor_tick()
+    clock.advance(seconds=15)
+    await engine.monitor_tick()  # close: stop cancelled, sell refused (link lost)
+    fake.cancelOrder = cancel
+    fake.errorEvent.emit(-1, 1102, "Connectivity between IB and TWS has been restored", None)
+    assert _stops(fake) == [] and broker.connected
+    _set_bid(broker, fake, 103.0)
+    for _ in range(6):
+        clock.advance(seconds=15)
+        await engine.monitor_tick()
+    assert _stops(fake) == [95.0]
+
+
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:
     h = await harness(db, config)
     h.broker.standalone_stops = False

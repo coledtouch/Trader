@@ -387,6 +387,7 @@ async def test_a_partial_working_sell_reduces_only_the_remainder(db: Database) -
                 qty=0.01,
                 order_type=OrderType.MARKET,
                 is_exit=True,
+                trace_id="ai-trader-42",
             ),
             status=OrderStatus.SUBMITTED,
             broker_order_id="WORKING",
@@ -396,6 +397,34 @@ async def test_a_partial_working_sell_reduces_only_the_remainder(db: Database) -
     await watchdog.tick()
     assert len(sells(broker)) == 1
     assert sells(broker)[0].qty == pytest.approx(0.01)
+
+
+async def test_an_owners_sell_covers_nothing(db: Database) -> None:
+    """Review finding: any working sell counted as cover, so an owner's limit sell from IBKR
+    Mobile far above the market kept the watchdog from selling a bot position at its stop
+    (or on flatten or kill) while the app was down."""
+    clock = Clock()
+    broker = FakeBroker()
+    instrument = hold(db, broker, qty=0.02)
+    beat(db, clock, age=200)
+    broker.orders.append(
+        OrderRecord(
+            request=OrderRequest(
+                instrument=instrument,
+                side=Side.SELL,
+                qty=0.02,
+                order_type=OrderType.LIMIT,
+                limit_price=150_000.0,
+                is_exit=True,
+            ),
+            status=OrderStatus.SUBMITTED,
+            broker_order_id="perm:555",
+        )
+    )
+    watchdog, _notes = make(db, broker, clock)
+    await watchdog.tick()
+    assert len(sells(broker)) == 1
+    assert sells(broker)[0].qty == pytest.approx(0.02)
 
 
 async def test_rejected_close_is_not_retried_until_the_window_passes(db: Database) -> None:

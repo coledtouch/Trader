@@ -978,7 +978,9 @@ IB client id (`TRADER_WATCHDOG_CLIENT_ID`, required to differ from `TRADER_IB_CL
 Only `positions_meta` rows are managed (the bot opened them). Stocks and the owner's own
 crypto are left alone. Orders are SELL exits whose `trace_id` (IBKR `orderRef`) is
 `ai-trader-wd-<symbol>-<kind>-<id>`.
-A working sell, or a send newer than `TRADER_WATCHDOG_RETRY_SECONDS`, suppresses a duplicate.
+A working market sell of the app or the watchdog (orderRef `ai-trader-...`), or a send newer than
+`TRADER_WATCHDOG_RETRY_SECONDS`, suppresses a duplicate; an owner's order from TWS or IBKR
+Mobile does not (a far limit may never fill).
 `TRADER_WATCHDOG_ORDERS=off` and simulator mode alert only. Paper may sell with the live
 gate closed; live sells only when `TRADER_ALLOW_LIVE=true` (shadow mode included, because
 the app still exits then). A live account with `TRADER_ALLOW_LIVE=false` therefore gets

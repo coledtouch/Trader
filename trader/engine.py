@@ -1875,7 +1875,10 @@ class Engine:
         return self._closing_now(key, now) and key not in self._close_refused
 
     def _mark_closing(self, key: str, reason: str, at: datetime) -> int:
-        """Stamp a close attempt; returns its number for _note_close."""
+        """Stamp a close attempt; returns its number for _note_close. Arms re-protect: a
+        close that fails part-way (e.g. the link drops after the stop's cancel, before the
+        sell) gets its stop back once the attempt's marker lapses."""
+        self._reprotect_pending = True
         self._closing[key] = at
         self._close_reasons[key] = reason
         self._close_refused.discard(key)
@@ -2193,7 +2196,8 @@ class Engine:
         owner is notified and the engine's backup stop guards the position. Shares a working
         market exit of this app will already sell are not protected again (never sell
         twice); an owner's order from TWS (a conditional sell, a stop-limit, a buy) does
-        not count."""
+        not count. A position with a close attempt under way (or in its CLOSE_RETRY
+        window) is looked at again on a later tick, from fresh orders."""
         if not self._reprotect_pending:
             return
         self._reprotect_pending = False
@@ -2205,6 +2209,11 @@ class Engine:
             meta = metas.get(key)
             stop = meta.get("stop_loss") if meta else None
             qty = round(pos.qty - queued.get(key, 0.0), 8)
+            if self._closing_now(key, now):
+                # This tick's orders may predate the close (a stop it has since cancelled):
+                # decide once the attempt is over.
+                self._reprotect_pending = True
+                continue
             if (
                 qty <= EPS
                 or stop is None
@@ -2212,7 +2221,6 @@ class Engine:
                 or not self.broker.supports_native_stops(pos.instrument)
                 or key in protected
                 or key in buying
-                or self._closing_now(key, now)
             ):
                 continue
             if not self.broker.supports_standalone_stops(pos.instrument):
