@@ -36,7 +36,13 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
-from trader.broker.base import PROTECTIVE_REJECTED, Broker, BrokerError, PartialFlattenError
+from trader.broker.base import (
+    PROTECTIVE_REJECTED,
+    TARGET_REJECTED,
+    Broker,
+    BrokerError,
+    PartialFlattenError,
+)
 from trader.config import AppConfig
 from trader.db import EQUITY_SINCE_KEY, Database
 from trader.models import (
@@ -419,6 +425,7 @@ class Engine:
         self._down_since: datetime | None = None
         self._down_notified = False
         self._reprotect_pending = True
+        self._reprotect_armed = 0  # times re-protect was armed (see _arm_reprotect)
 
         # journal bookkeeping
         self._fill_commissions: dict[str, tuple[float, datetime]] | None = None
@@ -806,7 +813,7 @@ class Engine:
         log.info("engine monitor running; decisions stay off until the bot is started")
 
     async def _start_monitor(self) -> None:
-        self._reprotect_pending = True
+        self._arm_reprotect()
         try:
             await self.broker.connect()
         except BrokerError as exc:
@@ -1472,7 +1479,7 @@ class Engine:
             await self._notify("Broker reconnected", f"Connection restored after {down_for:.0f}s.")
         self._down_since = None
         self._down_notified = False
-        self._reprotect_pending = True
+        self._arm_reprotect()
         self._busy_at = now  # what happened while disconnected is not known to be quiet
         self._fills_journaled_at = None
 
@@ -1487,6 +1494,7 @@ class Engine:
             account = await self.broker.account()
             await self._check_account(account, now)
             close_seq = dict(self._close_seq)  # a close stamped after this is not in the reads
+            armed = self._reprotect_armed  # likewise for re-protect armed after the reads
             raw_positions = await self.broker.positions()
             open_orders = await self.broker.open_orders()
             # A bot position the crypto watchdog sold while the app was down: what is held
@@ -1557,7 +1565,8 @@ class Engine:
                 write_heartbeat(self.db, now)
             await self._step("flatten", self._flatten_before_close(now, positions, metas))
             await self._step(
-                "re-protect", self._reprotect(now, positions, open_orders, metas, close_seq)
+                "re-protect",
+                self._reprotect(now, positions, open_orders, metas, close_seq, armed),
             )
             await self._step("journal", self._sync_journal(now, positions, open_orders))
             await self._step("signals", self._evaluate_signals(now))
@@ -1910,11 +1919,18 @@ class Engine:
         """A close was sent in the last CLOSE_RETRY and the broker did not refuse it."""
         return self._closing_now(key, now) and key not in self._close_refused
 
+    def _arm_reprotect(self) -> None:
+        """Have the next monitor pass look for positions missing their broker stop. The
+        count tells a pass whether it was armed again after the pass read the positions
+        (an entry whose stop the broker refused, filled meanwhile): then it stays armed."""
+        self._reprotect_pending = True
+        self._reprotect_armed += 1
+
     def _mark_closing(self, key: str, reason: str, at: datetime) -> int:
         """Stamp a close attempt; returns its number for _note_close. Arms re-protect: a
         close that fails part-way (e.g. the link drops after the stop's cancel, before the
         sell) gets its stop back once the attempt's marker lapses."""
-        self._reprotect_pending = True
+        self._arm_reprotect()
         self._closing[key] = at
         self._close_reasons[key] = reason
         self._close_refused.discard(key)
@@ -1986,6 +2002,21 @@ class Engine:
                 key = req.instrument.key
                 stops[key] = max(stops.get(key, 0.0), req.stop_loss)
         return stops
+
+    def _working_targets(self, open_orders: list[OrderRecord]) -> set[str]:
+        """Instruments with a take-profit (a SELL limit) of this app working at the broker.
+        A refused close puts back only the stop, and the broker may refuse a bracket's
+        take-profit: without one the engine sells at the target itself."""
+        return {
+            order.request.instrument.key
+            for order in open_orders
+            if order.status in OPEN_ORDER_STATUSES
+            and order.request.side == Side.SELL
+            and order.request.order_type == OrderType.LIMIT
+            and order.request.stop_loss is None
+            and self.broker.can_cancel(order)
+            and not self.broker.cancel_requested(order)
+        }
 
     def _queued_exits(self, open_orders: list[OrderRecord]) -> dict[str, float]:
         """Unfilled quantity of this app's working market SELL exits per instrument: closes
@@ -2060,6 +2091,7 @@ class Engine:
         """Engine-side stops/targets, time stop, breakeven and trailing for positions the
         engine opened (those with positions_meta). Stops only ever move up."""
         native_stops = self._native_stops(self._open_orders)
+        targets = self._working_targets(self._open_orders)
         stocks_open = stock_market_open(now)
         failures: list[str] = []
         breached: set[str] = set()
@@ -2072,7 +2104,15 @@ class Engine:
             if pos.instrument.asset_class == AssetClass.STOCK and not stocks_open:
                 continue  # stock orders cannot execute now; broker stops still protect
             try:
-                await self._manage_one(pos, meta, mark, native_stops.get(key), now, breached)
+                await self._manage_one(
+                    pos,
+                    meta,
+                    mark,
+                    native_stops.get(key),
+                    now,
+                    breached,
+                    broker_target=key in targets,
+                )
             except BrokerError as exc:
                 failures.append(f"{key}: {exc}")
         # A breach must be seen on consecutive ticks; anything not seen this tick restarts.
@@ -2105,11 +2145,14 @@ class Engine:
         broker_stop: float | None,
         now: datetime,
         breached: set[str] | None = None,
+        *,
+        broker_target: bool = True,
     ) -> None:
         """Exit rules for one engine position valued at `mark` (the bid). `broker_stop` is
-        the highest protective stop working at the broker, if any. Exits fire only after
-        the condition held on BREACH_CONFIRM_TICKS consecutive ticks (`breached` collects
-        the instruments that saw one this tick)."""
+        the highest protective stop working at the broker, if any; `broker_target` whether
+        a take-profit of this app works there (else the engine sells at the target). Exits
+        fire only after the condition held on BREACH_CONFIRM_TICKS consecutive ticks
+        (`breached` collects the instruments that saw one this tick)."""
         exits = self.settings.exits
         key = pos.instrument.key
         stop, target = meta.get("stop_loss"), meta.get("take_profit")
@@ -2128,7 +2171,12 @@ class Engine:
                     )
             elif stop > broker_stop + EPS and mark <= stop:
                 reason = f"stop-loss {stop:g} hit (engine-managed, bid {mark:g})"
-        if reason is None and not native and target is not None and mark >= target:
+        if (
+            reason is None
+            and (not native or not broker_target)
+            and target is not None
+            and mark >= target
+        ):
             reason, kind = f"take-profit {target:g} hit (engine-managed, bid {mark:g})", "target"
 
         unit = self._unit_risk(key, pos.avg_cost, meta)
@@ -2246,6 +2294,7 @@ class Engine:
         open_orders: list[OrderRecord],
         metas: dict[str, dict[str, Any]],
         close_seq: dict[str, int],
+        armed: int,
     ) -> None:
         """After a (re)connect: re-place a broker stop for engine stock positions that have
         none working. Only brokers that rest a stop for a SELL request carrying stop_loss
@@ -2261,7 +2310,8 @@ class Engine:
         half-done), so it never doubles one a close put back or sits next to its sell."""
         if not self._reprotect_pending:
             return
-        self._reprotect_pending = False
+        # Armed again after this tick read the positions: the next pass must look too.
+        self._reprotect_pending = self._reprotect_armed != armed
         protected = self._native_stops(open_orders)
         buying = self._working_buys(open_orders)
         queued = self._queued_exits(open_orders)
@@ -2281,8 +2331,12 @@ class Engine:
                 or pos.instrument.asset_class != AssetClass.STOCK
                 or not self.broker.supports_native_stops(pos.instrument)
                 or key in protected
-                or key in buying
             ):
+                continue
+            if key in buying:
+                # Its entry still works (e.g. part filled, its bracket stop refused): look
+                # again once the entry is done.
+                self._reprotect_pending = True
                 continue
             if not self.broker.supports_standalone_stops(pos.instrument):
                 await self._notify(
@@ -2304,11 +2358,10 @@ class Engine:
                         0.0,
                     )
                     qty = round(held - self._queued_exits(orders).get(key, 0.0), 8)
-                    if (
-                        qty <= EPS
-                        or key in self._native_stops(orders)
-                        or key in self._working_buys(orders)
-                    ):
+                    if qty <= EPS or key in self._native_stops(orders):
+                        continue
+                    if key in self._working_buys(orders):
+                        self._reprotect_pending = True
                         continue
                     req = OrderRequest(
                         instrument=pos.instrument,
@@ -3410,16 +3463,23 @@ class Engine:
         if PROTECTIVE_REJECTED in (placed.message or ""):
             # The entry filled but the broker refused its stop: the next monitor pass
             # re-places it (or alerts that it cannot); the backup stop watches meanwhile.
-            self._reprotect_pending = True
+            self._arm_reprotect()
+            bought = (
+                f"{placed.filled_qty:g} of {order.qty:g}"
+                if placed.filled_qty < order.qty
+                else f"{order.qty:g}"
+            )
             await self._notify(
                 f"Unprotected {order.instrument.symbol}",
-                f"Bought {order.qty:g} @ {entry:g}, but the broker refused its stop at "
+                f"Bought {bought} @ {entry:g}, but the broker refused its stop at "
                 f"{stop:g} ({_short(placed.message or '')}). Re-placing it; the engine's "
                 "backup stop watches it meanwhile.",
                 priority="high",
                 tags=["warning"],
             )
             return placed
+        if TARGET_REJECTED in (placed.message or ""):
+            target_text += " (refused by the broker: the bot sells there itself)"
         await self._notify(
             f"BUY {order.instrument.symbol}",
             f"{order.qty:g} @ {entry:g}, stop {stop:g}, target {target_text}",

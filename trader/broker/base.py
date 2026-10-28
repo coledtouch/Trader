@@ -31,6 +31,9 @@ logger = logging.getLogger(__name__)
 
 # In an accepted entry's message: the parent filled but the broker refused its bracket stop.
 PROTECTIVE_REJECTED = "protective order rejected"
+# In an accepted entry's message: the parent filled and its stop works, but the broker
+# refused the bracket's take-profit.
+TARGET_REJECTED = "take-profit order rejected"
 
 
 class BrokerError(Exception):

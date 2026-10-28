@@ -50,7 +50,7 @@ from ib_async import (
 )
 
 from trader import fees
-from trader.broker.base import PROTECTIVE_REJECTED, Broker, BrokerError
+from trader.broker.base import PROTECTIVE_REJECTED, TARGET_REJECTED, Broker, BrokerError
 from trader.config import AppConfig
 from trader.models import (
     MAX_QUOTE_STREAMS,
@@ -1084,9 +1084,9 @@ class IBKRBroker(Broker):
             and parent.orderStatus.status in PENDING_IB_STATES
         ):
             record.message = "sent; awaiting IBKR acknowledgement"
-        failed_child = next(
-            (t for t in trades[1:] if t.orderStatus.status in DONE_IB_STATES - {"Filled"}), None
-        )
+        failed = [t for t in trades[1:] if t.orderStatus.status in DONE_IB_STATES - {"Filled"}]
+        failed_stop = next((t for t in failed if t.order.orderType == "STP"), None)
+        failed_child = failed_stop or (failed[0] if failed else None)
         if failed_child is not None:
             error = _trade_error(failed_child)
             reason = error[1] if error else failed_child.orderStatus.status
@@ -1097,7 +1097,10 @@ class IBKRBroker(Broker):
                     f"{PROTECTIVE_REJECTED} by IBKR ({reason}); entry cancelled",
                     broker_order_id=str(parent.order.orderId),
                 )
-            record.message = f"WARNING: {PROTECTIVE_REJECTED} by IBKR ({reason})"
+            if failed_stop is not None:
+                record.message = f"WARNING: {PROTECTIVE_REJECTED} by IBKR ({reason})"
+            else:  # the stop works; only the take-profit is missing
+                record.message = f"WARNING: {TARGET_REJECTED} by IBKR ({reason})"
         return record
 
     def _quiet_cancel(self, order: Order) -> None:
@@ -1147,6 +1150,12 @@ class IBKRBroker(Broker):
 
     def _request_for(self, trade: Trade) -> OrderRequest | None:
         stored = self._requests.get(trade.order.orderId) if self._is_own(trade.order) else None
+        if stored is not None and stored.stop_loss is not None and trade.order.orderType == "STP":
+            # A stop placed on its own reads back at the price IBKR holds now: modify_stop
+            # (breakeven, trailing) moves it under the same order id.
+            live = _price(trade.order.auxPrice)
+            if live is not None and live != stored.stop_loss:
+                stored = stored.model_copy(update={"stop_loss": live})
         return stored or _request_from_trade(trade)
 
     def _record(self, trade: Trade, request: OrderRequest) -> OrderRecord:

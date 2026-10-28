@@ -3402,6 +3402,158 @@ async def test_a_refused_bracket_stop_alerts_and_is_placed_again(db, config) -> 
     ] == [("SELL", 99.5)]
 
 
+async def _ibkr_entry_engine(db, config, maker=None):
+    """An IBKR-backed engine about to BUY AAPL (stop 99.5, target 101.5) on its next cycle."""
+    from tests.test_ibkr import NOW as IB_NOW
+    from tests.test_ibkr import av, connected_broker, stock
+
+    broker, fake = await connected_broker(ib_market_data_type=1)
+    fake.summary = [
+        av("NetLiquidation", "10000"),
+        av("TotalCashValue", "10000"),
+        av("BuyingPower", "10000"),
+    ]
+    fake.ticker_values[stock().conId] = {"bid": 100.0, "ask": 100.02, "last": 100.01}
+    settings = BotSettings(
+        stock_universe=["AAPL"], trade_crypto=False, autopilot=True,
+        risk=RiskLimits(max_order_notional_usd=1000),
+    )  # fmt: skip
+    db.save_settings(settings)
+    scanner = FakeScanner(settings)
+    scanner.candidates["STK:AAPL"] = [cand("AAPL", price=100.01, stop=99.5, target=101.5)]
+    maker = maker or FakeDecisionMaker()
+    maker.decisions = [buy("AAPL")]
+    notes, clock = RecordingNotifier(), FakeClock(IB_NOW)
+    engine = Engine(config, db, broker, maker, notifier=notes, clock=clock, scanner=scanner)
+    return engine, broker, fake, notes, clock
+
+
+def _refuse_child(fake, order_type: str, filled: float | None = None):
+    """on_place hook: IBKR refuses the bracket's `order_type` child; the parent fills
+    (`filled` of it, the rest still working, when given)."""
+    from ib_async import Position as IBPosition
+
+    from tests.test_ibkr import PAPER, log_error, stock
+
+    def hook(trade) -> None:
+        if trade.order.orderType == order_type and trade.order.parentId:
+            trade.orderStatus.status = "Inactive"
+            log_error(trade, 163, "Order rejected - reason: refused by test")
+            parent = fake.trade_list[0]
+            qty = parent.order.totalQuantity if filled is None else filled
+            parent.orderStatus.status = "Filled" if filled is None else "Submitted"
+            parent.orderStatus.filled = qty
+            fake.position_items[:] = [IBPosition(PAPER, stock(), qty, 100.02)]
+
+    return hook
+
+
+def _stops_working(fake) -> list[tuple[str, float]]:
+    return [
+        (t.order.action, t.order.auxPrice) for t in fake.openTrades() if t.order.orderType == "STP"
+    ]
+
+
+async def test_a_refused_stop_of_a_part_filled_entry_is_placed_once_it_fills(db, config) -> None:
+    """Review finding: the entry filled only in part and IBKR refused its stop. Re-protect
+    skipped the position while the rest of the entry worked and never looked again."""
+    from ib_async import Position as IBPosition
+
+    from tests.test_ibkr import PAPER, stock
+
+    engine, _broker, fake, notes, clock = await _ibkr_entry_engine(db, config)
+    fake.on_place = _refuse_child(fake, "STP", filled=4)
+    await engine.run_cycle()
+    fake.on_place = None
+    [(title, body, _)] = [n for n in notes.sent if n[0] == "Unprotected AAPL"]
+    assert "Bought 4 of 9" in body
+    clock.advance(seconds=15)
+    await engine.monitor_tick()
+    assert _stops_working(fake) == []  # still buying
+    parent = fake.trade_list[0]
+    parent.orderStatus.status, parent.orderStatus.filled = "Filled", parent.order.totalQuantity
+    fake.position_items[:] = [IBPosition(PAPER, stock(), parent.order.totalQuantity, 100.02)]
+    clock.advance(seconds=15)
+    await engine.monitor_tick()
+    assert _stops_working(fake) == [("SELL", 99.5)]
+
+
+async def test_a_tick_already_running_does_not_use_up_a_refused_stops_rearm(db, config) -> None:
+    """Review finding: a monitor tick read the positions (no AAPL yet), then the entry
+    filled and IBKR refused its stop, arming re-protect; the tick then cleared the flag
+    looking at its old positions, and no later tick looked again."""
+    gate = asyncio.Event()
+    hold_next = False
+    ticks: list[asyncio.Task] = []
+    box: dict[str, Engine] = {}
+
+    async def during(ctx) -> None:
+        nonlocal hold_next
+        hold_next = True
+        ticks.append(asyncio.create_task(box["engine"].monitor_tick()))
+        await asyncio.sleep(0.01)  # that tick has read the positions: flat
+
+    engine, broker, fake, _notes, clock = await _ibkr_entry_engine(db, config, SlowMaker(during))
+    box["engine"] = engine
+    read = broker.open_orders
+
+    async def open_orders():
+        nonlocal hold_next
+        if hold_next:
+            hold_next = False
+            await gate.wait()  # a slow reply to that tick's read
+        return await read()
+
+    broker.open_orders = open_orders
+    fake.on_place = _refuse_child(fake, "STP")
+    await engine.run_cycle()
+    fake.on_place = None
+    gate.set()
+    await ticks[0]
+    clock.advance(seconds=15)
+    await engine.monitor_tick()
+    assert _stops_working(fake) == [("SELL", 99.5)]
+
+
+async def test_a_refused_take_profit_is_no_refused_stop(db, config) -> None:
+    """Review finding: IBKR refused the bracket's take-profit (its stop working) and the
+    owner got a false "Unprotected" alert about a refused stop, and nothing about the
+    missing target."""
+    engine, _broker, fake, notes, _clock = await _ibkr_entry_engine(db, config)
+    fake.on_place = _refuse_child(fake, "LMT")
+    await engine.run_cycle()
+    fake.on_place = None
+    assert "Unprotected AAPL" not in notes.titles()
+    [(title, body, _)] = [n for n in notes.sent if n[0] == "BUY AAPL"]
+    assert "refused by the broker" in body
+    assert _stops_working(fake) == [("SELL", 99.5)]
+
+
+async def test_the_engine_sells_at_the_target_when_no_take_profit_works(db, config) -> None:
+    """Review finding: a refused close put back the stop but not the take-profit, and the
+    engine checked targets only for positions without broker stops: the price passed the
+    target and nothing sold."""
+    h = await harness(db, config)
+    await enter_f(h)  # bracket: stop 9.80, target 10.50
+    h.broker.reject_exits = True
+    h.clock.advance(minutes=46)  # 0R after 45 min: time stop
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()  # the close is refused: only the stop is put back
+    assert h.broker.working("STK:F", "stop") and not h.broker.working("STK:F", "target")
+    h.broker.reject_exits = False
+    h.broker.set_price("F", 10.15)  # +0.7R: no time stop
+    for _ in range(4):
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    assert h.broker.pos
+    h.broker.set_price("F", 10.60)  # past the 10.50 target
+    for _ in range(4):
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    assert not h.broker.pos
+
+
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:
     h = await harness(db, config)
     h.broker.standalone_stops = False

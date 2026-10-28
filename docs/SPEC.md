@@ -874,8 +874,14 @@ Contracts changed by the confirmed review findings (each has a regression test).
 - **Entry levels** (ENG-9): an entry is blocked when its stop is at or above the current
   bid (the price fell through it since the decision, or while it waited for approval).
   An entry the broker accepted whose bracket stop it refused alerts "Unprotected X" and
-  arms re-protect. In a batch, an entry already filled counts as its position only, not
-  also as a working buy.
+  arms re-protect (which waits while the rest of a part-filled entry works, and stays armed
+  when armed after a running tick read the positions); a refused take-profit (the stop
+  works) is said in the BUY alert. In a batch, an entry already filled counts as its
+  position only, not also as a working buy.
+- **Targets** (ENG-10): with no take-profit of this app working at the broker (refused at
+  entry, or a refused close put back only the stop), the engine sells at the meta target
+  itself after BREACH_CONFIRM_TICKS. A stop placed on its own reads back at the price IBKR
+  holds (modify_stop moves it under the same id), so a put-back never lowers it.
 - **IBKR 1101** (BRK-1): `connected` is False and data/order calls raise `BrokerError` until
   `connect()` has disconnected and reconnected (re-running ib_async's startup syncs);
   1102 needs no reconnect.

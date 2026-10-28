@@ -737,7 +737,8 @@ async def test_exit_with_stop_loss_is_a_resting_gtc_stop_not_a_market_sell() -> 
     assert order.auxPrice == 98.13  # rounded UP to the tick: never risk more
     assert order.transmit and order.parentId == 0
     [working] = await broker.open_orders()
-    assert working.request.stop_loss == 98.123 and working.request.is_exit
+    # Read back at the price IBKR holds (tick-rounded), as modify_stop may move it.
+    assert working.request.stop_loss == 98.13 and working.request.is_exit
 
 
 @pytest.mark.parametrize(
@@ -1676,3 +1677,36 @@ async def test_a_cancel_that_never_went_out_leaves_the_order_working() -> None:
     [listed] = [o for o in await broker.open_orders() if o.request.stop_loss is not None]
     assert not broker.cancel_requested(listed)
     assert await broker.modify_stop(AAPL, 99.0) is True
+
+
+async def test_a_raised_stop_reads_back_raised_and_is_put_back_there() -> None:
+    """Review finding: a stop placed on its own (re-protect, a put-back) read back at its
+    first price after modify_stop raised it (breakeven, trailing), so a refused close put
+    it back lower: from breakeven down to the initial stop."""
+    broker, fake = await connected_broker()
+    hold(fake, stock(), 5)
+    await broker.place_order(
+        OrderRequest(
+            instrument=AAPL,
+            side=Side.SELL,
+            qty=5,
+            order_type=OrderType.MARKET,
+            stop_loss=98.12,
+            is_exit=True,
+            reason="protective stop (re-placed)",
+        )
+    )
+    [(_, first)] = fake.placed
+    assert await broker.modify_stop(AAPL, 100.5) is True
+    [working] = await broker.open_orders()
+    assert working.request.stop_loss == 100.5
+
+    def refuse_market_sell(trade: Trade) -> None:
+        if trade.order.orderType == "MKT":
+            trade.orderStatus.status = "Cancelled"
+            log_error(trade, 201, "Order rejected - reason: no liquidity")
+
+    fake.on_place = refuse_market_sell
+    rec = await broker.close_position(AAPL, "time stop")
+    assert rec is not None and rec.status == OrderStatus.REJECTED
+    assert _working(fake, "STP") == [("AAPL", 100.5)]
