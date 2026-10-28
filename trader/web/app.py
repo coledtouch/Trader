@@ -34,6 +34,8 @@ from trader.models import (
     BOOL_TRUE_IS_LOOSER,
     HARD_CAPS,
     LOWER_IS_LOOSER,
+    MAX_QUOTE_STREAMS,
+    SCANNER_MOVERS,
     BotSettings,
     Mode,
     OrderStatus,
@@ -61,7 +63,7 @@ log = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 MAX_BODY_BYTES = 64 * 1024
-MAX_UNIVERSE = 50
+MAX_UNIVERSE = MAX_QUOTE_STREAMS
 WRONG_KEY_MESSAGE = (
     "TRADER_SECRET_KEY looks wrong: 2FA codes cannot be checked with it either, so the next "
     "login will fail. Put the original key back in .env, then run docker compose up -d."
@@ -353,10 +355,26 @@ def validate_settings(settings: BotSettings) -> BotSettings:
         raise HTTPException(
             status_code=422, detail="stock_entry_start must be before stock_entry_cutoff"
         )
+    stocks = _normalize_universe("stock_universe", settings.stock_universe)
+    cryptos = _normalize_universe("crypto_universe", settings.crypto_universe)
+    # Every symbol is a live quote stream; past the limit quotes keep dropping out.
+    movers = SCANNER_MOVERS if settings.dynamic_universe else 0
+    streams = len(stocks) + movers + (len(cryptos) if settings.trade_crypto else 0)
+    if streams > MAX_QUOTE_STREAMS:
+        parts = [f"{len(stocks)} stocks"]
+        if movers:
+            parts.append(f"{movers} scanner movers")
+        if settings.trade_crypto and cryptos:
+            parts.append(f"{len(cryptos)} crypto")
+        raise HTTPException(
+            status_code=422,
+            detail=f"too many symbols: {' + '.join(parts)} = {streams}, "
+            f"at most {MAX_QUOTE_STREAMS} live quotes",
+        )
     return settings.model_copy(
         update={
-            "stock_universe": _normalize_universe("stock_universe", settings.stock_universe),
-            "crypto_universe": _normalize_universe("crypto_universe", settings.crypto_universe),
+            "stock_universe": stocks,
+            "crypto_universe": cryptos,
             "enabled_setups": list(dict.fromkeys(settings.enabled_setups)),
         }
     )

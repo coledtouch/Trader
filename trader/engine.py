@@ -42,6 +42,7 @@ from trader.db import EQUITY_SINCE_KEY, Database
 from trader.models import (
     LEVERAGED_ETFS,
     OPEN_ORDER_STATUSES,
+    SCANNER_MOVERS,
     AccountSnapshot,
     AIDecision,
     AssetClass,
@@ -2576,7 +2577,7 @@ class Engine:
             names = list(settings.stock_universe)
             if settings.dynamic_universe:
                 try:
-                    movers = await self.broker.scan_movers(10)
+                    movers = await self.broker.scan_movers(SCANNER_MOVERS)
                     names += movers
                     dynamic_keys = {
                         Instrument(symbol=s.strip().upper()).key for s in movers if s.strip()

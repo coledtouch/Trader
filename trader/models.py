@@ -433,6 +433,14 @@ LEVERAGED_ETFS = frozenset(
 )  # fmt: skip
 
 
+# Live quotes streamed at once (IBKR's default is 100 market data lines for the account; the
+# rest is left for the crypto watchdog and paper-test), and the scanner's top movers added
+# to the stock universe each round when dynamic_universe is on. Settings keep the
+# universes within the streams (trader/web/app.py validate_settings).
+MAX_QUOTE_STREAMS = 95
+SCANNER_MOVERS = 10
+
+
 class ExitRules(BaseModel):
     """Engine-managed exits on top of the stop-loss and target placed with every entry."""
 

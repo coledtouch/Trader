@@ -508,7 +508,9 @@ Datetimes serialize as ISO-8601 strings (pydantic `model_dump(mode="json")`).
 Errors: rate-limited login/step-up → 429 `{"detail": "too many failed attempts"}`; a
 code-only login over the daily cap → 429 `{"detail": "too many failed codes today"}`; PUT
 /api/settings → 422 with a string detail when a risk value exceeds HARD_CAPS, the entry
-window is invalid or a universe has an invalid symbol / more than 50 symbols; engine
+window is invalid, a universe has an invalid symbol, or the stock symbols plus the 10
+scanner movers (when on) plus the crypto symbols (when traded) exceed the 95 live quote
+streams (`MAX_QUOTE_STREAMS`); engine
 failures map PermissionError → 403, ValueError/LookupError → 409, anything else → 503.
 `/static/sw.js` carries `Service-Worker-Allowed: /`.
 

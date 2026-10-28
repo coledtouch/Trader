@@ -747,7 +747,7 @@ def test_hard_caps_and_validation(env):
     assert put_settings(env, headers, bad_time).status_code == 422
     bad_symbol = BotSettings(stock_universe=["F", "DROP TABLE;"])
     assert put_settings(env, headers, bad_symbol).status_code == 422
-    too_many = BotSettings(stock_universe=[f"S{i}" for i in range(51)])
+    too_many = BotSettings(stock_universe=[f"S{i}" for i in range(96)])
     assert put_settings(env, headers, too_many).status_code == 422
 
     invalid = env.client.put(
@@ -755,6 +755,30 @@ def test_hard_caps_and_validation(env):
     )
     assert invalid.status_code == 422
     assert env.engine.reloads == 0
+
+
+def test_universe_fits_the_live_quote_streams(env):
+    """Every symbol is a live quote: stocks + 10 scanner movers (when on) + crypto (when
+    traded) must fit the 95 streams, or quotes keep dropping out."""
+    headers = login(env)
+    stocks = [f"S{i}" for i in range(85)]
+    ok = put_settings(env, headers, BotSettings(stock_universe=stocks, dynamic_universe=True))
+    assert ok.status_code == 200, ok.text
+    assert len(env.db.get_settings().stock_universe) == 85
+    over = BotSettings(stock_universe=[*stocks, "X1"], dynamic_universe=True)
+    response = put_settings(env, headers, over)
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "too many symbols: 86 stocks + 10 scanner movers = 96, at most 95 live quotes"
+    )
+    no_movers = BotSettings(stock_universe=[f"S{i}" for i in range(95)], dynamic_universe=False)
+    assert put_settings(env, headers, no_movers).status_code == 200
+    crypto = BotSettings(
+        stock_universe=[f"S{i}" for i in range(94)],
+        trade_crypto=True,
+        crypto_universe=["BTC", "ETH"],
+    )
+    assert "2 crypto" in put_settings(env, headers, crypto).json()["detail"]
 
 
 def test_loosened_fields_rules():
