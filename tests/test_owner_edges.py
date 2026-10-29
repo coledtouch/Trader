@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from tests.test_engine import _BTC, _hold_btc, _restart_next_morning, hold
+from tests.test_engine import _BTC, _hold_btc, _restart_next_morning, enter_f, harness, hold
 from tests.test_owner_shares import (
     F,
     _f_with_owner,
@@ -332,3 +332,162 @@ async def test_the_owners_sale_after_an_estimated_watchdog_sale_leaves_the_bots_
     await ticks(h, 8, seconds=15)
     assert bot_sells(h, KEY) == [pytest.approx(round(mine - part, 8), abs=1e-6)]
     assert h.broker.pos[KEY][0] == pytest.approx(0.006 - o, abs=1e-9)
+
+
+# ----------------------------------------------------------------------------- review 42
+@pytest.mark.parametrize("owner_sale", [0.0, 0.001])
+async def test_an_owner_round_trip_after_the_watchdogs_last_sale_is_his(
+    db, config, owner_sale: float
+) -> None:
+    """The watchdog sold half the bot's BTC on Wednesday (IBKR no longer reports it). On
+    Thursday the owner buys 0.004 and sells part of it: the watchdog's done IOC could not
+    have sold then, so that sale is his and the bot's stop sells all of its rest."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 28, 13, 0, tzinfo=UTC))
+    mine = h.broker.pos[KEY][0]
+    meta = db.get_position_meta(KEY)
+    h.clock.t = datetime(2026, 10, 28, 20, 0, tzinfo=UTC)
+    sold = round(mine / 2, 8)
+    h.broker.pos[KEY][0] -= sold
+    h.broker.cash += sold * 58990.0
+    h.broker.fills.append(
+        Fill(exec_id=f"WD{next(_ids)}", broker_order_id=f"perm:{next(_ids)}", instrument=_BTC,
+             side=Side.SELL, qty=sold, price=58990.0, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    note_watchdog_sale(db, KEY, position_marker(meta), "77", sold, h.clock(), done=True)
+    h.clock.t = datetime(2026, 10, 29, 13, 0, tzinfo=UTC)
+    owner_buys(h, _BTC, 0.004, 60000.0)
+    if owner_sale:
+        h.clock.t = datetime(2026, 10, 29, 13, 30, tzinfo=UTC)
+        owner_sells(h, _BTC, owner_sale, 60050.0)
+    h.engine = _restart_next_morning(h, config)
+    h.broker.set_price("BTC", 59500.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    await ticks(h, 4, seconds=15)
+    h.broker.set_price("BTC", 58500.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    await ticks(h, 8, seconds=15)
+    assert bot_sells(h, KEY) == [pytest.approx(mine - sold)]
+    assert h.broker.pos[KEY][0] == pytest.approx(0.004 - owner_sale)
+
+
+async def _enter_with_refused_stop(h) -> None:
+    from trader.broker.base import PROTECTIVE_REJECTED
+
+    real = h.broker.place_order
+
+    async def place(req: OrderRequest) -> OrderRecord:
+        rec = await real(req)
+        if req.side == Side.BUY and rec.filled_qty > 0:
+            h.broker.orders[f"{rec.broker_order_id}-SL"].status = OrderStatus.REJECTED
+            rec = rec.model_copy(
+                update={"message": f"WARNING: {PROTECTIVE_REJECTED} by IBKR (price limits)"}
+            )
+        return rec
+
+    h.broker.place_order = place
+    await h.engine.run_cycle()
+    h.broker.place_order = real
+
+
+async def test_a_reprotected_stop_never_sits_next_to_the_brackets_target(db, config) -> None:
+    """IBKR refused the bracket's stop and kept its target. The stop put back is not in the
+    target's OCA group, so the target is cancelled and the engine takes the profit itself:
+    a part fill of the target can never leave the stop larger than the bot's units."""
+    h = await harness(db, config, exits={"time_stop_minutes": 0})
+    await _enter_with_refused_stop(h)
+    await ticks(h, 1)
+    assert _stops(h) == [24.0]
+    assert h.broker.working("STK:F", "target") == []
+    owner_buys(h, F, 50, 10.0)
+    await ticks(h, 2)
+    h.broker.set_price("F", 10.6)
+    await ticks(h, 3, seconds=15)
+    assert h.broker.pos["STK:F"][0] == 50
+    assert bot_sells(h, "STK:F") == [24]
+
+
+async def test_a_shadow_halt_flatten_with_a_failed_read_alerts(db, tmp_path) -> None:
+    """Shadow mode, the daily-loss halt, and the executions read fails while the journal
+    does not explain the position: the flatten reports the failure, never 'nothing'."""
+    from tests.test_engine import disarmed_with_bot_position
+
+    h = await disarmed_with_bot_position(db, tmp_path)
+    owner_buys(h, F, 150, 10.0)
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    h.broker.set_price("F", 9.83)
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    owner_buys(h, F, 5, 9.83)
+    h.broker.fail.add("fills_since")
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert "Flatten FAILED" in h.notes.titles()
+    assert bot_sells(h, "STK:F") == []
+    assert "STK:F" not in h.engine._closing
+
+
+@pytest.mark.parametrize("owner", [0, 50])
+async def test_a_trip_waiting_for_its_commission_is_journaled_after_a_restart(
+    db, config, owner: int
+) -> None:
+    """The bot's target sells its 24 F in two executions, the second with commission 0, and
+    the app restarts inside COMMISSION_GRACE while the owner holds F too."""
+    from tests.test_engine import _part
+    from trader.models import Mode
+
+    h = await harness(db, config, mode=Mode.PAPER, exits={"time_stop_minutes": 0})
+    await enter_f(h)
+    await ticks(h, 1)
+    if owner:
+        owner_buys(h, F, owner, 10.0)
+    await ticks(h, 1)
+    [target] = [oid for oid, k in h.broker.kind.items() if k == "target"]
+    _part(h.broker, target, 10, 10.5)
+    h.broker.fee = 0.0
+    _part(h.broker, target, 14, 10.5)
+    h.broker.fee = 0.35
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert db.list_trades() == []
+    h.clock.advance(seconds=30)
+    h.engine = Engine(config, db, h.broker, h.decider, notifier=h.notes, clock=h.clock,
+                      scanner=h.scanner)  # fmt: skip
+    await ticks(h, 10, seconds=30)
+    assert [t.qty for t in db.list_trades()] == [24]
+    assert db.get_position_meta("STK:F") is None
+
+
+@pytest.mark.parametrize("journaled", [0.0, 0.004])
+@pytest.mark.parametrize("prev_qty", [0.02, 0.005])
+async def test_the_bots_quick_previous_trip_is_none_of_its_new_entry(
+    db: Database, prev_qty: float, journaled: float
+) -> None:
+    """No other client in BTC. The bot's previous trip bought 50 s and sold 30 s before
+    its new entry was sent; the new entry filled while the app was down (or in part
+    before). The watchdog's stop and flatten sell all of the new position."""
+    from tests import test_watchdog as tw
+    from trader.models import Position
+
+    btc = tw.crypto()
+    opened = tw.NOW - timedelta(hours=1)
+    db.insert_fill(Fill(exec_id="P1", broker_order_id="7", instrument=btc, side=Side.BUY,
+                        qty=prev_qty, price=100.0, ts=opened - timedelta(seconds=50)))  # fmt: skip
+    db.insert_fill(Fill(exec_id="P2", broker_order_id="8", instrument=btc, side=Side.SELL,
+                        qty=prev_qty, price=98.0, ts=opened - timedelta(seconds=30)))  # fmt: skip
+    db.set_position_meta(btc.key, stop_loss=95.0, take_profit=110.0, entry_price=100.0,
+                         initial_risk=5.0 * 0.01, opened_at=opened)  # fmt: skip
+    db.set_kv("position_extra:" + btc.key, '{"unit_risk": 5.0, "qty": 0.01}')
+    if journaled:
+        at = opened + timedelta(seconds=2)
+        db.insert_fill(Fill(exec_id="E1", broker_order_id="12", instrument=btc, side=Side.BUY,
+                            qty=journaled, price=100.0, ts=at))  # fmt: skip
+    clock = tw.Clock()
+    broker = tw.FakeBroker()
+    broker.positions_list.append(Position(instrument=btc, qty=0.01, avg_cost=100.0))
+    broker.quotes[btc.key] = tw.q(btc, 90.0, 90.0)
+    tw.beat(db, clock, age=400)
+    watchdog, _ = tw.make(db, broker, clock)
+    for _ in range(4):
+        await watchdog.tick()
+        clock.advance(seconds=10)
+        tw.beat(db, clock, age=400)
+    assert [o.qty for o in broker.placed] == [pytest.approx(0.01)]

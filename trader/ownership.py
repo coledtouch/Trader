@@ -86,6 +86,7 @@ def split_fills(
     *,
     bot_first_from: datetime | None = None,
     bot_first_qty: float | None = None,
+    bot_first_until: datetime | None = None,
     entry: float | None = None,
     entry_sent: datetime | None = None,
 ) -> Split:
@@ -109,14 +110,31 @@ def split_fills(
     position: the symbol was flat at the broker when the entry went out."""
     bot = owner = owner_bought = bot_bought = 0.0
     ordered = sorted(fills, key=lambda f: (_aware(f.ts), f.exec_id))
-    seen = sum(f.qty for f in ordered if f.side == Side.BUY and not is_other_client(f))
+    sent_at = _aware(entry_sent) if entry_sent is not None else None
+    # The bot's previous trip: what it bought and sold back to flat before this entry was
+    # sent (the symbol was flat at the broker when it went out) is none of this entry's.
+    prior, reset = 0.0, -1
+    if sent_at is not None:
+        run = bought = 0.0
+        for i, f in enumerate(ordered):
+            if f.qty <= EPS or is_other_client(f):
+                continue
+            if f.side == Side.BUY:
+                run += f.qty
+                bought += f.qty
+                continue
+            run = max(0.0, run - f.qty)
+            if run <= EPS and bought > EPS and _aware(f.ts) < sent_at:
+                prior, reset = bought, i
+    seen = sum(f.qty for f in ordered if f.side == Side.BUY and not is_other_client(f)) - prior
     unseen = max(0.0, entry - seen) if entry is not None else 0.0
     out: list[Fill] = []
     flat_at: datetime | None = None
     start = _aware(bot_first_from) if bot_first_from is not None else None
+    until = _aware(bot_first_until) if bot_first_until is not None else None
     budget = None if bot_first_qty is None else max(0.0, bot_first_qty) + _tol(bot_first_qty)
-    sent_at = _aware(entry_sent) if entry_sent is not None else None
-    for f in ordered:
+    trip = 0.0  # the bot's buys since its previous trip
+    for i, f in enumerate(ordered):
         q = f.qty
         if q <= EPS:
             continue
@@ -128,9 +146,10 @@ def split_fills(
             else:
                 bot += q
                 bot_bought += q
+                trip += q
                 out.append(f)
             continue
-        if sent_at is not None and bot_bought <= EPS and _aware(f.ts) < sent_at:
+        if sent_at is not None and trip <= EPS and _aware(f.ts) < sent_at:
             # Before the entry was sent (and any buy of the bot's): the symbol was flat at
             # the broker when it went out, so this sold nothing of the bot's position (the
             # bot's previous trip, or units held from before the window).
@@ -149,7 +168,11 @@ def split_fills(
                     # The app's estimate of the watchdog's sale no fill shows: part of what
                     # the watchdog sold, not left for another client's sells.
                     budget -= min(q, budget)
-            elif start is not None and _aware(f.ts) >= start:
+            elif (
+                start is not None
+                and _aware(f.ts) >= start
+                and (until is None or _aware(f.ts) <= until)
+            ):
                 lead = q if budget is None else min(q, budget)
                 if budget is not None:
                     budget -= lead
@@ -178,6 +201,8 @@ def split_fills(
             )
         if bot <= EPS and owner <= EPS:
             flat_at = _aware(f.ts)
+        if i == reset:
+            trip = 0.0
     return Split(
         bot=bot,
         owner=owner,
@@ -333,6 +358,25 @@ def watchdog_last_filled(db: Database, key: str, marker: str, before: datetime) 
     return last
 
 
+def watchdog_sales_end(db: Database, key: str, marker: str) -> datetime | None:
+    """The latest send of the watchdog's sells for this bot position when every one of
+    them is done (an IOC sell fills when it is sent or never): another client's sells
+    later than that (and the clock skew) cannot be its own. None: one may still fill, or
+    the record does not say when each was sent."""
+    rec = read_sales_record(db, key, marker)
+    if rec is None:
+        return None
+    finished = set(rec.get("done", []))
+    sent = rec.get("at", {})
+    last: datetime | None = None
+    for order_id in rec.get("orders", {}):
+        if order_id not in finished or order_id not in sent:
+            return None
+        stamp = _aware(datetime.fromisoformat(sent[order_id]))
+        last = stamp if last is None or stamp > last else last
+    return last
+
+
 def watchdog_filled(db: Database, key: str, marker: str) -> tuple[datetime, float] | None:
     """(first send, quantity) of what the watchdog's sells for this bot position are known
     to have filled (orders it saw done). None without a record."""
@@ -374,17 +418,21 @@ def watchdog_sales(
     return None if first is None else (first, total)
 
 
-def unreported_sales(sold: float, fills: Iterable[Fill], first: datetime) -> float:
+def unreported_sales(
+    sold: float, fills: Iterable[Fill], first: datetime, until: datetime | None = None
+) -> float:
     """The part of the watchdog's sales (`sold`, from `first` on) no fill shows: another
     client's sells since then are at least that much of it. An earlier day's sale IBKR no
     longer reports still came out of the bot's units."""
     start = _aware(first)
+    end = _aware(until) if until is not None else None
     seen = sum(
         f.qty
         for f in fills
         if f.side == Side.SELL
         and (is_other_client(f) or f.broker_order_id == UNREPORTED_EXIT)
         and _aware(f.ts) >= start
+        and (end is None or _aware(f.ts) <= end)
     )
     return max(0.0, sold - seen)
 

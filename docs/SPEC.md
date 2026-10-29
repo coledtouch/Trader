@@ -1128,7 +1128,8 @@ re-placed stops) are the bot's buys, and its sells come out of the bot's units f
 another client's (`perm:`) buys are the owner's, and another client's sells come out of the
 owner's units first (out of the bot's first from the crypto watchdog's first sale of the
 position on: its sells are not told apart from the owner's; at most what the watchdog may
-have sold in all, less what the app already journaled of it at an estimate; beyond that,
+have sold in all, less what the app already journaled of it at an estimate, and only until
+its last sale was sent, plus the skew, once every one of its orders is done; beyond that,
 another client's sells are the owner's again). The entry's quantity
 (`position_extra.qty`, older rows: planned risk over risk per unit, to 10 decimals so an
 8-decimal crypto quantity is not read as more than the entry) bounds the bot's part:
@@ -1136,7 +1137,9 @@ the bot never adds to a position. Part of the entry may be in no fill (it filled
 IBKR no longer reports): a sell of the bot's beyond its seen units comes out of that unseen
 part before the owner's (so does another client's beyond the owner's and the bot's seen
 units). A sell before the entry was sent and any buy of the bot's (the bot's previous trip,
-or another client's) sold nothing of the position: the symbol was flat then. Units no
+or another client's) sold nothing of the position: the symbol was flat then. The bot's
+previous trip inside the skew window (its buys sold flat before the entry was sent) is no
+part of the entry: its buys are not counted as seen units of it. Units no
 fill explains count as the bot's when they fit in what is left of it (so its own position
 keeps its exits); more than that, and whose they are is unknown (the bot sells only what its
 fills show, and the owner is alerted).
@@ -1159,12 +1162,16 @@ fills are the journal and the broker's executions (the journal alone is a tick b
 sale and an equal owner buy since then would net out); when the executions read fails and
 the journal does not explain the position, nothing is sold until it can (undecided, not
 "none of it is the bot's": re-protect looks again next tick, Close reports a broker error to
-retry, an approval stays pending). Sales of the crypto
+retry, an approval stays pending, the shadow-mode halt flatten reports a failed flatten).
+A stop re-placed next to a bracket target still working (IBKR refused the bracket's stop)
+would sit outside the target's OCA group: the target is cancelled first, the stop goes in
+once it is gone, and the engine's own exit rules take the profit. Sales of the crypto
 watchdog's that no fill shows (an earlier day IBKR no longer reports) come out of the bot's
 units. Less held than the bot's and the owner's units (a sale on a day IBKR no longer
 reports) is the owner selling his, since another client's sells come out of his units
 first (only units he held before today: today's executions would show a sale of what he
-bought since), unless one of the bot's own may have sold unseen (an app sell the journal may not
+bought since; a sale of his today after the watchdog's last sale is outside its bot-first
+window, so the bot's part is not charged with it), unless one of the bot's own may have sold unseen (an app sell the journal may not
 show: `ownership.app_sold_unjournaled`; for a stock, its bracket stop no longer working for
 all its shares): then the bot sells only what is surely its own and the owner is alerted
 once ("whose sale?"). A sell that would come out at 0 is a cap of 0 (nothing cancelled).
@@ -1213,7 +1220,9 @@ the stop, `unreported-exit`, dated at the latest sale it covers, so a later outa
 gets its own; with an alert), so the bot's trade closes
 and its metadata is released; without the owner's units, everything held is the bot's,
 still unsold, and only the flat-position path (`_close_unreported_exit`) estimates. A
-watchdog sale IBKR does report closes it from the executions. Windows without another
+watchdog sale IBKR does report closes it from the executions. The first fills sync after
+a start rebuilds the journal of every position with metadata, so a bot trip still waiting
+for its commission when the app stopped is journaled. Windows without another
 client's activity are replayed exactly as before. Open follow-up: exit rules read IBKR's
 blended average cost of a mixed position.
 

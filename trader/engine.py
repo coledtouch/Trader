@@ -96,6 +96,7 @@ from trader.ownership import (
     watchdog_filled,
     watchdog_last_filled,
     watchdog_sales,
+    watchdog_sales_end,
 )
 from trader.risk import (
     DELAYED_QUOTE_GRACE,
@@ -2156,6 +2157,13 @@ class Engine:
                     # One failure must not leave the other positions unsold (as flatten_all).
                     try:
                         cap = await self._bot_cap(pos.instrument)
+                        if cap is not None and cap.unread:  # undecided: the halt alerts
+                            self._unmark_closing(key, seq)
+                            failed.append(
+                                f"{pos.instrument.symbol}: the broker's executions could not "
+                                "be read"
+                            )
+                            continue
                         if cap is not None and cap.qty <= EPS:
                             self._note_close(key, None, seq)  # only the owner's shares
                             continue
@@ -2260,6 +2268,8 @@ class Engine:
         since = _aware(opened) - FILL_TIME_SKEW
         sales = watchdog_sales(self.db, key, position_marker(meta), opened)
         bot_first = sales[0] - FILL_TIME_SKEW if sales is not None else None
+        sales_end = watchdog_sales_end(self.db, key, position_marker(meta))
+        bot_until = sales_end + FILL_TIME_SKEW if sales_end is not None else None
         journal = [
             f
             for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
@@ -2279,6 +2289,7 @@ class Engine:
             fills,
             bot_first_from=bot_first,
             bot_first_qty=sales[1] if sales is not None else None,
+            bot_first_until=bot_until,
             entry=limit,
             entry_sent=opened,
         )
@@ -2289,11 +2300,11 @@ class Engine:
             # reports it, and less than the bot's entry).
             done = watchdog_filled(self.db, key, position_marker(meta))
             if done is not None:
-                sold = unreported_sales(done[1], fills, bot_first)
+                sold = unreported_sales(done[1], fills, bot_first, bot_until)
                 bought = bought_since(held, limit, less_sold(split, sold))
             # The watchdog's sales no fill shows (an earlier day IBKR no longer reports)
             # came out of the bot's units all the same.
-            split = less_sold(split, unreported_sales(sales[1], fills, bot_first))
+            split = less_sold(split, unreported_sales(sales[1], fills, bot_first, bot_until))
         cap = sell_cap(held, limit, split, evidence=bought)
         if cap is None:
             return None
@@ -2326,6 +2337,7 @@ class Engine:
                     [f for f in fills if _aware(f.ts) < today],
                     bot_first_from=bot_first,
                     bot_first_qty=sales[1] if sales is not None else None,
+                    bot_first_until=bot_until,
                     entry=limit,
                     entry_sent=opened,
                 )
@@ -2513,6 +2525,20 @@ class Engine:
             and self.broker.can_cancel(order)
             and not self.broker.cancel_requested(order)
         }
+
+    def _app_targets(self, open_orders: list[OrderRecord], key: str) -> list[OrderRecord]:
+        """This app's working take-profits (SELL limits) for `key`, a cancel asked or not
+        (one can fill until IBKR confirms the cancel)."""
+        return [
+            order
+            for order in open_orders
+            if order.status in OPEN_ORDER_STATUSES
+            and order.request.instrument.key == key
+            and order.request.side == Side.SELL
+            and order.request.order_type == OrderType.LIMIT
+            and order.request.stop_loss is None
+            and self.broker.can_cancel(order)
+        ]
 
     def _queued_exits(self, open_orders: list[OrderRecord]) -> dict[str, float]:
         """Unfilled quantity of this app's working market SELL exits per instrument: closes
@@ -2875,6 +2901,23 @@ class Engine:
                 # instrument running meanwhile.
                 async with self.broker.close_lock(pos.instrument):
                     orders = await self.broker.open_orders()
+                    targets = self._app_targets(orders, key)
+                    if (
+                        targets
+                        and key not in self._native_stops(orders)
+                        and key not in self._working_buys(orders)
+                    ):
+                        # The bracket's take-profit is in its dead stop's OCA group, not
+                        # the new stop's: a (part) fill of it would not shrink the stop,
+                        # which would then sell beyond the bot's units (the owner's). The
+                        # engine sells at the target itself instead.
+                        for order in targets:
+                            if order.broker_order_id:
+                                await self.broker.cancel_order(order.broker_order_id)
+                        orders = await self.broker.open_orders()
+                        if self._app_targets(orders, key):  # not confirmed gone yet
+                            self._reprotect_pending = True
+                            continue
                     held = next(
                         (p.qty for p in await self.broker.positions() if p.instrument.key == key),
                         0.0,
@@ -3054,10 +3097,15 @@ class Engine:
                 f.exec_id: (f.commission, f.ts)
                 for f in self.db.list_fills(since=now - FIRST_FILL_LOOKBACK, limit=FILL_QUERY_LIMIT)
             }
-        lookback = FILL_LOOKBACK if self._fills_synced else FIRST_FILL_LOOKBACK
+        first = not self._fills_synced
+        lookback = FIRST_FILL_LOOKBACK if first else FILL_LOOKBACK
         fills = await self.broker.fills_since(now - lookback)
         self._fills_synced = True
         touched = set(self._pending_trades)
+        if first:
+            # A restart forgot which trips were waiting for a commission report (one that
+            # stays 0 never touches its key again): rebuild every position the bot describes.
+            touched |= set(self.db.all_position_meta())
         for fill in sorted(fills, key=lambda f: (f.ts, f.exec_id)):
             key = fill.instrument.key
             replaced = self.db.correct_fill(fill)
@@ -3198,14 +3246,21 @@ class Engine:
         fallback = None
         if meta and meta.get("entry_price"):
             fallback = (float(meta["entry_price"]), meta.get("opened_at") or now)
-        bot_first = entry = budget = None
+        bot_first = entry = budget = until = None
         if meta is not None:
             sales = watchdog_sales(self.db, key, position_marker(meta), meta.get("opened_at"))
             bot_first = sales[0] - FILL_TIME_SKEW if sales is not None else None
             budget = sales[1] if sales is not None else None
+            end = watchdog_sales_end(self.db, key, position_marker(meta))
+            until = end + FILL_TIME_SKEW if end is not None else None
             entry = entry_qty(self._extra(key), meta)
         split = split_fills(
-            fills, bot_first_from=bot_first, bot_first_qty=budget, entry=entry, entry_sent=opened
+            fills,
+            bot_first_from=bot_first,
+            bot_first_qty=budget,
+            bot_first_until=until,
+            entry=entry,
+            entry_sent=opened,
         )
         trips, open_qty = replay_fills(split.bot_fills, fallback)
         self._open_qty[key] = open_qty
@@ -3439,6 +3494,8 @@ class Engine:
         except BrokerError:
             return False
         bot_first = sales[0] - FILL_TIME_SKEW
+        end = watchdog_sales_end(self.db, key, marker)
+        until = end + FILL_TIME_SKEW if end is not None else None
         fills = [
             f
             for f in self.db.list_fills(
@@ -3448,9 +3505,14 @@ class Engine:
         ]
         limit = entry_qty(self._extra(key), meta)
         split = split_fills(
-            fills, bot_first_from=bot_first, bot_first_qty=sales[1], entry=limit, entry_sent=opened
+            fills,
+            bot_first_from=bot_first,
+            bot_first_qty=sales[1],
+            bot_first_until=until,
+            entry=limit,
+            entry_sent=opened,
         )
-        unseen_sold = unreported_sales(sold, fills, bot_first)
+        unseen_sold = unreported_sales(sold, fills, bot_first, until)
         if not owner_evidence(held, limit, split) and not bought_since(
             held, limit, less_sold(split, unseen_sold)
         ):
