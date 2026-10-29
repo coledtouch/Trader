@@ -1149,7 +1149,9 @@ for, or more held than the bot can still hold after its own sales (a partial exi
 room under the entry's quantity; a sale of the app's of the last two minutes may not be in
 the position read yet: when only those sales make room for what is held, the read may lag
 them or the owner bought where no fill shows it, and the exit sells at most the bot's own
-units, keeping the owner's known ones; undecided while the executions are unread) or once the crypto watchdog's sales known to have
+units (the unseen part of its entry only for what the read less those sales leaves beyond
+both sides' units, and only with no owner buy known), keeping the owner's known ones;
+undecided while the executions are unread) or once the crypto watchdog's sales known to have
 filled are off (with the executions unread, also its sales still working, at what they
 asked: its IOC is done only on its next poll, and until then the rest held may be the
 owner's). Without it nothing changes: every exit sells the whole position, as before. With it,
@@ -1158,7 +1160,8 @@ the close, AI and approved closes, the dashboard Close of a bot position, the sh
 halt flatten, re-placed stops) sells at most `Cap.qty` (the bot's units, rounded down) and
 never into `Cap.keep` (the owner's units, at least everything held that is not the bot's):
 `_bot_cap` reads the position fresh when the exit is sized, and `close_position(max_qty,
-keep)` sizes the sell again on a fresh position read after its cancels, so a bracket child
+keep)` sizes the sell again on a fresh position read after its cancels, and takes what
+this app's own sells filled during those cancels off the bot's part, so a bracket child
 that fills meanwhile, or an owner buy since the tick read the positions, only shrinks it. A
 size of 0 sends nothing and leaves the bot's stop in place (Close refuses: "sell it in
 IBKR"; an approval is cancelled; the engine looks again after CLOSE_RETRY). A close that,
@@ -1193,7 +1196,8 @@ known units together gets one alert ("shares of unknown owner": urgent for crypt
 
 The crypto watchdog, with the app down, sells at most the bot's part from the journal the
 app kept (another client's sells after its own first sale are left out: they may be its
-own; a sale the app already journaled at an estimate is not taken off twice), plus what
+own, until its last sale was sent, plus the skew, once all its orders are done, as in the
+engine; a sale the app already journaled at an estimate is not taken off twice), plus what
 IBKR says the bot's entry filled beyond the journal (an entry still working there, by its
 tag; or what the app saw filled of one it saw done; an approved entry by its send time, not
 its proposal's), less what it already sold of the position. Part of the entry the app last
@@ -1233,7 +1237,9 @@ skips the trip already journaled. Part of the bot's entry the journal never saw 
 rest filled while the app was down, on a day IBKR no longer reports; an entry the app last
 saw working that IBKR no longer lists, or the engine forgot) keeps the metadata while the
 bot's journaled trades do not cover it: its units are still the bot's, and its stop and
-target are not cancelled as leftovers. Another client's sell beyond both sides' units
+target are not cancelled as leftovers. Once the entry no longer works and the position read
+is exactly what the journal's fills explain, that rest is settled (it lapsed, or filled
+and was sold unseen; position extra `rest_settled`): no later unit is taken for it. Another client's sell beyond both sides' units
 (and the unseen part of the bot's entry) sold what was held before the window: it is
 nobody's there, never paired with the metadata's entry. A capped watchdog sale on an
 earlier day IBKR no longer reports (the owner's units next to the bot's) is journaled at an
@@ -1242,7 +1248,9 @@ the stop, `unreported-exit`, dated at the latest sale it covers, so a later outa
 gets its own; with an alert), so the bot's trade closes
 and its metadata is released; a flat sale of the watchdog's (`WATCHDOG_CLOSED`) is
 estimated from the bot's own lot since its entry, never an owner lot the journal still
-shows open; without the owner's units, everything held is the bot's,
+shows open, plus what the watchdog sold beyond the journal's lot (the entry's rest that
+filled while the app was down), up to what is left of the entry, even with no open lot in
+the journal; without the owner's units, everything held is the bot's,
 still unsold, and only the flat-position path (`_close_unreported_exit`) estimates. A
 watchdog sale IBKR does report closes it from the executions. The first fills sync after
 a start rebuilds the journal of every position with metadata, so a bot trip still waiting

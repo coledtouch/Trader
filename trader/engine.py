@@ -95,6 +95,7 @@ from trader.ownership import (
     less_sold,
     merge_fills,
     owner_evidence,
+    read_sales_record,
     sell_cap,
     sent_at,
     split_fills,
@@ -175,6 +176,7 @@ PDT_REFRESH = timedelta(minutes=5)
 COMMISSION_GRACE = timedelta(minutes=2)  # wait this long for late commission reports
 STALE_META_GRACE = timedelta(minutes=2)
 ORDER_FORGET_AFTER = timedelta(days=1)
+REST_SETTLED = "rest_settled"  # position extra: the unseen rest of the entry is not held
 FILL_LOOKBACK = timedelta(days=2)
 FIRST_FILL_LOOKBACK = timedelta(days=7)
 TRADE_LOOKBACK = timedelta(days=30)
@@ -2338,9 +2340,17 @@ class Engine:
             if not read:
                 self._reprotect_pending = True  # undecided, not "none of it": look again
                 return Cap(qty=0.0, keep=held, unread=True)
+            # The unseen part of the entry only for what the read less those sales leaves
+            # beyond both sides' units, and only with no owner buy known: else the excess
+            # may be his (sell_cap credits it only when it fits in that part).
+            unseen = (
+                min(split.unseen, max(0.0, held - recent - split.bot - split.owner))
+                if split.owner_bought <= EPS
+                else 0.0
+            )
             mine = self.broker.round_qty(
                 inst,
-                round(max(0.0, min(split.bot + split.unseen, limit)), 8),
+                round(max(0.0, min(split.bot + unseen, limit)), 8),
                 allow_fractional=self.settings.allow_fractional_stocks,
             )
             return Cap(qty=mine, keep=max(0.0, split.owner))
@@ -3285,7 +3295,7 @@ class Engine:
         units are still the bot's, so its position is not finished."""
         meta = self.db.get_position_meta(key)
         opened = meta.get("opened_at") if meta else None
-        if opened is None:
+        if opened is None or self._extra(key).get(REST_SETTLED):
             return False
         since = _aware(opened) - FILL_TIME_SKEW
         fills = [
@@ -3303,6 +3313,29 @@ class Engine:
             if trade.instrument.key == key and _aware(trade.entry_ts) >= since
         )
         return journaled < bought + sure + unknown - EPS
+
+    def _settle_unseen_rest(
+        self, key: str, meta: dict[str, Any], positions: list[Position]
+    ) -> bool:
+        """The bot's entry is no longer working and the position read is exactly what the
+        journal's fills explain (the bot's units and the owner's): no unit is the unseen
+        rest of the entry (it lapsed, or filled and was sold while the app was down), and
+        none can come later. Record it, so a later owner buy no fill shows is never taken
+        for that rest."""
+        if not self._entry_unseen_held(key):
+            return False
+        held = next((p.qty for p in positions if p.instrument.key == key and p.qty > 0), 0.0)
+        since = _aware(meta["opened_at"]) - FILL_TIME_SKEW
+        fills = [
+            f
+            for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+            if f.instrument.key == key and _aware(f.ts) >= since
+        ]
+        split = self._bot_split(key, meta, fills)
+        if abs(held - (split.bot + split.owner)) > max(EPS, 1e-6 * held):
+            return False
+        self._set_extra(key, **{REST_SETTLED: 1.0})
+        return True
 
     def _bot_split(self, key: str, meta: dict[str, Any] | None, fills: list[Fill]) -> Split:
         """split_fills of a window of `key`'s fills for the bot position `meta` (None: no
@@ -3501,10 +3534,11 @@ class Engine:
             for f in self.db.list_fills(since=now - TRADE_LOOKBACK, limit=FILL_QUERY_LIMIT)
             if f.instrument.key == key and (sold_at is None or _aware(f.ts) <= sold_at)
         ]
-        if not fills:
+        if not fills and not watchdog_sold:
             return False
-        last = max(fills, key=lambda f: _aware(f.ts))
-        if _aware(last.ts) >= trading_day_start(trading_day(now)):
+        today = trading_day_start(trading_day(now))
+        last = max(fills, key=lambda f: _aware(f.ts)) if fills else None
+        if last is not None and _aware(last.ts) >= today:
             return False  # today's executions would still report the exit: wait for it
         # Acting on a false flat read would cancel the stop of a held position: read again.
         # (The watchdog's mark already says it sold the bot's position flat: what is held
@@ -3530,22 +3564,33 @@ class Engine:
                 ),
                 key=lambda f: (f.ts, f.exec_id),
             )
-            _, qty = replay_fills(self._bot_split(key, meta, window).bot_fills)
+            split = self._bot_split(key, meta, window)
+            _, qty = replay_fills(split.bot_fills)
+            # It sold flat, so all it sold was the bot's: what no fill shows (the rest of
+            # the entry filled while the app was down) too, up to what is left of the entry.
+            unseen_sold, sale_at = self._watchdog_unjournaled(key, meta, window)
+            if sale_at is None or sale_at >= today:
+                if last is None:
+                    return False  # today's executions would still report it
+            else:
+                qty = max(qty, min(unseen_sold, split.bot + split.unseen))
             if qty <= EPS:
                 return True  # nothing of the bot's was open before the sale
-        price = meta.get("stop_loss") or meta.get("entry_price") or last.price
+        price = meta.get("stop_loss") or meta.get("entry_price") or (last.price if last else 0)
+        if not price:
+            return False
         exit_fill = Fill(
             exec_id=f"{UNREPORTED_EXIT}:{key}:{now.isoformat()}",
             broker_order_id=UNREPORTED_EXIT,
-            instrument=last.instrument,
+            instrument=Instrument.from_key(key),
             side=Side.SELL,
             qty=qty,
             price=float(price),
-            ts=_aware(last.ts) + timedelta(seconds=1),
+            ts=_aware(last.ts) + timedelta(seconds=1) if last is not None else sale_at,
         )
         self.db.insert_fill(exit_fill)
         await self._reconstruct(key, now)
-        symbol = last.instrument.symbol
+        symbol = exit_fill.instrument.symbol
         log.warning("%s: exit fill never reported; journaled %g at %g (estimate)", key, qty, price)
         self.db.audit(
             "unreported_exit",
@@ -3567,6 +3612,34 @@ class Engine:
         if watchdog_sold:  # anything open after it in the journal is the owner's since
             return key not in self._pending_trades
         return self._open_qty.get(key, 0.0) <= EPS and key not in self._pending_trades
+
+    def _watchdog_unjournaled(
+        self, key: str, meta: dict[str, Any], fills: list[Fill] | None = None
+    ) -> tuple[float, datetime | None]:
+        """What the crypto watchdog sold of the bot position `meta` (marked sold flat: its
+        last sell filled in full) that no fill in `fills` (default: the journal's since the
+        entry) shows, and when it last sold (None: no sale recorded)."""
+        opened = meta.get("opened_at")
+        marker = position_marker(meta)
+        sales = watchdog_sales(self.db, key, marker, opened)
+        if sales is None:
+            return 0.0, None
+        first, sold = sales
+        if fills is None:
+            since = _aware(opened) - FILL_TIME_SKEW if opened is not None else first
+            fills = [
+                f
+                for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+                if f.instrument.key == key
+            ]
+        end = watchdog_sales_end(self.db, key, marker)
+        until = end + FILL_TIME_SKEW if end is not None else None
+        rec = read_sales_record(self.db, key, marker) or {}
+        latest = max(
+            (_aware(datetime.fromisoformat(v)) for v in rec.get("at", {}).values()),
+            default=self._watchdog_sale_at(key) or first,
+        )
+        return unreported_sales(sold, fills, first - FILL_TIME_SKEW, until), latest
 
     def _watchdog_sale_at(self, key: str) -> datetime | None:
         """When the crypto watchdog last sold `key` (its audit row), if it is recorded."""
@@ -3675,6 +3748,14 @@ class Engine:
             # buy since, which the fills journal counts).
             sold = sold_by_watchdog(self.db, key, meta)
             closed = self._meta_used(key, meta)
+            if (
+                key in held
+                and not sold
+                and not closed
+                and key not in buying
+                and self._settle_unseen_rest(key, meta, positions)
+            ):
+                closed = self._meta_used(key, meta)
             released = sold or closed
             if (
                 key in held
@@ -3700,7 +3781,14 @@ class Engine:
                     log.warning("%s: broker shows no position but the fills journal does", key)
                 if not await self._close_unreported_exit(key, meta, since, now):
                     continue
-            elif sold and not closed and self._open_qty.get(key, 0.0) > EPS:
+            elif (
+                sold
+                and not closed
+                and (
+                    self._open_qty.get(key, 0.0) > EPS
+                    or self._watchdog_unjournaled(key, meta)[0] > EPS
+                )
+            ):
                 # The watchdog's sale fell on an earlier day IBKR no longer reports: journal
                 # the bot's lot at an estimate before forgetting the meta, so the next trip
                 # in the symbol is not paired with it.

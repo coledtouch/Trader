@@ -251,11 +251,14 @@ class Broker(ABC):
             reason=reason or "close position",
             trace_id=order_trace_id(existing=trace_id),
         )
+        filled_before: dict[str, float] = {}
         try:
             for order in await self.open_orders():
                 if order.request.instrument.key == instrument.key and order.broker_order_id:
                     if not self.can_cancel(order):
                         continue  # still working: never counted as a stop to put back
+                    if order.request.side == Side.SELL:
+                        filled_before[order.broker_order_id] = order.filled_qty
                     await self.cancel_order(order.broker_order_id)
                     cancelled.add(order.broker_order_id)
                     if order.request.side == Side.SELL and order.request.stop_loss is not None:
@@ -274,7 +277,15 @@ class Broker(ABC):
                     ),
                     0.0,
                 )
-                qty = self._capped(instrument, now_held, max_qty, keep)
+                # What this app's own sells (a bracket child) filled during the cancels
+                # came out of the bot's units, whatever the read shows (it may lag them,
+                # or an earlier lag may have caught up).
+                sold = 0.0
+                for oid, before in filled_before.items():
+                    done = await self.order_status(oid)
+                    if done is not None:
+                        sold += max(0.0, done.filled_qty - before)
+                qty = self._capped(instrument, now_held, max(0.0, max_qty - sold), keep)
                 if qty <= 1e-9:
                     return None
                 req = req.model_copy(update={"qty": qty})

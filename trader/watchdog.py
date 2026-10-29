@@ -67,6 +67,7 @@ from trader.ownership import (
     unreported_sales,
     watchdog_filled,
     watchdog_sales,
+    watchdog_sales_end,
 )
 from trader.risk import sane_exit_price
 from trader.timeutil import trading_day
@@ -501,6 +502,10 @@ class CryptoWatchdog:
         sent = await self._sent_qty(key, meta)  # also keeps what done orders filled
         sales = watchdog_sales(self.db, key, marker, opened)
         cut = sales[0] - FILL_TIME_SKEW if sales is not None else None
+        # Once every sale of this process's is done, another client's sells after its last
+        # send (and the skew) cannot be its own: they are the owner's again.
+        end = watchdog_sales_end(self.db, key, marker) if cut is not None else None
+        until = end + FILL_TIME_SKEW if end is not None else None
         fills = [
             f
             for f in self.db.list_fills(since=since, limit=5000)
@@ -510,6 +515,7 @@ class CryptoWatchdog:
                 and f.side == Side.SELL
                 and is_other_client(f)
                 and f.ts.replace(tzinfo=f.ts.tzinfo or UTC) >= cut
+                and (until is None or f.ts.replace(tzinfo=f.ts.tzinfo or UTC) <= until)
             )
         ]
         limit = entry_qty(read_extra(self.db, key), meta)
@@ -522,7 +528,7 @@ class CryptoWatchdog:
         if cut is not None:
             # What the journal shows of this process's sales (the app's estimate of an
             # earlier day's) is out of the split already.
-            sent = unreported_sales(sent, fills, cut)
+            sent = unreported_sales(sent, fills, cut, until)
         # The broker's word on the bot's entry beyond the journal (it filled while the app
         # was down): the bot's, even when the owner sold some of his meanwhile (less held
         # than both sides' journaled units would otherwise hide it).

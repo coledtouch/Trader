@@ -1105,3 +1105,314 @@ async def test_a_lapsed_rest_leaves_the_owners_shares_alone(db, config) -> None:
     assert h.broker.pos["STK:F"][0] == 50
     await ticks(h, 80, seconds=15)
     assert h.broker.pos["STK:F"][0] == 50
+
+
+# ----------------------------------------------------------------------------- review 47
+@pytest.mark.parametrize("wait_ticks", [1, 12])
+async def test_a_target_fill_during_the_close_cancels_keeps_the_owners_unseen_shares(
+    db, config, wait_ticks: int
+) -> None:
+    """Thursday: the bot's target fills 4 of its 24, the owner's 3 bought on Wednesday
+    evening are in no fill. A Close (1 or 12 minutes later) cancels the bracket, and the
+    target fills 2 more before its cancel lands: those come off the bot's part."""
+    from tests.test_engine import _part
+
+    h = await _paper(db, config, datetime(2026, 10, 28, 15, 0, tzinfo=UTC))
+    await enter_f(h)
+    [entry] = [oid for oid, k in h.broker.kind.items() if k == "entry"]
+    await ticks(h, 2)
+    h.clock.t = datetime(2026, 10, 28, 19, 45, tzinfo=UTC)
+    owner_buys(h, F, 3, 10.4)
+    h.engine = _restart_next_morning(h, config)
+    await ticks(h, 2)
+    _part(h.broker, f"{entry}-TP", 4, 10.5)
+    await ticks(h, wait_ticks)
+    real = h.broker.cancel_order
+    raced: list[str] = []
+
+    async def cancel(oid: str) -> None:
+        if not raced and oid == f"{entry}-TP":
+            raced.append(oid)
+            _part(h.broker, oid, 2, 10.5)  # fills just before the cancel lands
+        await real(oid)
+
+    h.broker.cancel_order = cancel
+    await h.engine.close_position("STK:F")
+    assert raced
+    assert h.broker.pos["STK:F"][0] == 3
+    await ticks(h, 20)
+    assert h.broker.pos["STK:F"][0] == 3
+    assert sum(t.qty for t in db.list_trades()) == 24
+
+
+async def _lapsed_rest_with_owner(db, config):
+    """Wednesday: the bot's entry of 24 F fills 20 and its rest lapses; the owner's 10
+    are journaled. Returns the harness and the entry's order id."""
+    from tests.test_engine import _part, _resting_entry
+
+    h = await _paper(db, config, datetime(2026, 10, 28, 15, 0, tzinfo=UTC))
+    entry, total = await _resting_entry(h)
+    assert total == 24
+    _part(h.broker, entry, 20, 10.01)
+    await ticks(h, 2, seconds=15)
+    owner_buys(h, F, 10, 10.2)
+    await ticks(h, 2, seconds=15)
+    h.broker.orders[entry].status = OrderStatus.CANCELLED  # the rest lapses
+    await ticks(h, 2, seconds=15)
+    return h, entry
+
+
+async def test_a_lagging_read_never_credits_a_lapsed_rest_over_the_owners_shares(
+    db, config
+) -> None:
+    """The target sells 6 of the bot's 20 and the position read still shows them: the
+    entry's lapsed rest (4) is not the bot's; the owner's journaled 10 stay."""
+    from tests.test_engine import _part
+
+    h, entry = await _lapsed_rest_with_owner(db, config)
+    _part(h.broker, f"{entry}-TP", 6, 10.5)
+    await ticks(h, 1, seconds=15)
+    real = h.broker.positions
+
+    async def lagging():
+        return [p.model_copy(update={"qty": p.qty + 6}) for p in await real()]
+
+    h.broker.positions = lagging
+    await h.engine.close_position("STK:F")
+    h.broker.positions = real
+    assert h.broker.pos["STK:F"][0] == 10
+
+
+@pytest.mark.parametrize("wait", [1, 3])
+async def test_a_close_after_a_part_fill_keeps_an_unreported_owner_buy(
+    db, config, wait: int
+) -> None:
+    """With the lapsed rest above, the owner also bought 6 on Wednesday evening (no fill
+    shows them). Thursday the target sells 4 of the bot's 20: a Close 1 or 3 minutes later
+    sells the bot's 16 and keeps his 16."""
+    from tests.test_engine import _part
+
+    h, entry = await _lapsed_rest_with_owner(db, config)
+    h.clock.t = datetime(2026, 10, 28, 19, 45, tzinfo=UTC)
+    owner_buys(h, F, 6, 10.4)
+    h.engine = _restart_next_morning(h, config)
+    await ticks(h, 2)
+    _part(h.broker, f"{entry}-TP", 4, 10.5)
+    await ticks(h, wait)
+    await h.engine.close_position("STK:F")
+    assert h.broker.pos["STK:F"][0] == 16
+
+
+async def test_a_lagging_close_of_an_unreported_rest_sells_all_of_the_bots(db, config) -> None:
+    """Pure bot: the rest (17) filled while the app was down; Thursday the target sells 5
+    and a Close follows while the position read still shows them: it sells the bot's 12."""
+    from tests.test_engine import _part
+
+    h = await _partly_filled_entry_then_outage(db, config)
+    [entry] = [oid for oid, k in h.broker.kind.items() if k == "entry"]
+    _part(h.broker, f"{entry}-TP", 5, 10.5)
+    await ticks(h, 1, seconds=15)
+    real = h.broker.positions
+
+    async def lagging():
+        return [p.model_copy(update={"qty": p.qty + 5}) for p in await real()]
+
+    h.broker.positions = lagging
+    await h.engine.close_position("STK:F")
+    h.broker.positions = real
+    assert "STK:F" not in h.broker.pos
+
+
+@pytest.mark.parametrize("forgotten", [True, False])
+async def test_a_settled_rest_never_takes_a_later_owner_buy(db, config, forgotten: bool) -> None:
+    """Wednesday: the bot's entry of 24 F fills 7, the owner buys 50 (journaled), the
+    target sells the bot's 7 and the rest lapses while the app is down. Thursday the read
+    is exactly the owner's 50: the rest is settled. Friday, after the owner bought 10 more
+    while the app was down, nothing of his is sold and no bot trade is journaled."""
+    from tests.test_engine import _part, _resting_entry
+    from trader.models import Mode
+
+    h = await harness(db, config, now=datetime(2026, 10, 28, 14, 0, tzinfo=UTC), mode=Mode.PAPER)
+    entry, _ = await _resting_entry(h)
+    _part(h.broker, entry, 7, 10.01)
+    await ticks(h, 2, seconds=15)
+    owner_buys(h, F, 50, 10.2)
+    await ticks(h, 2, seconds=15)
+    _part(h.broker, f"{entry}-TP", 7, 10.5)
+    stop = h.broker.orders[f"{entry}-SL"]
+    stop.request = stop.request.model_copy(update={"qty": stop.request.qty - 7})
+    await ticks(h, 2, seconds=15)
+    h.clock.t = datetime(2026, 10, 28, 17, 0, tzinfo=UTC)
+    for oid in (entry, f"{entry}-SL", f"{entry}-TP"):
+        h.broker.orders[oid].status = OrderStatus.CANCELLED
+    if forgotten:
+        known = h.broker.order_status
+
+        async def order_status(oid):
+            return None if oid == entry else await known(oid)
+
+        h.broker.order_status = order_status
+    h.engine = _restart_next_morning(h, config)
+    await ticks(h, 80, seconds=15)
+    assert h.broker.pos["STK:F"][0] == 50
+    h.clock.t = datetime(2026, 10, 29, 22, 0, tzinfo=UTC)
+    owner_buys(h, F, 10, 10.0)
+    h.clock.t = datetime(2026, 10, 30, 14, 0, tzinfo=UTC)
+    every_fill = h.broker.fills_since
+
+    async def today_only(since):
+        midnight = trading_day_start(trading_day(h.clock()))
+        return [f for f in await every_fill(since) if f.ts >= midnight]
+
+    h.broker.fills_since = today_only
+    h.engine = Engine(config, h.db, h.broker, h.decider, notifier=h.notes, clock=h.clock,
+                      scanner=h.scanner)  # fmt: skip
+    await ticks(h, 16, seconds=15)
+    assert h.broker.pos["STK:F"][0] == 60
+    assert [t.qty for t in db.list_trades()] == [7]
+
+
+@pytest.mark.parametrize("first", [0.001, 0.0])
+async def test_a_watchdog_flat_sale_of_a_late_filled_entry_is_journaled_in_full(
+    db, config, first: float
+) -> None:
+    """The bot's BTC entry fills `first` (journaled), the app goes down, the watchdog
+    flattens what is held; the entry's rest fills while the app is down and the watchdog
+    sells that too (sold flat). Thursday the app journals the bot's whole entry."""
+    from tests.test_engine import _part, cand
+    from tests.test_watchdog import Notes, settings
+    from trader.models import AIDecision, Mode
+    from trader.watchdog import CryptoWatchdog, sold_by_watchdog
+
+    perm = itertools.count(900)
+
+    class AsOtherClient:
+        """The engine's FakeBroker as the watchdog's connection: its executions are
+        another client's (perm:) to the app."""
+
+        def __init__(self, broker) -> None:
+            self.b = broker
+
+        def __getattr__(self, name):
+            return getattr(self.b, name)
+
+        async def place_order(self, req):
+            n = len(self.b.fills)
+            rec = await self.b.place_order(req)
+            for i in range(n, len(self.b.fills)):
+                self.b.fills[i] = self.b.fills[i].model_copy(
+                    update={"broker_order_id": f"perm:{next(perm)}"}
+                )
+            return rec
+
+    h = await harness(db, config, mode=Mode.PAPER, now=datetime(2026, 10, 28, 15, 0, tzinfo=UTC),
+                      trade_crypto=True, trade_stocks=False,
+                      exits={"time_stop_minutes": 0})  # fmt: skip
+    h.broker.set_price("BTC", 60000.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    h.scanner.candidates = {
+        KEY: [cand("BTC", price=60000.0, stop=59000.0, target=62000.0)
+              .model_copy(update={"instrument": _BTC})]
+    }  # fmt: skip
+    h.decider.decisions = [
+        AIDecision(action=TradeAction.BUY, symbol="BTC", asset_class=AssetClass.CRYPTO,
+                   conviction=0.8, setup="vwap_reclaim", rationale="reclaim")
+    ]  # fmt: skip
+    h.broker._match = lambda key: None  # the entry rests
+    await h.engine.run_cycle()
+    h.decider.decisions = []
+    [entry] = [oid for oid, k in h.broker.kind.items() if k == "entry"]
+    total = h.broker.orders[entry].request.qty
+    if first:
+        _part(h.broker, entry, first, 60005.0)
+    await ticks(h, 3, seconds=15)
+    wd = CryptoWatchdog(db, AsOtherClient(h.broker), settings(), Notes(), h.clock,
+                        started_at=h.clock() - timedelta(hours=1))  # fmt: skip
+    h.broker.set_price("BTC", 59990.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    for _ in range(40):
+        h.clock.advance(seconds=10)
+        await wd.tick()
+    h.clock.advance(minutes=30)
+    _part(h.broker, entry, round(total - first, 8), 60005.0)
+    for _ in range(40):
+        h.clock.advance(seconds=10)
+        await wd.tick()
+    assert sold_by_watchdog(db, KEY, db.get_position_meta(KEY))
+    h.engine = _restart_next_morning(h, config)
+    await ticks(h, 80, seconds=15)
+    assert sum(t.qty for t in db.list_trades()) == pytest.approx(total)
+    assert db.get_position_meta(KEY) is None
+
+
+def _watchdog_after_owner_sale(db: Database, broker: FakeBroker, *, owner_sale: float,
+                               app_row: OrderStatus, app_filled: float,
+                               bid: float) -> None:  # fmt: skip
+    """The bot holds 0.01 BTC, the owner's 0.005 journaled. An outage: the watchdog's IOC
+    for 0.01 filled 0.006 (done, journaled). The owner later sells `owner_sale` of his
+    (journaled). The app's own exit of the bot's 0.004 is in its journal as `app_row`,
+    `app_filled` of it filled with no fill journaled; the app is down again."""
+    from tests.test_watchdog import crypto, q
+    from trader.models import Position
+
+    btc = crypto()
+    opened = NOW - timedelta(hours=3)
+    db.set_position_meta(btc.key, stop_loss=95.0, take_profit=110.0, entry_price=100.0,
+                         initial_risk=5.0 * BOT, opened_at=opened)  # fmt: skip
+    db.set_kv("position_extra:" + btc.key, json.dumps({"unit_risk": 5.0, "qty": BOT}))
+    marker = position_marker(db.get_position_meta(btc.key))
+    db.insert_fill(Fill(exec_id="E1", broker_order_id="12", instrument=btc, side=Side.BUY,
+                        qty=BOT, price=100.0, ts=opened + timedelta(seconds=2)))  # fmt: skip
+    db.insert_fill(Fill(exec_id="X1", broker_order_id="perm:5", instrument=btc, side=Side.BUY,
+                        qty=0.005, price=99.0, ts=opened + timedelta(minutes=10)))  # fmt: skip
+    t1 = opened + timedelta(minutes=30)
+    note_watchdog_sale(db, btc.key, marker, "B1", BOT, t1)
+    note_watchdog_sale(db, btc.key, marker, "B1", 0.006, t1, done=True)
+    db.insert_fill(Fill(exec_id="W1", broker_order_id="perm:900", instrument=btc,
+                        side=Side.SELL, qty=0.006, price=95.0,
+                        ts=t1 + timedelta(seconds=1)))  # fmt: skip
+    held = BOT - 0.006 + 0.005
+    if owner_sale:
+        db.insert_fill(Fill(exec_id="X2", broker_order_id="perm:6", instrument=btc,
+                            side=Side.SELL, qty=owner_sale, price=101.0,
+                            ts=t1 + timedelta(minutes=30)))  # fmt: skip
+        held -= owner_sale
+    at = t1 + timedelta(hours=1)
+    req = OrderRequest(instrument=btc, side=Side.SELL, qty=0.004, order_type=OrderType.MARKET,
+                       is_exit=True, reason="stop-loss", trace_id="ai-trader-77")  # fmt: skip
+    db.insert_order(OrderRecord(request=req, status=app_row, broker_order_id="77",
+                                filled_qty=app_filled, created_at=at, updated_at=at))  # fmt: skip
+    held -= app_filled
+    broker.positions_list.append(Position(instrument=btc, qty=round(held, 8), avg_cost=99.0))
+    broker.quotes[btc.key] = q(btc, bid, bid)
+
+
+@pytest.mark.parametrize("owner_sale", [0.0, 0.003])
+@pytest.mark.parametrize(
+    ("app_row", "app_filled", "bid", "age", "sells"),
+    [
+        (OrderStatus.CANCELLED, 0.001, 100.0, 400, [0.003]),  # flatten
+        (OrderStatus.CANCELLED, 0.001, 90.0, 60, [0.003]),  # stop
+        (OrderStatus.SUBMITTED, 0.0, 90.0, 60, [0.004]),  # the app's exit still working
+    ],
+)
+async def test_the_owners_later_sale_is_his_once_the_watchdogs_sales_are_done(
+    db: Database,
+    owner_sale: float,
+    app_row: OrderStatus,
+    app_filled: float,
+    bid: float,
+    age: int,
+    sells: list[float],
+) -> None:
+    """The owner's sale long after the watchdog's last (done) sale cannot be the
+    watchdog's: it comes out of his coins, and the watchdog sells the bot's rest."""
+    broker = FakeBroker()
+    _watchdog_after_owner_sale(db, broker, owner_sale=owner_sale, app_row=app_row,
+                               app_filled=app_filled, bid=bid)  # fmt: skip
+    clock = Clock()
+    beat(db, clock, age=age)
+    watchdog, _ = make(db, broker, clock)
+    for _ in range(4):
+        await watchdog.tick()
+        clock.advance(seconds=10)
+        beat(db, clock, age=age)
+    assert [round(o.qty, 8) for o in broker.placed] == sells
