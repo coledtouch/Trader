@@ -918,13 +918,19 @@ Contracts changed by the confirmed review findings (each has a regression test).
   the 60 s retries go on), not "Closing X". An approved close whose broker call raised
   drops its marker, so the owner can approve it again.
 - **Unreported exits** (ENG-8): IBKR reports only the current day's executions. A bot
-  stock position read flat for `UNREPORTED_EXIT_GRACE` (15 min) whose fills journal still
-  holds shares, last filled on an earlier day, gets its exit journaled at an estimate (the
-  stop, else the entry price; exit reason "closed at broker (fill not reported; price
-  estimated)"), dated just after that fill, and the owner is told to check the real price.
-  Otherwise its meta would block entries in the symbol for good. The flat reads must be
-  consecutive (a held read restarts the wait), and positions are read once more right
-  before acting.
+  position (stock or crypto) read flat for `UNREPORTED_EXIT_GRACE` (15 min) whose fills
+  journal still holds shares, last filled on an earlier day, gets its exit journaled at an
+  estimate (the stop, else the entry price; exit reason "closed at broker (fill not
+  reported; price estimated)"), dated just after that fill, and the owner is told to check
+  the real price. Otherwise its meta would block entries in the symbol for good. The flat
+  reads must be consecutive (a held read restarts the wait), and positions are read once
+  more right before acting. A crypto position the watchdog marked sold on an earlier day
+  is closed the same way (its lot up to the watchdog's `watchdog_close` audit time, no
+  flat read needed: anything held now is the owner's), so the next trip in the coin is not
+  paired with the stale lot.
+- **Unchecked engine stops**: a position whose stop only the engine enforces (crypto) and
+  that has no usable quote counts as a failed exits check, so the heartbeat stays stale
+  and the crypto watchdog's stale-heartbeat rules apply.
 - **Entry levels** (ENG-9): an entry is blocked when its stop is at or above the current
   bid (the price fell through it since the decision, or while it waited for approval).
   An entry the broker accepted whose bracket stop it refused alerts "Unprotected X" and

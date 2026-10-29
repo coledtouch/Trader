@@ -46,6 +46,7 @@ from trader.notify import Notifier
 from trader.performance import performance_report
 from trader.research import ReplayFrame
 from trader.strategy.decide import RuleBasedDecisionMaker
+from trader.timeutil import trading_day, trading_day_start
 from trader.watchdog import HEARTBEAT_KEY, read_heartbeat
 
 NOW = datetime(2026, 10, 21, 15, 0, tzinfo=UTC)  # Wednesday 11:00 New York (EDT)
@@ -2980,6 +2981,109 @@ async def test_no_position_is_managed_before_the_fills_of_a_new_connection_are_j
     assert h.broker.pos["STK:F"][0] == 50.0
     assert db.get_position_meta("STK:F") is None
     assert "monitor:exits" not in h.engine._errors
+
+
+_BTC = Instrument(symbol="BTC", asset_class=AssetClass.CRYPTO)
+
+
+async def _hold_btc(db, config, now: datetime) -> H:
+    """A paper engine that just bought BTC (stop 59000, engine-managed)."""
+    h = await harness(
+        db, config, mode=Mode.PAPER, now=now, trade_crypto=True, trade_stocks=False,
+        exits={"time_stop_minutes": 45},
+    )  # fmt: skip
+    h.broker.set_price("BTC", 60000.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    h.scanner.candidates = {
+        "CRYPTO:BTC": [
+            cand("BTC", price=60000.0, stop=59000.0, target=62000.0).model_copy(
+                update={"instrument": _BTC}
+            )
+        ]
+    }
+    h.decider.decisions = [
+        AIDecision(action=TradeAction.BUY, symbol="BTC", asset_class=AssetClass.CRYPTO,
+                   conviction=0.8, setup="vwap_reclaim", rationale="reclaim")
+    ]  # fmt: skip
+    await h.engine.run_cycle()
+    h.decider.decisions = []
+    assert "CRYPTO:BTC" in h.broker.pos
+    for _ in range(2):
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    return h
+
+
+def _restart_next_morning(h: H, config) -> Engine:
+    """The app comes back Thursday 10:00 New York; IBKR reports only today's executions."""
+    h.clock.t = datetime(2026, 10, 29, 14, 0, tzinfo=UTC)
+    every_fill = h.broker.fills_since
+
+    async def today_only(since):
+        midnight = trading_day_start(trading_day(h.clock()))
+        return [f for f in await every_fill(since) if f.ts >= midnight]
+
+    h.broker.fills_since = today_only
+    return Engine(config, h.db, h.broker, h.decider, notifier=h.notes, clock=h.clock,
+                  scanner=h.scanner)  # fmt: skip
+
+
+async def test_a_crypto_exit_ibkr_no_longer_reports_frees_the_coin(db, config) -> None:
+    """Review finding: the bot's BTC was sold while the app was down on an earlier day
+    (by the owner, with the watchdog only alerting). IBKR no longer reports that sale, and
+    the unreported-exit rule was stocks only: the metadata stayed, BTC entries were blocked
+    for 30 days, and BTC the owner bought later was sold by the bot's time stop."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 1, 0, tzinfo=UTC))  # Wed 21:00
+    del h.broker.pos["CRYPTO:BTC"]  # sold by hand at 23:30, not reported the next day
+    engine = _restart_next_morning(h, config)
+    for _ in range(70):  # over 15 minutes of flat reads
+        await engine.monitor_tick()
+        h.clock.advance(seconds=15)
+    assert db.get_position_meta("CRYPTO:BTC") is None
+    [trade] = db.list_trades()
+    assert trade.instrument == _BTC and trade.exit_price == 59000.0  # estimated at the stop
+    assert "Exit of BTC not reported" in h.notes.titles()
+
+
+async def test_a_watchdog_sale_on_an_earlier_day_closes_the_bots_lot(db, config) -> None:
+    """Review finding: the watchdog sold the bot's BTC while the app was stopped overnight.
+    The next day the metadata was released but the bot's buy stayed open in the fills
+    journal, so the bot's next BTC trade was paired with it, never journaled, and its
+    metadata blocked BTC for good."""
+    from trader.watchdog import WATCHDOG_CLOSED_PREFIX, position_marker
+
+    h = await _hold_btc(db, config, datetime(2026, 10, 28, 22, 0, tzinfo=UTC))  # Wed 18:00
+    meta = db.get_position_meta("CRYPTO:BTC")
+    qty = h.broker.pos.pop("CRYPTO:BTC")[0]  # the watchdog's sale, on Wednesday
+    db.audit("watchdog_close", {"instrument": "CRYPTO:BTC", "qty": qty}, actor="watchdog")
+    db.set_kv(WATCHDOG_CLOSED_PREFIX + "CRYPTO:BTC", position_marker(meta))
+    engine = _restart_next_morning(h, config)
+    for _ in range(70):
+        await engine.monitor_tick()
+        h.clock.advance(seconds=15)
+    assert db.get_position_meta("CRYPTO:BTC") is None
+    assert len(db.list_trades()) == 1
+    assert engine._open_qty.get("CRYPTO:BTC", 0.0) == 0.0  # the next trip starts clean
+
+
+async def test_an_unchecked_crypto_stop_lets_the_watchdog_take_over(db, config) -> None:
+    """Review finding: with the BTC quote failing (IBKR 10197 while the owner's app holds
+    the data), the engine skipped its BTC stop without a word and still refreshed the
+    heartbeat, so the crypto watchdog never took over."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 15, 0, tzinfo=UTC))
+    quote = h.broker.quote
+
+    async def no_btc_data(inst):
+        if inst.key == "CRYPTO:BTC":
+            raise BrokerError("no market data for BTC (error 10197)")
+        return await quote(inst)
+
+    h.broker.quote = no_btc_data
+    beat = read_heartbeat(db)
+    for _ in range(4):
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    assert read_heartbeat(db) == beat  # stale: the watchdog's stale-heartbeat rules apply
+    assert "no usable quote" in h.engine._errors["monitor:exits"][1]
 
 
 async def test_signal_ledger_dedupes_repeated_setups(db, config) -> None:

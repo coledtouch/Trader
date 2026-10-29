@@ -2269,10 +2269,16 @@ class Engine:
             key = pos.instrument.key
             meta = metas.get(key)
             mark = sane_exit_price(quotes.get(key))  # None: no quote, or an implausible one
-            if pos.qty <= 0 or meta is None or mark is None or self._closing_now(key, now):
+            if pos.qty <= 0 or meta is None or self._closing_now(key, now):
                 continue
             if pos.instrument.asset_class == AssetClass.STOCK and not stocks_open:
                 continue  # stock orders cannot execute now; broker stops still protect
+            if mark is None:
+                if not self.broker.supports_native_stops(pos.instrument):
+                    # Nothing else enforces this position's stop (crypto): a failed check,
+                    # so the heartbeat stays stale and the crypto watchdog can take over.
+                    failures.append(f"{key}: no usable quote, its stop was not checked")
+                continue
             try:
                 await self._manage_one(
                     pos,
@@ -2937,20 +2943,28 @@ class Engine:
         return "closed at broker"
 
     async def _close_unreported_exit(
-        self, key: str, meta: dict[str, Any], since: datetime, now: datetime
+        self,
+        key: str,
+        meta: dict[str, Any],
+        since: datetime,
+        now: datetime,
+        watchdog_sold: bool = False,
     ) -> bool:
-        """A bot stock position the broker reads flat whose exit fill the journal never got:
-        it filled while the app was down on an earlier day, and IBKR reports only today's
-        executions. Without it the meta (which blocks new entries in the symbol) would stay
-        for good. After UNREPORTED_EXIT_GRACE of flat reads, journal the exit at an estimate
-        (the stop, else the entry), dated just after the last fill so it lands on that
-        earlier day, and tell the owner. Returns True when the position is closed now."""
-        if not key.startswith(f"{AssetClass.STOCK.value}:") or now - since < UNREPORTED_EXIT_GRACE:
+        """A bot position the broker reads flat (or, with `watchdog_sold`, one the crypto
+        watchdog marked sold) whose exit fill the journal never got: it filled while the
+        app was down on an earlier day, and IBKR reports only today's executions. Without
+        it the meta (which blocks new entries in the symbol) would stay for good, and a
+        later trip would be paired with the stale lot. After UNREPORTED_EXIT_GRACE, journal
+        the exit at an estimate (the stop, else the entry), dated just after the bot's last
+        fill so it lands on that earlier day, and tell the owner. Returns True when the
+        position is closed now."""
+        if now - since < UNREPORTED_EXIT_GRACE:
             return False
+        sold_at = self._watchdog_sale_at(key) if watchdog_sold else None
         fills = [
             f
             for f in self.db.list_fills(since=now - TRADE_LOOKBACK, limit=FILL_QUERY_LIMIT)
-            if f.instrument.key == key
+            if f.instrument.key == key and (sold_at is None or _aware(f.ts) <= sold_at)
         ]
         if not fills:
             return False
@@ -2958,10 +2972,24 @@ class Engine:
         if _aware(last.ts) >= trading_day_start(trading_day(now)):
             return False  # today's executions would still report the exit: wait for it
         # Acting on a false flat read would cancel the stop of a held position: read again.
-        if any(p.instrument.key == key and p.qty > 0 for p in await self.broker.positions()):
+        # (The watchdog's mark already says it sold the bot's position flat: what is held
+        # under the symbol now was bought since, by the owner.)
+        if not watchdog_sold and any(
+            p.instrument.key == key and p.qty > 0 for p in await self.broker.positions()
+        ):
             self._mismatch_logged.pop(key, None)
             return False
         qty = self._open_qty.get(key, 0.0)
+        if watchdog_sold:  # the bot's lot is what was open when the watchdog sold
+            epoch = self._epoch
+            _, qty = replay_fills(
+                sorted(
+                    (f for f in fills if epoch is None or _aware(f.ts) >= epoch),
+                    key=lambda f: (f.ts, f.exec_id),
+                )
+            )
+            if qty <= EPS:
+                return True  # nothing of the bot's was open before the sale
         price = meta.get("stop_loss") or meta.get("entry_price") or last.price
         exit_fill = Fill(
             exec_id=f"{UNREPORTED_EXIT}:{key}:{now.isoformat()}",
@@ -2976,17 +3004,34 @@ class Engine:
         await self._reconstruct(key, now)
         symbol = last.instrument.symbol
         log.warning("%s: exit fill never reported; journaled %g at %g (estimate)", key, qty, price)
-        self.db.audit("unreported_exit", {"instrument": key, "qty": qty, "price": price})
+        self.db.audit(
+            "unreported_exit",
+            {"instrument": key, "qty": qty, "price": price, "watchdog": watchdog_sold},
+        )
+        how = (
+            "the crypto watchdog sold it while the app was down"
+            if watchdog_sold
+            else f"IBKR shows no {symbol} position, but its exit filled while the app was down"
+        )
         await self._notify(
             f"Exit of {symbol} not reported",
-            f"IBKR shows no {symbol} position, but its exit filled while the app was down "
-            f"on an earlier day and IBKR no longer reports it. The trade is journaled at "
-            f"{price:g} as an estimate: check the real price in IBKR's statements. "
-            f"{symbol} can be traded again.",
+            f"{how[0].upper()}{how[1:]} on an earlier day and IBKR no longer reports it. The "
+            f"trade is journaled at {price:g} as an estimate: check the real price in IBKR's "
+            f"statements. {symbol} can be traded again.",
             priority="high",
             tags=["warning"],
         )
+        if watchdog_sold:  # anything open after it in the journal is the owner's since
+            return key not in self._pending_trades
         return self._open_qty.get(key, 0.0) <= EPS and key not in self._pending_trades
+
+    def _watchdog_sale_at(self, key: str) -> datetime | None:
+        """When the crypto watchdog last sold `key` (its audit row), if it is recorded."""
+        for row in self.db.list_audit(limit=1000):
+            if row["action"] == "watchdog_close" and row["detail"].get("instrument") == key:
+                stamp = datetime.fromisoformat(row["ts"])
+                return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
+        return None
 
     async def _cleanup_meta(
         self, now: datetime, positions: list[Position], open_orders: list[OrderRecord]
@@ -3018,6 +3063,13 @@ class Engine:
                 if since == now:
                     log.warning("%s: broker shows no position but the fills journal does", key)
                 if not await self._close_unreported_exit(key, meta, since, now):
+                    continue
+            elif sold and not closed and self._open_qty.get(key, 0.0) > EPS:
+                # The watchdog's sale fell on an earlier day IBKR no longer reports: journal
+                # the bot's lot at an estimate before forgetting the meta, so the next trip
+                # in the symbol is not paired with it.
+                since = self._mismatch_logged.setdefault(key, now)
+                if not await self._close_unreported_exit(key, meta, since, now, True):
                     continue
             self._mismatch_logged.pop(key, None)
             for order in open_orders:
