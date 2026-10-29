@@ -749,9 +749,13 @@ Owner decision (2026-10-23): **a BUY goes out only when Claude AND Grok both agr
   `output_text` parts of `message` items; a `refusal` part or `incomplete_details.reason ==
   "content_filter"` → `refused`; any other incomplete/failed status, no text, or text that
   fails `ModelDecisions` validation → error, no decisions; then `convert_decisions` (same
-  validation as Claude). Retries: 408/409/429/5xx and connection errors, at most 2 retries,
-  `Retry-After` honoured (capped 20 s), else 1 s / 2 s; timeouts are not retried. Remaining
-  transient failures → the fallback maker's CLOSEs only; other 4xx → error, no decisions.
+  validation as Claude). Retries: 408/409/429/5xx and errors before the request reached xAI
+  (connect, write), at most 2 retries, `Retry-After` honoured (capped 20 s), else 1 s / 2 s;
+  timeouts are not retried. An answer lost after xAI had the request (a read timeout, a
+  connection dropped while waiting: `ReadError`, `RemoteProtocolError`) is not resent and
+  is charged the worst-case estimate; a call cancelled by Stop or shutdown while a POST is
+  out leaves it in `take_abandoned_cost()`, as Claude does. Remaining transient failures →
+  the fallback maker's CLOSEs only; other 4xx → error, no decisions.
   Cost from `usage` (Responses or Chat field names): cached prompt tokens at the cached
   price; billed output = `total_tokens - input_tokens` when `total_tokens` is reported
   (covers reasoning tokens either way), else output + reasoning; a 2xx answer without usable
@@ -837,11 +841,16 @@ Contracts changed by the confirmed review findings (each has a regression test).
   inside `_entry_lock`, tracks halts, re-prices a model-less entry at the fresh ask and
   runs `size_entry`/`check` with `now` = send time. It blocks while a halt is being
   confirmed and when positions_meta exists for the instrument (an entry in flight or a
-  position still held). A BUY whose context is older than `DECISION_MAX_AGE` (3 min) is
+  position still held), and when the symbol is no longer in the current settings' universe
+  (the owner removed it while the models thought; a scanner mover of the cycle stays
+  allowed while dynamic movers are on). A HOLD never claims its symbol in a batch, so a
+  model may HOLD one setup and BUY another of the same symbol. A BUY whose context is older
+  than `DECISION_MAX_AGE` (3 min) is
   dropped ("decision too old"); the reviewers' 2 x `monitor_seconds` would drop most LLM
   answers, and the fresh re-check already covers the entry window, halts and the collar.
 - **AI CLOSE** (ENG-3): refused for positions without positions_meta (journal BLOCKED "not
-  opened by the bot"); such positions alone are not worth an LLM call; the prompt marks a
+  opened by the bot"); such positions alone are not worth an LLM call, nor is a bot stock
+  held while its market is closed (its CLOSE is deferred to the open); the prompt marks a
   position without a stop "not opened by the bot: never CLOSE". An owner-approved pending
   CLOSE is unaffected.
 - **Re-protect** (ENG-4): `_reprotect` subtracts the unfilled quantity of this app's working

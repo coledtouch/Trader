@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections.abc import Callable
@@ -305,6 +306,68 @@ async def test_timeout_is_not_retried() -> None:
     batch = await m.decide(base_ctx())
     assert len(server.requests) == 1 and sleeps == []
     assert "timed out" in (batch.error or "") and fallback.calls == 1
+
+
+@pytest.mark.parametrize(
+    "exc", [httpx.ReadTimeout("slow"), httpx.ReadError("reset"), httpx.RemoteProtocolError("eof")]
+)
+async def test_an_answer_lost_after_xai_had_the_request_is_charged_and_not_resent(exc) -> None:
+    """Review finding: a read timeout or a connection dropped while xAI was answering cost
+    $0 against the daily AI budget, and a dropped connection sent the same request 3 times."""
+    server = Server(exc)
+    fallback = FakeFallback(DecisionBatch(maker="rules"))
+    m, sleeps = maker(server, fallback)
+    ctx = base_ctx()
+    batch = await m.decide(ctx)
+    assert len(server.requests) == 1 and sleeps == []
+    assert batch.cost_usd == pytest.approx(m._estimate(render_context(ctx)).cost)
+    assert batch.output_tokens == MAX_OUTPUT_TOKENS and batch.input_tokens > 0
+    assert "estimated" in (batch.error or "") and fallback.calls == 1
+
+
+@pytest.mark.parametrize("exc", [httpx.ConnectError("refused"), httpx.ConnectTimeout("slow")])
+async def test_a_request_that_never_reached_xai_costs_nothing(exc) -> None:
+    m, _ = maker(Server(exc))
+    batch = await m.decide(base_ctx())
+    assert batch.cost_usd == 0 and batch.output_tokens == 0
+
+
+async def test_a_call_cut_off_while_xai_answers_leaves_its_estimate_for_the_engine() -> None:
+    """Review finding: Stop or shutdown during a Grok call charged nothing."""
+    asked = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        asked.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    m = GrokDecisionMaker(KEY, "grok-4.7", FakeFallback(), client=client)
+    ctx = base_ctx()
+    task = asyncio.create_task(m.decide(ctx))
+    await asyncio.wait_for(asked.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert m.take_abandoned_cost() == pytest.approx(m._estimate(render_context(ctx)).cost)
+    assert m.take_abandoned_cost() == 0
+
+
+async def test_a_call_cut_off_between_retries_costs_nothing() -> None:
+    waiting = asyncio.Event()
+
+    async def sleep(seconds: float) -> None:
+        waiting.set()
+        await asyncio.Event().wait()
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(Server(error(503))))
+    m = GrokDecisionMaker(KEY, "grok-4.7", FakeFallback(), client=client, sleep=sleep)
+    task = asyncio.create_task(m.decide(base_ctx()))
+    await asyncio.wait_for(waiting.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert m.take_abandoned_cost() == 0
 
 
 @pytest.mark.parametrize("code", [400, 401, 403, 404, 422])

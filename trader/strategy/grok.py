@@ -17,8 +17,11 @@ Failure handling mirrors the Claude maker (fail safe, never a BUY on a failure):
 - cut off, unparseable or schema-invalid output, other 4xx errors, unexpected exceptions:
   ``error`` set, no decisions.
 - transient errors (connection errors, timeouts, 408/409/429, 5xx): 408/409/429/5xx and
-  connection errors are retried up to MAX_RETRIES times (honouring ``Retry-After``); what
-  remains returns the fallback maker's CLOSE decisions only.
+  errors before the request reached xAI are retried up to MAX_RETRIES times (honouring
+  ``Retry-After``); what remains returns the fallback maker's CLOSE decisions only. An answer
+  lost after xAI had the request (a read timeout, a dropped connection) is not resent and is
+  charged a worst-case estimate, as is a call cut off by Stop or shutdown
+  (``take_abandoned_cost``): the daily AI budget must not under-count.
 The API key only ever travels in the Authorization header; it is never logged, journaled
 or kept in a readable attribute, and error text is scrubbed of it.
 """
@@ -193,6 +196,10 @@ def read_response(body: Any) -> GrokReply:
 class _Transient(Exception):
     """Rate limit, server or connection error that remained after the retries."""
 
+    def __init__(self, message: str, *, sent: bool = False) -> None:
+        super().__init__(message)
+        self.sent = sent  # xAI had the request and its answer was lost: probably billed
+
 
 class _Permanent(Exception):
     """Any other request failure (4xx, a non-JSON body)."""
@@ -239,6 +246,7 @@ class GrokDecisionMaker:
         self._timeout = httpx.Timeout(REQUEST_TIMEOUT_S, connect=CONNECT_TIMEOUT_S)
         self._client = client or httpx.AsyncClient(timeout=self._timeout, follow_redirects=False)
         self._sleep = sleep
+        self._abandoned_cost = 0.0  # see take_abandoned_cost
 
     async def decide(self, ctx: DecisionContext) -> DecisionBatch:
         try:
@@ -247,18 +255,27 @@ class GrokDecisionMaker:
             log.exception("could not render the decision context")
             return self._failed(ctx, f"could not render context: {type(exc).__name__}")
         path, payload = build_request(self.model, SYSTEM_PROMPT, user_text)
+        in_flight: list[bool] = []
         try:
-            body = await self._post(path, payload)
+            body = await self._post(path, payload, in_flight)
+        except asyncio.CancelledError:
+            if in_flight:  # cut off by Stop or shutdown while xAI had it: billed, never journaled
+                self._abandoned_cost += self._estimate(user_text).cost
+            raise
         except _Transient as exc:
             error = self._scrub(str(exc))
             log.warning("Grok request failed: %s", error)
+            spend = self._estimate(user_text) if exc.sent else _Spend(self.model, 0, 0, 0.0)
             return await exits_only(
                 ctx,
                 maker=self.name,
                 model=self.model,
                 label="Grok",
                 fallback=self.fallback,
-                error=error,
+                error=f"{error}; tokens and cost are estimated" if exc.sent else error,
+                prompt_tokens=spend.prompt_tokens,
+                output_tokens=spend.output_tokens,
+                cost=spend.cost,
             )
         except _Permanent as exc:
             error = self._scrub(str(exc))
@@ -279,22 +296,37 @@ class GrokDecisionMaker:
             log.exception("could not process Grok response")
             return self._failed(ctx, f"could not process response: {type(exc).__name__}")
 
+    def take_abandoned_cost(self) -> float:
+        """The estimated cost of calls cancelled while xAI had them (Stop, shutdown). They
+        journal no batch, so the engine adds this to the day's AI spend. Resets it."""
+        cost, self._abandoned_cost = self._abandoned_cost, 0.0
+        return cost
+
     # ------------------------------------------------------------------ HTTP
-    async def _post(self, path: str, payload: dict[str, Any]) -> Any:
-        """POST with retries for 408/409/429/5xx and connection errors. Returns the JSON
-        body of a 2xx answer; raises _Transient or _Permanent otherwise."""
+    async def _post(self, path: str, payload: dict[str, Any], in_flight: list[bool]) -> Any:
+        """POST with retries for 408/409/429/5xx and errors before the request reached xAI.
+        Returns the JSON body of a 2xx answer; raises _Transient or _Permanent otherwise.
+        in_flight holds True while a POST is out."""
         url = self._base_url + path
         headers = {"Authorization": f"Bearer {self._key.get_secret_value()}"}
         error = "no attempt made"
         for attempt in range(MAX_RETRIES + 1):
             delay = min(RETRY_BASE_DELAY_S * 2**attempt, RETRY_MAX_DELAY_S)
+            in_flight[:] = [True]
             try:
                 resp = await self._client.post(
                     url, json=payload, headers=headers, timeout=self._timeout
                 )
-            except httpx.TimeoutException as exc:
-                # A 90 s timeout is not retried: a decision that late would be stale.
+            except httpx.ReadTimeout:
+                # xAI had the request and is still answering: billed, and not retried (a
+                # decision that late would be stale).
+                raise _Transient("request timed out (ReadTimeout)", sent=True) from None
+            except httpx.TimeoutException as exc:  # connect, pool or write: never reached xAI
                 raise _Transient(f"request timed out ({type(exc).__name__})") from None
+            except (httpx.ReadError, httpx.RemoteProtocolError) as exc:
+                # Dropped while waiting for the answer: xAI may be answering (and billing)
+                # it, so it is not sent again.
+                raise _Transient(f"connection lost ({type(exc).__name__})", sent=True) from None
             except httpx.TransportError as exc:
                 error = f"connection error ({type(exc).__name__})"
             else:
@@ -309,6 +341,7 @@ class GrokDecisionMaker:
                 if resp.status_code not in RETRY_STATUS and resp.status_code < 500:
                     raise _Permanent(error)
                 delay = _retry_after(resp, delay)
+            in_flight.clear()
             if attempt < MAX_RETRIES:
                 log.info("Grok request failed (%s); retry %d in %.1fs", error, attempt + 1, delay)
                 await self._sleep(delay)

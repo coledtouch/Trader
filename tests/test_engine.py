@@ -763,6 +763,38 @@ class SlowMaker(FakeDecisionMaker):
         return await super().decide(ctx)
 
 
+def _owner_saves(h: H, **update):
+    async def during(ctx: DecisionContext) -> None:
+        h.clock.advance(seconds=40)
+        h.db.save_settings(h.db.get_settings().model_copy(update=update))
+        h.engine.reload_settings()
+
+    return during
+
+
+async def test_a_symbol_removed_from_the_universe_while_deciding_is_not_bought(db, config) -> None:
+    """Review finding: the owner took F out of the universe (bad news) while the models
+    thought, and the BUY F they returned was still sent."""
+    h = await harness(db, config, autopilot=True)
+    maker = SlowMaker(_owner_saves(h, stock_universe=["T"]))
+    maker.decisions = [buy()]
+    h.engine._decider = maker
+    await h.engine.run_cycle()
+    assert not [r for r in h.broker.placed if r.side == Side.BUY]
+    [blocked] = h.orders(OrderStatus.BLOCKED)
+    assert "removed from the universe" in (blocked.message or "")
+
+
+async def test_a_mover_is_still_bought_after_an_unrelated_settings_save(db, config) -> None:
+    h = await harness(db, config, autopilot=True, stock_universe=["T"], dynamic_universe=True)
+    h.broker.movers = ["F"]
+    maker = SlowMaker(_owner_saves(h, llm_min_candidate_score=0.4))
+    maker.decisions = [buy()]
+    h.engine._decider = maker
+    await h.engine.run_cycle()
+    assert [r.instrument.symbol for r in h.broker.placed if r.side == Side.BUY] == ["F"]
+
+
 async def test_entry_that_fills_during_the_llm_call_is_not_doubled(db, config) -> None:
     """ENG-1: the resting F entry fills while the models think and the monitor loop ticks.
     The context the models saw says F is not held, but the BUY is checked against the
@@ -2324,6 +2356,47 @@ async def test_llm_skipped_when_disabled_or_nothing_worth_it(db, config) -> None
     assert batch is not None and batch.maker == "rules"
     assert not h2.decider.calls
     assert h2.db.list_signals()[0].skip_reason == "score 0.30 < 0.50"
+
+
+async def test_a_hold_on_one_setup_does_not_block_a_buy_on_another(db, config) -> None:
+    """Review finding: a model answering per candidate line (HOLD F's extended breakout, BUY
+    F's VWAP reclaim) lost the BUY: the HOLD claimed F first, and the ledger said HOLD."""
+    h = await harness(db, config)
+    h.scanner.candidates["STK:F"] = [
+        cand(setup="orb_breakout", score=0.7),
+        cand(setup="vwap_reclaim", score=0.6),
+    ]
+    h.decider.decisions = [
+        hold("F").model_copy(update={"setup": "orb_breakout"}),
+        buy("F", setup="vwap_reclaim"),
+    ]
+    await h.engine.run_cycle()
+    assert [r.instrument.symbol for r in h.broker.placed if r.side == Side.BUY] == ["F"]
+    ledger = {s.setup: (s.taken, s.skip_reason) for s in db.list_signals()}
+    assert ledger["vwap_reclaim"][0] is True
+
+
+async def test_a_stock_held_overnight_is_not_worth_an_llm_call_until_the_open(db, config) -> None:
+    """Review finding: a bot-opened stock held overnight (crypto on, no flatten) made every
+    5-minute crypto-hours cycle call the models with nothing to decide, spending the next
+    session's AI budget before the open."""
+    h = await harness(db, config, trade_crypto=True, flatten_stocks_before_close=False)
+    h.decider.cost = 0.05
+    await enter_f(h)  # Wednesday 11:00 New York
+    h.scanner.candidates.clear()
+    h.decider.decisions = []
+    h.broker.set_price("BTC", 60000.0)
+    calls = len(h.decider.calls)
+    h.clock.t = datetime(2026, 10, 22, 4, 5, tzinfo=UTC)  # Thursday 00:05 New York
+    for _ in range(12):
+        batch = await h.engine.run_cycle()
+        assert batch is not None and batch.maker == "rules"
+        h.clock.advance(minutes=5)
+    assert len(h.decider.calls) == calls
+    assert h.day().llm_cost == 0
+    h.clock.t = datetime(2026, 10, 22, 13, 35, tzinfo=UTC)  # 09:35: the held stock counts
+    await h.engine.run_cycle()
+    assert len(h.decider.calls) == calls + 1
 
 
 class StalledMaker(FakeDecisionMaker):

@@ -421,6 +421,7 @@ class Engine:
         self._quoted_at: dict[str, datetime] = {}  # when each cached quote was fetched
         self._cycle_quote_scope: set[str] = set()
         self._cycle_quote_scope_at: datetime | None = None
+        self._cycle_movers: set[str] = set()  # scanner movers this cycle may buy (symbols)
         self._day: DayStats | None = None
         self._errors: dict[str, tuple[datetime, str]] = {}
         self._last_cycle_at: datetime | None = None
@@ -3030,12 +3031,14 @@ class Engine:
         stocks_open = stock_market_open(now)
         symbols: list[Instrument] = []
         dynamic_keys: set[str] = set()
+        mover_symbols: set[str] = set()
         if settings.trade_stocks and stocks_open:
             names = list(settings.stock_universe)
             if settings.dynamic_universe:
                 try:
                     movers = await self.broker.scan_movers(SCANNER_MOVERS)
                     names += movers
+                    mover_symbols = {s.strip().upper() for s in movers if s.strip()}
                     dynamic_keys = {
                         Instrument(symbol=s.strip().upper()).key for s in movers if s.strip()
                     }
@@ -3073,8 +3076,21 @@ class Engine:
             out = dict(list(out.items())[:MAX_QUOTE_STREAMS])
         self._cycle_quote_scope = set(out) & dynamic_keys
         self._cycle_quote_scope_at = now
+        self._cycle_movers = mover_symbols  # kept across a settings save, unlike the scope
         self._prune_quote_cache(now)
         return list(out.values())
+
+    def _in_universe(self, inst: Instrument) -> bool:
+        """Whether the current settings still let the bot buy inst: in the owner's lists,
+        or a scanner mover of this cycle while dynamic movers are on."""
+        s = self.settings
+        if inst.asset_class == AssetClass.STOCK:
+            allowed = {x.strip().upper() for x in s.stock_universe}
+            if s.dynamic_universe:
+                allowed |= self._cycle_movers
+        else:
+            allowed = {x.strip().upper() for x in s.crypto_universe}
+        return inst.symbol.strip().upper() in allowed
 
     def _log_skip_once(self, symbol: str, reason: str) -> None:
         if (symbol, reason) not in self._skip_logged:
@@ -3205,8 +3221,14 @@ class Engine:
             return self.rules, why, entries
         threshold = self.settings.llm_min_candidate_score
         managed = self.db.all_position_meta()  # positions the owner holds are not managed
+        # A stock held while its market is closed is not worth a call: nothing can be done
+        # for it until the open (its CLOSE is deferred), and overnight calls on crypto hours
+        # would spend the next session's budget.
         worth = any(c.score >= threshold for c in ctx.candidates) or any(
-            p.qty > 0 and p.instrument.key in managed for p in ctx.positions
+            p.qty > 0
+            and p.instrument.key in managed
+            and (p.instrument.asset_class != AssetClass.STOCK or ctx.stock_market_open)
+            for p in ctx.positions
         )
         if not worth:
             return self.rules, "no candidate worth an LLM call", entries
@@ -3379,6 +3401,11 @@ class Engine:
         for decision in batch.decisions:
             symbol = decision.symbol.strip().upper()
             inst = Instrument(symbol=symbol, asset_class=decision.asset_class)
+            if decision.action == TradeAction.HOLD:
+                # Does nothing, so it never claims the instrument: a model may HOLD one
+                # setup of a symbol and BUY another.
+                holds.setdefault(inst.key, decision.rationale)
+                continue
             if inst.key in seen:
                 log.info("ignoring a second decision for %s in one batch", inst.key)
                 continue
@@ -3388,10 +3415,8 @@ class Engine:
                     outcomes[inst.key] = await self._handle_buy(
                         decision, inst, batch, ctx, placed, now
                     )
-                elif decision.action == TradeAction.CLOSE:
-                    await self._handle_close(decision, inst, batch, ctx, now)
                 else:
-                    holds[inst.key] = decision.rationale
+                    await self._handle_close(decision, inst, batch, ctx, now)
             except BrokerError as exc:
                 log.warning("decision for %s failed: %s", inst.key, exc)
                 self._set_error("decision", f"{inst.symbol}: {exc}")
@@ -3497,6 +3522,8 @@ class Engine:
             reasons = list(verdict.reasons) if not verdict.approved else []
             if self._halt_pending is not None:
                 reasons.append(f"halt condition being confirmed: {self._halt_pending}")
+            if not self._in_universe(inst):  # the owner removed it while the models thought
+                reasons.append(f"{inst.symbol} was removed from the universe")
             if not reasons and self.db.get_position_meta(key) is not None:
                 # Metadata is written before every entry is sent and removed only once the
                 # position is flat: an entry is in flight or the position is still held.
