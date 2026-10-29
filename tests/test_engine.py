@@ -16,7 +16,14 @@ from pydantic import SecretStr
 from trader.broker.base import Broker, BrokerError
 from trader.config import AppConfig
 from trader.db import Database
-from trader.engine import NOTIFY_WAIT_S, Engine, build_engine, replay_fills, score_signal
+from trader.engine import (
+    NOTIFY_WAIT_S,
+    UNCHECKED_STOP_GRACE,
+    Engine,
+    build_engine,
+    replay_fills,
+    score_signal,
+)
 from trader.models import (
     OPEN_ORDER_STATUSES,
     AccountSnapshot,
@@ -2983,6 +2990,68 @@ async def test_no_position_is_managed_before_the_fills_of_a_new_connection_are_j
     assert "monitor:exits" not in h.engine._errors
 
 
+def _owner_buys(h: H, symbol: str, qty: float, price: float) -> None:
+    """The owner buys in IBKR Mobile: a fill under another client's id."""
+    inst = Instrument(symbol=symbol)
+    h.broker.fills.append(
+        Fill(exec_id=f"X{symbol}{qty}", broker_order_id="perm:1", instrument=inst,
+             side=Side.BUY, qty=qty, price=price, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    h.broker.pos[inst.key] = [qty, price]
+    h.broker.cash -= qty * price
+
+
+async def test_an_entry_row_the_journal_has_not_refreshed_does_not_keep_old_metadata(
+    db, config
+) -> None:
+    """Review finding (regression): the bot's limit entry was resting when the gateway
+    dropped; meanwhile it filled, its stop sold it, and the owner bought F. On the first
+    tick back, the entry's journal row still said SUBMITTED, so the bot's position counted
+    as unfinished and its stop was re-placed on the owner's 50 shares (and sold them)."""
+    h = await harness(db, config)
+    b = h.broker
+    entry, _ = await _resting_entry(h)
+    limit = b.orders[entry].request.limit_price
+    b._connected = False  # the gateway drops
+    h.clock.advance(minutes=2)
+    b.set_price("F", limit - 0.01)  # the entry fills
+    h.clock.advance(minutes=2)
+    b.set_price("F", 9.7)  # its bracket stop fills
+    h.clock.advance(minutes=5)
+    _owner_buys(h, "F", 50, 9.7)
+    sells = len([r for r in b.placed if r.side == Side.SELL])
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()  # reconnects
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    assert len([r for r in b.placed if r.side == Side.SELL]) == sells
+    assert b.pos["STK:F"][0] == 50.0
+
+
+async def test_no_decision_is_made_before_the_fills_of_a_new_connection_are_journaled(
+    db, config
+) -> None:
+    """Review finding: the journal gate stopped the monitor's exits, but the decision cycle
+    still ran on the stale metadata, and an AI CLOSE sold the owner's shares."""
+    h = await harness(db, config)
+    await enter_f(h)
+    h.clock.advance(minutes=5)
+    h.broker.set_price("F", 9.7)  # the bracket stop fills while the app is down
+    h.clock.advance(minutes=20)
+    _owner_buys(h, "F", 50, 9.7)
+    h.broker._connected = False
+    h.broker.fail.add("fills_since")
+    h.decider.decisions = [
+        AIDecision(action=TradeAction.CLOSE, symbol="F", asset_class=AssetClass.STOCK,
+                   conviction=0.9, rationale="below the stop")
+    ]  # fmt: skip
+    calls = len(h.decider.calls)
+    h.clock.advance(minutes=1)
+    assert await h.engine.run_cycle() is None
+    assert len(h.decider.calls) == calls
+    assert h.broker.pos["STK:F"][0] == 50.0
+
+
 _BTC = Instrument(symbol="BTC", asset_class=AssetClass.CRYPTO)
 
 
@@ -3068,7 +3137,8 @@ async def test_a_watchdog_sale_on_an_earlier_day_closes_the_bots_lot(db, config)
 async def test_an_unchecked_crypto_stop_lets_the_watchdog_take_over(db, config) -> None:
     """Review finding: with the BTC quote failing (IBKR 10197 while the owner's app holds
     the data), the engine skipped its BTC stop without a word and still refreshed the
-    heartbeat, so the crypto watchdog never took over."""
+    heartbeat, so the crypto watchdog never took over. A short gap (a phone check) must not
+    hand over, though: the watchdog shares the gateway and could only flatten blind."""
     h = await _hold_btc(db, config, datetime(2026, 10, 29, 15, 0, tzinfo=UTC))
     quote = h.broker.quote
 
@@ -3078,12 +3148,20 @@ async def test_an_unchecked_crypto_stop_lets_the_watchdog_take_over(db, config) 
         return await quote(inst)
 
     h.broker.quote = no_btc_data
-    beat = read_heartbeat(db)
-    for _ in range(4):
+    for _ in range(12):  # three minutes: still checked as far as the watchdog knows
         h.clock.advance(seconds=15)
         await h.engine.monitor_tick()
-    assert read_heartbeat(db) == beat  # stale: the watchdog's stale-heartbeat rules apply
+        assert read_heartbeat(db) == h.clock()
+    beat = read_heartbeat(db)
+    for _ in range(32):  # past the grace: the heartbeat stays where it was
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    assert read_heartbeat(db) < beat + UNCHECKED_STOP_GRACE
     assert "no usable quote" in h.engine._errors["monitor:exits"][1]
+    h.broker.quote = quote  # the data is back
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert read_heartbeat(db) == h.clock()
 
 
 async def test_signal_ledger_dedupes_repeated_setups(db, config) -> None:

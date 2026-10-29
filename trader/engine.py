@@ -160,6 +160,9 @@ LEDGER_RETRY = timedelta(hours=1)  # wait before re-requesting bars that were mi
 CRYPTO_HORIZON = timedelta(hours=24)
 FETCH_CONCURRENCY = 4
 NOTIFY_WAIT_S = 1.0  # longest a trading path waits for an alert to go out
+# An engine-only stop (crypto) without a usable quote for this long fails the exits check,
+# so the heartbeat goes stale and the crypto watchdog takes over.
+UNCHECKED_STOP_GRACE = timedelta(minutes=10)
 SHUTDOWN_TICK_WAIT = 20.0  # s shutdown waits for a tick under way (compose grace: 30 s)
 FIRST_CYCLE_DELAY = 5.0
 MAX_BACKOFF = 120.0
@@ -445,6 +448,8 @@ class Engine:
         self._fills_journaled_at: datetime | None = None
         self._last_exit: dict[str, datetime] | None = None
         self._bot_exit: dict[str, datetime] | None = None  # last journaled bot trade's exit
+        self._entry_buys: set[str] | None = None  # working app entries in the last broker read
+        self._unchecked_since: dict[str, datetime] = {}  # engine-only stops without a quote
         self._open_qty: dict[str, float] = {}
         self._pending_trades: set[str] = set()
 
@@ -1616,6 +1621,8 @@ class Engine:
             armed = self._reprotect_armed  # likewise for re-protect armed after the reads
             raw_positions = await self.broker.positions()
             open_orders = await self.broker.open_orders()
+            # Which app entries are working, from the broker (journal rows may be stale here).
+            self._entry_buys = self._working_buys(open_orders)
             if self._fills_journaled_at is None:
                 # First tick on this connection: journal what filled while the app was down
                 # before managing anything, so a bot position that closed meanwhile is not
@@ -2275,10 +2282,18 @@ class Engine:
                 continue  # stock orders cannot execute now; broker stops still protect
             if mark is None:
                 if not self.broker.supports_native_stops(pos.instrument):
-                    # Nothing else enforces this position's stop (crypto): a failed check,
-                    # so the heartbeat stays stale and the crypto watchdog can take over.
-                    failures.append(f"{key}: no usable quote, its stop was not checked")
+                    # Nothing else enforces this position's stop (crypto). A short gap (the
+                    # owner's IBKR Mobile taking the data, 10197) keeps the heartbeat: the
+                    # watchdog shares the gateway and could only flatten blind. A lasting
+                    # one fails the check, so the heartbeat goes stale and it takes over.
+                    since = self._unchecked_since.setdefault(key, now)
+                    if now - since >= UNCHECKED_STOP_GRACE:
+                        minutes = (now - since).total_seconds() / 60
+                        failures.append(
+                            f"{key}: no usable quote for {minutes:.0f} min, stop not checked"
+                        )
                 continue
+            self._unchecked_since.pop(key, None)
             try:
                 await self._manage_one(
                     pos,
@@ -2293,6 +2308,8 @@ class Engine:
                 failures.append(f"{key}: {exc}")
         # A breach must be seen on consecutive ticks; anything not seen this tick restarts.
         self._breaches = {k: v for k, v in self._breaches.items() if k in breached}
+        held = {p.instrument.key for p in positions if p.qty > 0}
+        self._unchecked_since = {k: v for k, v in self._unchecked_since.items() if k in held}
         if failures:
             raise BrokerError("; ".join(failures))
 
@@ -2797,7 +2814,10 @@ class Engine:
         """The bot's entry for `key` is still working, or one of its own buys filled after
         the journaled exit (a partly filled entry whose filled part was sold by its
         bracket): the position is not finished."""
-        if any(
+        if self._entry_buys is not None:  # the broker's open orders of the latest tick
+            if key in self._entry_buys:
+                return True
+        elif any(  # no broker read yet: the journal's view
             o.request.instrument.key == key and o.request.side == Side.BUY and not o.request.is_exit
             for o in self.db.list_orders(limit=200, statuses=OPEN_ORDER_STATUSES)
         ):
@@ -3180,6 +3200,11 @@ class Engine:
                 log.info("cycle skipped: halt condition being confirmed (%s)", self._halt_pending)
                 return None
             if not self.broker.connected or self._account is None:
+                return None
+            if self._fills_journaled_at is None:
+                # As for exits: no decision (a CLOSE above all) on metadata that may describe
+                # a bot position that closed while the app was down.
+                log.info("cycle skipped: fills since the (re)connect not journaled yet")
                 return None
             universe = await self._universe(now)
             if not universe:
@@ -3864,10 +3889,16 @@ class Engine:
         if inst.asset_class == AssetClass.STOCK and not stock_market_open(now):
             log.info("CLOSE %s deferred: the stock market is closed", inst.key)
             return
-        if self.db.get_position_meta(inst.key) is None:
+        meta = self.db.get_position_meta(inst.key)
+        if (
+            meta is None
+            or sold_by_watchdog(self.db, inst.key, meta)
+            or self._meta_used(inst.key, meta)
+        ):
             # The engine never manages positions it did not open on this account (the
-            # owner's own holdings, or positions forgotten after an account change). The
-            # owner can still close them at the broker.
+            # owner's own holdings, a bot position that already closed, or positions
+            # forgotten after an account change). The owner can still close them at the
+            # broker.
             log.warning("CLOSE %s refused: the bot did not open this position", inst.key)
             self._journal_order(
                 OrderRecord(
