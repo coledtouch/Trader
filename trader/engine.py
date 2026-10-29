@@ -157,6 +157,7 @@ LEDGER_GIVE_UP = timedelta(days=5)
 LEDGER_RETRY = timedelta(hours=1)  # wait before re-requesting bars that were missing
 CRYPTO_HORIZON = timedelta(hours=24)
 FETCH_CONCURRENCY = 4
+SHUTDOWN_TICK_WAIT = 30.0  # seconds shutdown waits for a monitor tick under way
 FIRST_CYCLE_DELAY = 5.0
 MAX_BACKOFF = 120.0
 EPS = 1e-9
@@ -459,6 +460,7 @@ class Engine:
         self._fallback_logged: str | None = None
         self._last_ledger_at: datetime | None = None
         self._ledger_task: asyncio.Task[None] | None = None  # a signal-ledger pass running
+        self._start_gen = 0  # start()/stop() calls: the latest one decides
         # consecutive monitor ticks that saw an engine-side exit / a daily halt condition
         # instrument -> (kind, ticks, first seen)
         self._breaches: dict[str, tuple[str, int, datetime]] = {}
@@ -832,9 +834,15 @@ class Engine:
         monitor loop."""
         if self._decision_task is not None and not self._decision_task.done():
             return
+        self._start_gen += 1
+        gen = self._start_gen
         self._running = True
         self.db.set_flag("engine_running", True)
         await self._start_monitor()
+        if gen != self._start_gen or (
+            self._decision_task is not None and not self._decision_task.done()
+        ):
+            return  # a stop() (or a later start()) came in while connecting: it wins
         self._decision_task = asyncio.create_task(self._decision_loop(), name="engine-decision")
         log.info("engine started (%s, %s)", self.broker.name, self.broker.mode.value)
 
@@ -871,13 +879,23 @@ class Engine:
         """Stop everything and disconnect (app shutdown). Broker-side stops remain, and the
         persisted running flag is kept so a restart resumes the previous state."""
         await self._stop_decisions()
-        for name in ("_monitor_task", "_ledger_task"):
-            task = getattr(self, name)
-            setattr(self, name, None)
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
+        # A monitor tick under way (a halt's flatten, the journal) finishes first, within
+        # bounds; holding the lock, no new one starts while the tasks are cancelled.
+        locked = False
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._monitor_lock.acquire(), SHUTDOWN_TICK_WAIT)
+            locked = True
+        try:
+            for name in ("_monitor_task", "_ledger_task"):
+                task = getattr(self, name)
+                setattr(self, name, None)
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+        finally:
+            if locked:
+                self._monitor_lock.release()
         try:
             await self.broker.disconnect()
         except Exception as exc:
@@ -885,6 +903,7 @@ class Engine:
         log.info("engine shut down (broker-side stops remain in place)")
 
     async def _stop_decisions(self) -> None:
+        self._start_gen += 1  # a start() still connecting must not start the decisions
         self._running = False
         task, self._decision_task = self._decision_task, None
         self._next_cycle_at = None
@@ -1166,15 +1185,16 @@ class Engine:
         quote = None if req.is_exit else await self.broker.quote(req.instrument)
         if quote is not None:
             self._track_halt(req.instrument.key, quote, self._now())
-        account = await self.broker.account()
-        positions = await self.broker.positions()
-        open_orders = await self.broker.open_orders()
         async with self._entry_lock:
             rec = self._pending(order_id)  # rejected (or already sent) while prices loaded
             now = self._now()
             if now - _aware(rec.created_at) >= APPROVAL_TTL:
                 self._expire(rec)
                 return self._get_order(order_id)
+            # Read under the lock: another approval or a cycle may have sent an entry.
+            account = await self.broker.account()
+            positions = await self.broker.positions()
+            open_orders = await self.broker.open_orders()
             req = rec.request
             day = self._today(now)
             verdict = None
@@ -2938,7 +2958,14 @@ class Engine:
         """One decision cycle. Returns the journaled batch, or None when skipped (halted,
         disconnected, or nothing tradable now). Raises BrokerError when the broker is down."""
         async with self._cycle_lock:
-            await self.monitor_tick()  # fresh account, positions, fills and halts
+            # Fresh account, positions, fills and halts. Shielded: stop() cancelling the cycle
+            # must not cut a halt's flatten or the journal off halfway.
+            tick = asyncio.ensure_future(self.monitor_tick())
+            try:
+                await asyncio.shield(tick)
+            except asyncio.CancelledError:
+                tick.add_done_callback(lambda t: t.cancelled() or t.exception())  # logged there
+                raise
             now = self._now()
             self._last_cycle_at = now
             day = self._today(now)

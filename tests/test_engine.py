@@ -3822,6 +3822,132 @@ async def test_the_halt_cooldown_survives_a_restart(db, config) -> None:
     assert not [r for r in h.broker.placed if r.side == Side.BUY]
 
 
+def _slow_connect(h) -> asyncio.Event:
+    gate, connect = asyncio.Event(), h.broker.connect
+
+    async def slow():
+        await gate.wait()  # e.g. the IB Gateway handshake, or a reconnect holding the lock
+        await connect()
+
+    h.broker.connect = slow
+    return gate
+
+
+def _decision_tasks() -> list[asyncio.Task]:
+    return [t for t in asyncio.all_tasks() if t.get_name() == "engine-decision" and not t.done()]
+
+
+async def test_stop_while_start_connects_wins(db, config) -> None:
+    """Review finding: Stop pressed while Start was still connecting cancelled nothing, and
+    the decision loop Start created afterwards kept trading while the dashboard showed the
+    bot stopped, with no way to stop it."""
+    h = await harness(db, config)
+    await h.broker.disconnect()
+    gate = _slow_connect(h)
+    start = asyncio.create_task(h.engine.start())
+    for _ in range(5):
+        await asyncio.sleep(0)
+    await h.engine.stop()
+    gate.set()
+    await start
+    try:
+        assert not h.engine.status().running
+        assert _decision_tasks() == []
+    finally:
+        await h.engine.shutdown()
+
+
+async def test_two_starts_while_connecting_make_one_decision_loop(db, config) -> None:
+    h = await harness(db, config)
+    await h.broker.disconnect()
+    gate = _slow_connect(h)
+    starts = [asyncio.create_task(h.engine.start()) for _ in range(2)]
+    for _ in range(5):
+        await asyncio.sleep(0)
+    gate.set()
+    await asyncio.gather(*starts)
+    try:
+        assert len(_decision_tasks()) == 1
+        await h.engine.stop()
+        assert _decision_tasks() == []
+    finally:
+        await h.engine.shutdown()
+
+
+def _slow_cancel_all(h) -> tuple[asyncio.Event, asyncio.Event]:
+    """IBKR's cancel_all sends a global cancel, then waits (up to 5 s) for confirmations."""
+    entered, gate, cancel_all = asyncio.Event(), asyncio.Event(), h.broker.cancel_all
+
+    async def slow():
+        await cancel_all()
+        entered.set()
+        await gate.wait()
+
+    h.broker.cancel_all = slow
+    return entered, gate
+
+
+async def _loss_halt_pending(h) -> None:
+    await enter_f(h)
+    h.broker.set_price("F", 9.85)  # above its 9.80 stop, past a 0.5% daily loss limit
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()  # seen once: pending
+    assert not h.day().halted and h.engine._halt_pending
+    h.clock.advance(seconds=15)
+
+
+async def test_stop_never_cuts_a_halts_flatten_short(db, config) -> None:
+    """Review finding: Stop cancelled the cycle while its monitor tick flattened on a loss
+    halt, after the stops were cancelled and before the sells: the position stayed open
+    for good (the halt is never re-flattened) and no alert went out."""
+    h = await harness(db, config, risk={"max_daily_loss_pct": 0.5})
+    await _loss_halt_pending(h)
+    entered, gate = _slow_cancel_all(h)
+    h.engine._decision_task = asyncio.create_task(h.engine.run_cycle())
+    await entered.wait()
+    await h.engine.stop()
+    gate.set()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if "STK:F" not in h.broker.pos:
+            break
+    assert "STK:F" not in h.broker.pos
+    assert "Trading halted" in h.notes.titles()
+
+
+async def test_shutdown_lets_a_halts_flatten_finish(db, config) -> None:
+    h = await harness(db, config, risk={"max_daily_loss_pct": 0.5})
+    await _loss_halt_pending(h)
+    entered, gate = _slow_cancel_all(h)
+    h.engine._monitor_task = asyncio.create_task(h.engine.monitor_tick())
+    await entered.wait()
+    asyncio.get_running_loop().call_later(0.05, gate.set)  # IBKR confirms the cancels
+    await h.engine.shutdown()
+    assert "STK:F" not in h.broker.pos
+    assert "Trading halted" in h.notes.titles()
+
+
+async def test_two_quick_approvals_respect_max_open_positions(db, config) -> None:
+    """Review finding: approvals read the account, positions and orders before waiting for
+    the entry lock, so two taps at once both passed max_open_positions (and cash)."""
+    h = await harness(db, config, autopilot=False, risk={"max_open_positions": 1})
+    h.scanner.candidates["STK:T"] = [cand("T", price=20.0, stop=19.6, target=21.0)]
+    h.decider.decisions = [buy("F"), buy("T")]
+    await h.engine.run_cycle()
+    pending = h.orders(OrderStatus.PENDING_APPROVAL)
+    read = h.broker.open_orders
+
+    async def open_orders():  # IBKR: a round trip
+        snapshot = await read()
+        await asyncio.sleep(0)
+        return snapshot
+
+    h.broker.open_orders = open_orders
+    h.clock.advance(seconds=20)
+    await asyncio.gather(*(h.engine.approve_order(o.id) for o in pending))
+    assert len(h.broker.pos) == 1
+
+
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:
     h = await harness(db, config)
     h.broker.standalone_stops = False

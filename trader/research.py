@@ -767,6 +767,7 @@ async def _replay_arm(
             warnings=warnings,
         )
     finally:
+        await engine._ledger_done()  # a pending scoring pass must not outlive its database
         await broker.disconnect()
         db.close()
 

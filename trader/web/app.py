@@ -968,7 +968,10 @@ def create_app(
     async def bot_start(request: Request, session: Session = Depends(require_csrf)) -> Any:
         st = state(request)
         await call_engine(request, "bot_start", st.engine.start())
-        st.db.set_flag("engine_running", True)  # a restart resumes the running state
+        # A restart resumes the running state; a Stop that came in while start() was
+        # connecting wins (the engine then no longer reports running).
+        if st.engine.status().running:
+            st.db.set_flag("engine_running", True)
         return engine_status(request)
 
     @app.post("/api/bot/stop")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -400,3 +401,20 @@ def test_cli_database_uses_latest_frozen_cohort_and_saves_dashboard_report(tmp_p
     db.close()
     assert main(["--database", str(path), "--arms", "rules"]) == 0
     assert json.loads(capsys.readouterr().out)["frame_count"] == 1
+
+
+async def test_a_replay_leaves_no_ledger_pass_behind(monkeypatch) -> None:
+    """Review finding: an arm's last monitor tick could leave a signal-ledger pass that ran
+    after the arm closed its database: ERROR tracebacks in the server log on every run."""
+    close, pending = Database.close, []
+
+    def closing(self) -> None:  # each arm closes its database when it is done
+        pending.extend(
+            t for t in asyncio.all_tasks() if t.get_name() == "engine-ledger" and not t.done()
+        )
+        close(self)
+
+    monkeypatch.setattr(Database, "close", closing)
+    frames = [frame(0), frame(10, decision=False), frame(20, decision=False)]
+    await replay_experiment(frames, settings(), slippage_bps=0)
+    assert pending == []
