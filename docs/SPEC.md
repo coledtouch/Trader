@@ -1145,7 +1145,9 @@ keeps its exits); more than that, and whose they are is unknown (the bot sells o
 fills show, and the owner is alerted).
 
 Evidence the owner bought is an owner buy in the window, more held than the entry asked
-for, or more held than the bot can still hold once the crypto watchdog's sales known to have
+for, or more held than the bot can still hold after its own sales (a partial exit leaves
+room under the entry's quantity; a sale of the app's of the last two minutes may not be in
+the position read yet and is not counted) or once the crypto watchdog's sales known to have
 filled are off (with the executions unread, also its sales still working, at what they
 asked: its IOC is done only on its next poll, and until then the rest held may be the
 owner's). Without it nothing changes: every exit sells the whole position, as before. With it,
@@ -1194,7 +1196,8 @@ IBKR says the bot's entry filled beyond the journal (an entry still working ther
 tag; or what the app saw filled of one it saw done; an approved entry by its send time, not
 its proposal's), less what it already sold of the position. Part of the entry the app last
 saw working that IBKR no longer lists (it filled, lapsed or was cancelled while the app was
-down), with less held than if all of it had filled next to the owner's units, is unknown: the watchdog sells only what is surely the bot's and alerts
+down), with what is held not what it would be had all of it filled next to the owner's
+units (less: it lapsed or the owner sold; more: the owner bought), is unknown: the watchdog sells only what is surely the bot's and alerts
 (urgent, "the bot's part unknown"). More held than the bot can still hold once its known (done)
 sales are off is the owner buying since: then it sells only the bot's part too. It never
 sells into the owner's journaled units when an exit of the app's may have sold the bot's

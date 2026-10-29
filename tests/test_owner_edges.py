@@ -807,3 +807,130 @@ async def test_an_entry_gone_after_filling_in_full_needs_no_alert(db: Database) 
     placed, sent = await _watchdog_outage(db, broker)
     assert placed == [BOT]
     assert "Crypto watchdog: the bot's part unknown" not in sent
+
+
+# ----------------------------------------------------------------------------- review 45
+async def _bot_sold_part(db, config, now: datetime | None = None):
+    """The bot's 24 F, 14 of them sold by its bracket target (journaled): 10 left."""
+    from tests.test_engine import _part
+
+    kwargs = {"now": now} if now is not None else {}
+    h = await harness(db, config, exits={"time_stop_minutes": 0}, **kwargs)
+    await enter_f(h)
+    [entry] = [oid for oid, k in h.broker.kind.items() if k == "entry"]
+    await ticks(h, 1)
+    _part(h.broker, f"{entry}-TP", 14, 10.5)
+    await ticks(h, 2)
+    assert h.broker.pos["STK:F"][0] == 10
+    return h, entry
+
+
+async def _executions_fail(since):
+    raise BrokerError("IBKR executions timed out after 10s")
+
+
+async def test_after_a_partial_exit_an_unseen_owner_buy_waits_for_the_read(db, config) -> None:
+    """The bot sold 14 of its 24 F; the owner buys 5 and the executions read fails: 15
+    held, under the entry's 24, but more than the bot's 10 left. Close sells nothing until
+    the read works, then only the bot's 10."""
+    h, _ = await _bot_sold_part(db, config)
+    owner_buys(h, F, 5, 10.4)
+    real = h.broker.fills_since
+    h.broker.fills_since = _executions_fail
+    with pytest.raises(BrokerError):
+        await h.engine.close_position("STK:F")
+    assert h.broker.pos["STK:F"][0] == 15
+    h.broker.fills_since = real
+    rec = await h.engine.close_position("STK:F")
+    assert rec.request.qty == 10
+
+
+async def test_after_a_partial_exit_the_flatten_waits_for_the_read(db, config) -> None:
+    h, _ = await _bot_sold_part(db, config)
+    owner_buys(h, F, 5, 10.4)
+    real = h.broker.fills_since
+    h.broker.fills_since = _executions_fail
+    h.clock.t = datetime(2026, 10, 21, 19, 51, tzinfo=UTC)
+    await h.engine.monitor_tick()
+    assert bot_sells(h, "STK:F") == []
+    assert h.broker.working("STK:F", "stop")
+    h.broker.fills_since = real
+    await ticks(h, 3, seconds=30)
+    assert bot_sells(h, "STK:F") == [10]
+
+
+async def test_after_a_partial_exit_an_owner_buy_on_an_unreported_day_is_his(db, config) -> None:
+    """Wednesday: the bot's target sold 14 of its 24 F; the owner buys 5 while the app is
+    down. Thursday IBKR reports only Thursday's executions: Close sells the bot's 10."""
+    h, _ = await _bot_sold_part(db, config, now=datetime(2026, 10, 28, 15, 0, tzinfo=UTC))
+    h.clock.t = datetime(2026, 10, 28, 19, 45, tzinfo=UTC)
+    owner_buys(h, F, 5, 10.4)
+    h.engine = _restart_next_morning(h, config)
+    await ticks(h, 2)
+    rec = await h.engine.close_position("STK:F")
+    assert rec.request.qty == 10
+
+
+async def test_a_bot_sale_the_position_read_does_not_show_yet_is_no_owner_buy(db, config) -> None:
+    """Pure bot: the target's 14 are journaled seconds ago, but the position read still
+    shows 24 (it lags). That is no evidence the owner bought: Close sells the bot's 10."""
+    from tests.test_engine import _part
+
+    h = await harness(db, config, exits={"time_stop_minutes": 0})
+    await enter_f(h)
+    [entry] = [oid for oid, k in h.broker.kind.items() if k == "entry"]
+    await ticks(h, 2)
+    _part(h.broker, f"{entry}-TP", 14, 10.5)
+    await ticks(h, 1, seconds=15)  # journaled
+    real = h.broker.positions
+    calls = {"n": 0}
+
+    async def lagging():
+        calls["n"] += 1
+        out = await real()
+        if calls["n"] <= 2:
+            return [p.model_copy(update={"qty": 24.0}) for p in out]
+        return out
+
+    h.broker.positions = lagging
+    rec = await h.engine.close_position("STK:F")
+    assert rec.request.qty == 10
+    assert "STK:F" not in h.broker.pos
+
+
+async def test_a_target_fill_during_the_sizing_reads_is_no_owner_buy(db, config) -> None:
+    """Pure bot: the target fills 14 between the cap's position read and its executions
+    read. Close still sells the bot's 10."""
+    from tests.test_engine import _part
+
+    h = await harness(db, config, exits={"time_stop_minutes": 0})
+    await enter_f(h)
+    [entry] = [oid for oid, k in h.broker.kind.items() if k == "entry"]
+    await ticks(h, 2)
+    real = h.broker.fills_since
+    raced = []
+
+    async def racing(since):
+        if not raced:
+            raced.append(True)
+            _part(h.broker, f"{entry}-TP", 14, 10.5)
+        return await real(since)
+
+    h.broker.fills_since = racing
+    rec = await h.engine.close_position("STK:F")
+    assert rec.request.qty == 10
+
+
+@pytest.mark.parametrize("journaled", [0.0, 0.004])
+@pytest.mark.parametrize("bought", [0.001, 0.1])
+async def test_an_entry_gone_in_the_outage_with_an_owner_buy_alerts(
+    db: Database, journaled: float, bought: float
+) -> None:
+    """The entry (journaled part `journaled` of 0.01) is gone at IBKR, and the owner (0.5
+    journaled) bought more in the outage: more is held than if it all filled. Whose coins
+    are left is unknown: only the sure part is sold, and the owner is told."""
+    broker = FakeBroker()
+    _entry_outage(db, broker, journaled=journaled, held=BOT + 0.5 + bought, working_filled=None)
+    placed, sent = await _watchdog_outage(db, broker)
+    assert placed == ([journaled] if journaled else [])
+    assert "Crypto watchdog: the bot's part unknown" in sent

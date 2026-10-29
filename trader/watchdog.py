@@ -320,7 +320,7 @@ class CryptoWatchdog:
         self._started_at = started if started.tzinfo else started.replace(tzinfo=UTC)
         self._below_stop: dict[str, int] = {}
         # This poll: bot positions where part of the bot's entry may have filled unseen,
-        # and less is held than if it all had (whose coins are left is unknown).
+        # and what is held is not what it would be if it all had (whose coins is unknown).
         self._unsure: set[str] = set()
         self._attempt_at: dict[str, datetime] = {}
         # Bot positions this process sold (key -> position_marker and the broker id of its
@@ -532,9 +532,9 @@ class CryptoWatchdog:
             split = dataclasses.replace(split, bot=split.bot + late, unseen=split.unseen - late)
         split = less_sold(split, sent)
         vanished = min(unknown, split.unseen)
-        if vanished > QTY_EPS and held < split.bot + split.owner + vanished - QTY_EPS:
-            # Less held than if all of it had filled: it lapsed, or the owner sold some of
-            # his meanwhile. Whose coins are left is unknown.
+        if vanished > QTY_EPS and abs(held - (split.bot + split.owner + vanished)) > QTY_EPS:
+            # Not what is held if all of it had filled: it lapsed, or the owner sold or
+            # bought some meanwhile. Whose coins are left is unknown.
             self._unsure.add(key)
         cap = sell_cap(held, limit, split, evidence=True)
         if cap is None:
@@ -758,9 +758,9 @@ class CryptoWatchdog:
                 (
                     UNKNOWN_PART_TITLE,
                     f"{unsure}: the bot's entry may have filled while the app was down, and "
-                    "less is held than that and your journaled coins would make (it lapsed, "
-                    "or you sold some). Whose coins are left is unknown: the watchdog sells "
-                    "only what is surely the bot's. Check the position in IBKR.",
+                    "what is held is not what that and your journaled coins would make (it "
+                    "lapsed, or you sold or bought some). Whose coins are left is unknown: "
+                    "the watchdog sells only what is surely the bot's. Check IBKR.",
                     "urgent",
                 )
             )

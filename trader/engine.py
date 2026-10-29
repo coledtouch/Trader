@@ -90,6 +90,7 @@ from trader.ownership import (
     app_sold_unjournaled,
     bought_since,
     entry_qty,
+    is_other_client,
     less_sold,
     merge_fills,
     owner_evidence,
@@ -2295,6 +2296,7 @@ class Engine:
             entry=limit,
             entry_sent=opened,
         )
+        base = split
         bought = False
         if sales is not None and bot_first is not None:
             # More held than the bot can still hold once the watchdog's sales known to
@@ -2310,6 +2312,21 @@ class Engine:
             # The watchdog's sales no fill shows (an earlier day IBKR no longer reports)
             # came out of the bot's units all the same.
             split = less_sold(split, unreported_sales(sales[1], fills, bot_first, bot_until))
+        if not bought:
+            # More held than the bot can still hold after its own sales (a partial exit
+            # leaves room under the entry's quantity): the owner bought where neither the
+            # journal nor the executions show it (the read failed, or an earlier day IBKR
+            # no longer reports). A sale of the app's of the last moments may not be in the
+            # position read yet: its units may still be in `held`.
+            now = self._now()
+            recent = sum(
+                f.qty
+                for f in base.bot_fills
+                if f.side == Side.SELL
+                and not is_other_client(f)
+                and now - _aware(f.ts) < 2 * FILL_TIME_SKEW
+            )
+            bought = bought_since(held - recent, limit, base)
         cap = sell_cap(held, limit, split, evidence=bought)
         if cap is None:
             return None
