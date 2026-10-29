@@ -877,7 +877,7 @@ Contracts changed by the confirmed review findings (each has a regression test).
 - **Start, stop, shutdown** (ENG-13): the latest start()/stop() wins, also while start()
   is still connecting (a Stop then is never lost, and two Starts make one decision loop).
   A cycle's monitor tick is shielded from stop(), and shutdown lets a tick under way finish
-  (up to 30 s), so a halt's flatten or the journal is never cut off halfway. An approval
+  (up to 20 s, inside the 30 s compose stop grace), so a halt's flatten or the journal is never cut off halfway. An approval
   reads the account, positions and orders under the entry lock.
 - **Engine closes** (ENG-7): a monitor exit the broker refuses alerts "Close X FAILED"
   (urgent when no stop is working; at most every `CLOSE_FAILED_ALERT_EVERY`, 15 min, while

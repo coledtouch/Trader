@@ -157,7 +157,7 @@ LEDGER_GIVE_UP = timedelta(days=5)
 LEDGER_RETRY = timedelta(hours=1)  # wait before re-requesting bars that were missing
 CRYPTO_HORIZON = timedelta(hours=24)
 FETCH_CONCURRENCY = 4
-SHUTDOWN_TICK_WAIT = 30.0  # seconds shutdown waits for a monitor tick under way
+SHUTDOWN_TICK_WAIT = 20.0  # s shutdown waits for a tick under way (compose grace: 30 s)
 FIRST_CYCLE_DELAY = 5.0
 MAX_BACKOFF = 120.0
 EPS = 1e-9
