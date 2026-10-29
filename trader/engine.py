@@ -164,6 +164,7 @@ BAR_LOOKBACK = {"1 min": "2 D", "5 mins": "5 D", "15 mins": "10 D"}
 EXTRA_PREFIX = "position_extra:"
 BASELINE_PREFIX = "halt_baseline:"
 ACCOUNT_KEY = "broker_account"  # kv: the broker account id the journal belongs to
+HALT_SEEN_PREFIX = "halt_seen:"  # kv: when an instrument was last seen halted (cooldown)
 SENT_PREFIX = "order_sent:"  # kv: when an approved order was actually sent (order id)
 OWNER_CLOSED_PREFIX = "owner_closed:"  # kv: trading day the owner closed this instrument
 # Engine-side stops/targets/time stops and the daily halts fire only when the breach is
@@ -457,6 +458,7 @@ class Engine:
         self._ledger_retry: dict[str, datetime] = {}  # instrument -> no bar requests until
         self._fallback_logged: str | None = None
         self._last_ledger_at: datetime | None = None
+        self._ledger_task: asyncio.Task[None] | None = None  # a signal-ledger pass running
         # consecutive monitor ticks that saw an engine-side exit / a daily halt condition
         # instrument -> (kind, ticks, first seen)
         self._breaches: dict[str, tuple[str, int, datetime]] = {}
@@ -473,6 +475,13 @@ class Engine:
             self.db.set_kv("journal_account_since", self._epoch.isoformat())
         self._epoch_reason = "simulator restarted"
         self._rebase_pending = self._epoch is not None
+        if self._epoch is None and self.db.get_kv(ACCOUNT_KEY):
+            # A broker account recorded earlier: fills from before its epoch (another
+            # account's) stay out of every later process too (no P&L rebase here).
+            raw = self.db.get_kv("journal_account_since")
+            with contextlib.suppress(TypeError, ValueError):
+                self._epoch = _aware(datetime.fromisoformat(raw or ""))
+                self._epoch_reason = "broker account changed"
         self._busy_at = self._now()  # last time the account held a position or order
         self._enforce_live_gate()
         self._backfill_equity_floor()
@@ -862,11 +871,13 @@ class Engine:
         """Stop everything and disconnect (app shutdown). Broker-side stops remain, and the
         persisted running flag is kept so a restart resumes the previous state."""
         await self._stop_decisions()
-        task, self._monitor_task = self._monitor_task, None
-        if task is not None:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+        for name in ("_monitor_task", "_ledger_task"):
+            task = getattr(self, name)
+            setattr(self, name, None)
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
         try:
             await self.broker.disconnect()
         except Exception as exc:
@@ -1194,7 +1205,7 @@ class Engine:
                     broker=self.broker,
                     now=now,
                     settings=self.settings,
-                    last_halt_at=self._last_halt_at.get(req.instrument.key),
+                    last_halt_at=self._halt_seen_at(req.instrument.key),
                 )
                 reasons = verdict.reasons
             if verdict is None or not verdict.approved:
@@ -1394,7 +1405,7 @@ class Engine:
         if (problem is None or market) and since > allowed:
             problem, market = f"not re-checked for {since:.0f}s", False
         cooldown = self.risk.limits.halt_cooldown_minutes
-        halted_at = self._last_halt_at.get(key)
+        halted_at = self._halt_seen_at(key)
         if problem is None and halted_at is not None and cooldown > 0:
             since = _aware(now) - _aware(halted_at)
             if since < timedelta(minutes=cooldown):
@@ -1612,7 +1623,12 @@ class Engine:
                 self._reprotect(now, positions, open_orders, metas, close_seq, armed),
             )
             await self._step("journal", self._sync_journal(now, positions, open_orders))
-            await self._step("signals", self._evaluate_signals(now))
+            # Scoring the ledger requests history (up to 45 s a request): in a task of its
+            # own, so stop checks, halts and the heartbeat never wait for it.
+            if self._ledger_task is None or self._ledger_task.done():
+                self._ledger_task = asyncio.create_task(
+                    self._step("signals", self._evaluate_signals(now)), name="engine-ledger"
+                )
 
     async def _quotes(self, instruments: Sequence[Instrument], now: datetime) -> dict[str, Quote]:
         """Quotes for several instruments (concurrency-limited); failures are skipped."""
@@ -1788,6 +1804,18 @@ class Engine:
             if key not in self._last_halt_at or now - self._last_halt_at[key] > CLOSE_RETRY:
                 log.info("%s is halted", key)
             self._last_halt_at[key] = now
+            self.db.set_kv(
+                HALT_SEEN_PREFIX + key, now.isoformat()
+            )  # the cooldown survives a restart
+
+    def _halt_seen_at(self, key: str) -> datetime | None:
+        """When the instrument was last seen halted (this process, else the journal)."""
+        seen = self._last_halt_at.get(key)
+        if seen is None:
+            raw = self.db.get_kv(HALT_SEEN_PREFIX + key)
+            with contextlib.suppress(TypeError, ValueError):
+                seen = self._last_halt_at[key] = _aware(datetime.fromisoformat(raw or ""))
+        return seen
 
     def _mark_positions(
         self, raw: list[Position], quotes: dict[str, Quote], metas: dict[str, dict[str, Any]]
@@ -2859,6 +2887,12 @@ class Engine:
                 )
                 return
 
+    async def _ledger_done(self) -> None:
+        """Wait for a signal-ledger pass that is running (tests)."""
+        if self._ledger_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._ledger_task
+
     async def _evaluate_signals(self, now: datetime) -> None:
         """Score matured signals (stocks after their session close, crypto after 24h).
         Bounded to a few bar requests per pass; data errors are retried later."""
@@ -3057,7 +3091,7 @@ class Engine:
             broker=self.broker,
             now=now,
             settings=self.settings,
-            last_halt_at=self._last_halt_at.get(key),
+            last_halt_at=self._halt_seen_at(key),
         )
         reasons = list(verdict.reasons) if not verdict.approved else []
         if qty <= 0:
@@ -3389,7 +3423,7 @@ class Engine:
                 broker=self.broker,
                 now=send_now,
                 settings=self.settings,
-                last_halt_at=self._last_halt_at.get(key),
+                last_halt_at=self._halt_seen_at(key),
             )
             reasons = list(verdict.reasons) if not verdict.approved else []
             if self._halt_pending is not None:

@@ -45,7 +45,7 @@ from trader.models import (
 from trader.notify import Notifier
 from trader.research import ReplayFrame
 from trader.strategy.decide import RuleBasedDecisionMaker
-from trader.watchdog import HEARTBEAT_KEY
+from trader.watchdog import HEARTBEAT_KEY, read_heartbeat
 
 NOW = datetime(2026, 10, 21, 15, 0, tzinfo=UTC)  # Wednesday 11:00 New York (EDT)
 F = Instrument(symbol="F")
@@ -2485,6 +2485,7 @@ async def test_signal_ledger_taken_skipped_and_evaluated(db, config) -> None:
     h.broker.bar_data["STK:T"] = minute_bars(NOW, both)
     h.clock.t = datetime(2026, 10, 21, 20, 10, tzinfo=UTC)  # after the 16:00 ET close
     await h.engine.monitor_tick()
+    await h.engine._ledger_done()  # scored in a task of its own
     sigs = {s.instrument.symbol: s for s in db.list_signals()}
     f = sigs["F"]
     assert f.evaluated and f.first_hit == "target"
@@ -3726,6 +3727,99 @@ async def test_the_pnl_is_unknown_while_the_account_is(db, config) -> None:
     await h.engine.monitor_tick()
     h.engine._account = None
     assert h.engine.status().pnl_today is None
+
+
+def _as_account(broker, account_id: str) -> None:
+    read = broker.account
+
+    async def account():
+        return (await read()).model_copy(update={"account_id": account_id})
+
+    broker.account = account
+
+
+async def test_the_account_epoch_survives_a_restart(db, config) -> None:
+    """Review finding: after a switch of broker account, a restart forgot the journal epoch,
+    so the old account's unmatched fills were matched into the new account's trades: the
+    trade went unjournaled, its symbol stayed blocked, and a bogus trade followed."""
+    h = await harness(db, config, mode=Mode.PAPER)
+    _as_account(h.broker, "DU111")
+    await h.engine.monitor_tick()
+    await enter_f(h)  # bought on the first account, still held there at the switch
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    other = FakeBroker(h.clock, mode=Mode.PAPER, cash=500.0)
+    other._execs = itertools.count(100)  # IBKR exec ids are unique across accounts
+    other._ids = itertools.count(100)
+    other.set_price("F", 10.0)
+    other.set_price("T", 20.0)
+    await other.connect()
+    _as_account(other, "DU222")
+    h.engine.broker = other
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()  # the account changed: a new journal epoch
+    scanner = FakeScanner(db.get_settings())
+    scanner.candidates["STK:F"] = [cand()]
+    maker = FakeDecisionMaker()
+    maker.decisions = [buy()]
+    engine = Engine(
+        config, db, other, maker, notifier=RecordingNotifier(), clock=h.clock, scanner=scanner
+    )  # restarted
+    await engine.monitor_tick()
+    h.clock.advance(minutes=31)
+    await engine.run_cycle()  # BUY F on the new account
+    assert other.pos.get("STK:F")
+    before = len(db.list_trades())
+    other.set_price("F", 9.70)  # its bracket stop fills
+    for _ in range(3):
+        h.clock.advance(minutes=1)
+        await engine.monitor_tick()
+    trades = db.list_trades()
+    [new] = trades[: len(trades) - before]
+    assert new.qty == 24 and new.entry_price == pytest.approx(10.01)
+    assert db.get_position_meta("STK:F") is None
+
+
+async def test_the_ledger_never_holds_up_the_monitor(db, config) -> None:
+    """Review finding: scoring the signal ledger ran inside the monitor tick, so history
+    requests that hung (up to 45 s each, five a pass) stalled stop checks and the
+    heartbeat, and the crypto watchdog sold the bot's crypto as if the app were down."""
+    h = await harness(db, config)
+    await h.engine.run_cycle()  # leaves ledger signals to score
+    hung = asyncio.Event()
+
+    async def bars(*args, **kwargs):
+        hung.set()
+        await asyncio.sleep(3600)  # a history request that never answers
+
+    h.broker.bars = bars
+    h.clock.t = datetime(2026, 10, 21, 20, 10, tzinfo=UTC)  # after the close: signals mature
+    await asyncio.wait_for(h.engine.monitor_tick(), 2)
+    await asyncio.wait_for(hung.wait(), 2)  # the pass runs (and hangs) on its own
+    h.clock.advance(seconds=15)
+    await asyncio.wait_for(h.engine.monitor_tick(), 2)
+    assert read_heartbeat(db) == h.clock()
+    h.engine._ledger_task.cancel()
+
+
+async def test_the_halt_cooldown_survives_a_restart(db, config) -> None:
+    """Review finding: the halt cooldown lived in memory only, so after a restart the bot
+    could buy a stock minutes after its trading halt."""
+    h = await harness(db, config, mode=Mode.PAPER)
+    h.broker.set_price("F", 10.0, halted=True)  # a LULD pause seen by a cycle
+    await h.engine.run_cycle()
+    h.clock.advance(minutes=5)
+    h.broker.set_price("F", 10.0)  # trading resumed
+    scanner = FakeScanner(db.get_settings())
+    scanner.candidates["STK:F"] = [cand()]
+    maker = FakeDecisionMaker()
+    maker.decisions = [buy()]
+    engine = Engine(
+        config, db, h.broker, maker, notifier=RecordingNotifier(), clock=h.clock, scanner=scanner
+    )  # restarted
+    h.clock.advance(minutes=1)
+    await engine.run_cycle()  # 6 minutes after the halt; the cooldown is 15
+    assert not [r for r in h.broker.placed if r.side == Side.BUY]
 
 
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:

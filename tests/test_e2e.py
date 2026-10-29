@@ -274,6 +274,7 @@ def test_trading_day_end_to_end(tmp_path: Path) -> None:
         # After the close every ledger signal is scored, taken or not.
         st.clock.now = AFTER_CLOSE
         st.call(st.engine.monitor_tick)
+        st.call(st.engine._ledger_done)  # scored in a task of its own
         signals = st.get("/api/signals?limit=500")
         assert signals and all(s["evaluated"] for s in signals)
         assert all(s["first_hit"] in ("target", "stop", "neither") for s in signals)

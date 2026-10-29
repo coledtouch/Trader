@@ -869,6 +869,11 @@ Contracts changed by the confirmed review findings (each has a regression test).
   loss limit is re-measured from the current equity; status `pnl_today` is None while the
   equity is unknown. An approved exit takes no quote (missing data never blocks it). A KILL
   that never reached the broker drops its close markers (nothing was sent).
+- **Restarts** (ENG-12): the journal epoch of the last broker account change is restored
+  in every process (kv `journal_account_since`), so another account's fills never match
+  this account's; the halt cooldown is kept in kv `halt_seen:<key>`. The signal ledger is
+  scored in a task of its own, never inside the monitor tick (its history requests can
+  take 45 s each: stop checks, halts and the heartbeat never wait for them).
 - **Engine closes** (ENG-7): a monitor exit the broker refuses alerts "Close X FAILED"
   (urgent when no stop is working; at most every `CLOSE_FAILED_ALERT_EVERY`, 15 min, while
   the 60 s retries go on), not "Closing X". An approved close whose broker call raised
