@@ -52,6 +52,12 @@ STOP_ATR = {
 }
 
 
+def _interval(bars: Sequence[Bar]) -> timedelta:
+    """The bar size: the median gap between the last 21 bars (at least a minute)."""
+    gaps = [(b.ts - a.ts).total_seconds() for a, b in pairwise(bars[-21:])]
+    return timedelta(seconds=max(60.0, statistics.median(gaps) if gaps else 60.0))
+
+
 def _clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
@@ -117,7 +123,17 @@ class Scanner:
     def scan(
         self, instrument: Instrument, bars: Sequence[Bar], quote: Quote | None, now: datetime
     ) -> list[Candidate]:
-        """Candidates for the latest bar, best score first. Empty when filters fail."""
+        """Candidates for the latest complete bar, best score first. Empty when filters fail.
+
+        Brokers return the newest bar while it is still forming (part of its volume and
+        range), so patterns are judged on complete bars, as the backtest judges them; the
+        live quote still gives the price that stops, targets and "still valid now" checks
+        use."""
+        rows = self._regular_hours(bars) if instrument.asset_class == AssetClass.STOCK else bars
+        if len(rows) > 1 and rows[-1].ts + _interval(rows) > now:
+            if quote is None or not quote.price:  # the forming bar still gives the price
+                quote = Quote(instrument=instrument, last=rows[-1].close, ts=now)
+            bars = rows[:-1]
         ctx = self._context(instrument, bars, quote)
         if ctx is None or not self._passes_filters(ctx, now):
             return []
@@ -157,8 +173,7 @@ class Scanner:
         last = bars[-1]
         price = quote.price if quote is not None and quote.price else last.close
         closes = [b.close for b in bars]
-        gaps = [(b.ts - a.ts).total_seconds() for a, b in pairwise(bars[-21:])]
-        interval = timedelta(seconds=max(60.0, statistics.median(gaps) if gaps else 60.0))
+        interval = _interval(bars)
 
         if is_stock:
             day = last.ts.astimezone(self.tz).date()
@@ -420,28 +435,11 @@ class Scanner:
         SMA20 and SMA50 (when there are 50 bars), with the price above the session open
         (stocks) or the 24h open (crypto) and a positive 20-day trend when the history
         reaches that far. ATR % must be sane for the bar size. Stocks: not before 09:45.
-
-        Brokers return the newest bar while it is still forming, with only part of its
-        volume, so a spike shows there only once it already has 3x; the last complete bar
-        is checked as well, so a spike that finished between two cycles is found on the
-        next one (as the backtest finds it, on complete bars)."""
-        bars = ctx.bars
-        signal = self._spike_at(ctx, len(bars) - 1)
-        if (
-            signal is None
-            and len(bars) > 1
-            and bars[-1].ts + ctx.interval > now
-            and bars[-2].ts >= ctx.session[0].ts  # never yesterday's closing-auction bar
-        ):
-            signal = self._spike_at(ctx, len(bars) - 2)
-        return signal
-
-    def _spike_at(self, ctx: _Context, i: int) -> _Signal | None:
-        """volume_spike for bar i of ctx.bars (the newest or the last complete one)."""
+        The price must still be above the spike bar's open and the averages: a spike that
+        has been given back since its bar closed is no entry."""
         f, atr, price = ctx.features, ctx.atr or 0.0, ctx.price
-        last = ctx.bars[i]
-        multiple = self._volume_multiple(ctx.bars[: i + 1])
-        sma20, sma50 = f.get("sma20"), f.get("sma50")
+        last = ctx.bars[-1]
+        multiple, sma20, sma50 = f.get("volume_multiple"), f.get("sma20"), f.get("sma50")
         if multiple is None or multiple < SPIKE_MIN_MULTIPLE or sma20 is None:
             return None
         if ctx.is_stock and last.ts.astimezone(self.tz).time() < SPIKE_EARLIEST:
@@ -449,10 +447,12 @@ class Scanner:
         low, high = self._spike_atr_band(ctx.interval)
         perf = f.get("perf_20d_pct")
         session_open = ctx.session[0].open
+        held = min(last.close, price)  # the spike bar's close and where the price is now
         if not (
             last.close > last.open
-            and last.close > sma20
-            and (sma50 is None or last.close > sma50)
+            and price > last.open
+            and held > sma20
+            and (sma50 is None or held > sma50)
             and price > session_open
             and low <= f["atr_pct"] <= high
             and (perf is None or perf > 0)
@@ -476,7 +476,7 @@ class Scanner:
             score,
             price - STOP_ATR["volume_spike"] * atr,
             f"volume {multiple:.1f}x the 20-bar average, above {averages} and the {where}",
-            {"session_open": session_open, "volume_multiple": multiple},
+            {"session_open": session_open},
         )
 
     @staticmethod

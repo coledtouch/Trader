@@ -176,10 +176,15 @@ with reward:risk >= 2 by default:
   (close > open), close above SMA20 (and SMA50 when available) and above the session open
   (stocks) or 24h open (crypto), positive 20-session/20-day trend when the history allows,
   ATR% within 0.3-8% (5-minute bars, scaled for other sizes); stocks only from 09:45 NY.
-  Brokers return the newest bar while it forms (part of its volume), so the last complete
-  bar is checked too: a spike that finished between two cycles is found on the next one.
+  The price must still be above the spike bar's open and SMA20/SMA50 (not given back).
   Stop 1.5 ATR, target >= 2R.
 Filters: price >= `risk.min_price`, avg volume >= `min_avg_volume` (stocks), enough bars.
+Patterns are judged on complete bars, as the backtest judges them: brokers return the
+newest bar while it forms (part of its volume and range), so `scan` leaves that bar out
+and uses the live quote for the price (stops, targets and "still valid now" checks).
+`snapshot` keeps the forming bar. The backtest shows the scanner the history the engine
+requests for the bar size (`BAR_LOOKBACK`: 2 sessions for 1-minute bars, 5 for 5-minute,
+10 for 15-minute).
 Crypto uses the same setups minus ORB, with a rolling 24h "session" for VWAP.
 
 ### 5.4 `trader/strategy/decide.py`
@@ -336,8 +341,8 @@ loop continues; exponential backoff on broker errors; never crash the app):
   tradable now (stocks closed and crypto disabled). Build universe (settings + optional
   scanner movers), fetch bars + quote per instrument (concurrency-limited, per-symbol
   errors tolerated), run Scanner and journal every emitted candidate (including
-  unaffordable and disabled setups). Size the scanner's proposed stop at the ask with
-  `size_fraction=1`, reserving working-buy notional and fees, and run the full risk check
+  unaffordable and disabled setups). Size the scanner's proposed stop at the higher of
+  the ask and the candidate's price with `size_fraction=1`, reserving working-buy notional and fees, and run the full risk check
   on the refreshed account/cache with the candidate's own price as the limit (the entry
   the rules send and a model BUY is validated at: reward:risk, collar). Pending approvals, settling trades, in-flight metadata
   and unconfirmed halts also exclude entry proposals. Only eligible candidates enter

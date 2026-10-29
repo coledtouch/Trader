@@ -11,6 +11,7 @@ from trader.backtest import (
     load_csv,
     main,
     run_backtest,
+    synthetic_history,
 )
 from trader.models import Bar, BotSettings, Instrument, RiskLimits, Side
 from trader.strategy.signals import Scanner
@@ -309,3 +310,23 @@ def test_daily_loss_limit_halts_and_flattens():
     assert trade.exit_reason == "daily loss limit"
     assert trade.exit_price == pytest.approx(dip * 0.9995)
     assert result.halted_days == {"daily loss limit": 1}
+
+
+@pytest.mark.parametrize(("bar_size", "sessions"), [("1 min", 2), ("5 mins", 5)])
+def test_the_scanner_sees_as_much_history_as_the_engine_requests(
+    monkeypatch, bar_size: str, sessions: int
+):
+    """Review finding: the backtest showed the scanner 2 sessions while the engine asks for
+    5 with 5-minute bars, so relative volume and the ORB gate differed from live."""
+    seen: list[int] = []
+    scan = Scanner.scan
+
+    def spy(self, instrument, bars, quote, now):
+        seen.append(len({b.ts.astimezone(NY).date() for b in bars}))
+        return scan(self, instrument, bars, quote, now)
+
+    monkeypatch.setattr(Scanner, "scan", spy)
+    end = datetime(2026, 10, 23, 21, 0, tzinfo=UTC)
+    data = synthetic_history([Instrument(symbol="F")], 8, bar_size, 7, end)
+    run_backtest(data, BotSettings(), BacktestConfig(starting_equity=10_000))
+    assert max(seen) == sessions

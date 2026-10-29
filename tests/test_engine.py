@@ -2391,6 +2391,42 @@ async def test_a_last_trade_on_the_bid_does_not_block_a_valid_setup(db, config) 
     assert entry.limit_price == 10.04 and entry.stop_loss == 10.01
 
 
+@pytest.mark.parametrize(
+    ("inst", "quote", "price"),
+    [
+        (Instrument(symbol="ETH", asset_class=AssetClass.CRYPTO), (3999.0, 3999.5, 4000.0), 4000.0),
+        (Instrument(symbol="F"), (49.97, 49.99, 50.01), 50.01),
+    ],
+    ids=["crypto", "stock"],
+)
+async def test_a_last_trade_above_the_ask_does_not_break_the_order_cap(
+    db, config, inst, quote, price
+) -> None:
+    """Review finding: the pre-decision filter sized at the ask but judged the order at the
+    candidate's (last) price, so after a downtick the $250 order cap was exceeded by cents
+    ("order $250.03 > max order $250.00") and the setup was hidden from every maker."""
+    h = await harness(db, config, trade_crypto=True, crypto_universe=["ETH"], llm_enabled=False)
+    h.broker.cash = 50_000.0
+    bid, ask, last = quote
+    h.broker.quotes[inst.key] = {"bid": bid, "ask": ask, "last": last, "halted": False}
+    h.scanner.candidates = {
+        inst.key: [
+            Candidate(
+                instrument=inst,
+                setup="vwap_reclaim",
+                score=0.8,
+                price=price,
+                suggested_stop=round(price * 0.975, 2),
+                suggested_target=round(price * 1.05, 2),
+            )
+        ]
+    }
+    await h.engine.run_cycle()
+    assert [s.skip_reason for s in db.list_signals()] == [None]
+    [entry] = [r for r in h.broker.placed if r.side == Side.BUY]
+    assert entry.qty * entry.limit_price <= 250.01
+
+
 class _DroppingMaker(FakeDecisionMaker):
     """Acts on its decisions after dropping one invalid one, as convert_decisions does."""
 

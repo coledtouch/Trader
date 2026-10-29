@@ -42,8 +42,14 @@ def after(bars: list[Bar], minutes: float = 3) -> datetime:
     return bars[-1].ts + timedelta(minutes=minutes)
 
 
+def closed(bars: list[Bar]) -> datetime:
+    """The moment the newest bar closes. The scanner judges complete bars (a forming one is
+    left out), as the backtest does when it scans at each bar's close."""
+    return bars[-1].ts + (bars[-1].ts - bars[-2].ts)
+
+
 def scan(bars, inst=STOCK, now=None, quote=None, settings=None):
-    return Scanner(settings or BotSettings()).scan(inst, bars, quote, now or after(bars))
+    return Scanner(settings or BotSettings()).scan(inst, bars, quote, now or closed(bars))
 
 
 def setups(candidates) -> list[str]:
@@ -168,6 +174,36 @@ def test_rsi_reversion_not_in_steep_downtrend_or_while_falling():
     assert scan(rsi_reversion_bars(turn=98.0), inst=CRYPTO) == []  # RSI still falling
 
 
+def _with_forming_bar(bars: list[Bar], seconds: float = 30) -> tuple[list[Bar], datetime]:
+    """The bars plus the next bar as a broker returns it `seconds` after it opened: flat at
+    the last close, with a sliver of volume."""
+    last = bars[-1]
+    step = last.ts - bars[-2].ts
+    c = last.close
+    forming = Bar(ts=last.ts + step, open=c, high=c, low=c, close=c, volume=last.volume * 0.05)
+    return [*bars, forming], forming.ts + timedelta(seconds=seconds)
+
+
+@pytest.mark.parametrize(
+    ("make", "inst", "setup"),
+    [
+        (lambda: vwap_reclaim_bars(), STOCK, "vwap_reclaim"),
+        (lambda: trend_pullback_bars(), CRYPTO, "trend_pullback"),
+        (lambda: rsi_reversion_bars(), CRYPTO, "rsi_reversion"),
+        (lambda: orb_bars(), STOCK, "orb_breakout"),
+    ],
+    ids=["vwap_reclaim", "trend_pullback", "rsi_reversion", "orb_breakout"],
+)
+def test_patterns_are_judged_on_the_last_complete_bar(make, inst, setup):
+    """Review finding: every setup tested its pattern on the broker's still-forming bar, so
+    a pattern that completed on the bar before was never seen once the next bar opened (the
+    backtest, which scans complete bars, took it)."""
+    bars = make()
+    assert setup in setups(scan(bars, inst=inst))
+    with_forming, now = _with_forming_bar(bars)
+    assert setup in setups(scan(with_forming, inst=inst, now=now))
+
+
 # ----------------------------------------------------------------------------- filters
 def test_filters_min_price_volume_bars_spread_and_staleness():
     bars = orb_bars()
@@ -289,6 +325,22 @@ def test_yesterdays_closing_bar_is_no_spike_at_the_open():
     assert spike(scan([*prior, *first], now=now, quote=quote)) is None
 
 
+def test_a_spike_given_back_since_its_bar_closed_is_no_entry():
+    """Review finding: the spike bar was judged complete while the next bar had already
+    fallen below the spike's open, and the rules maker bought the failed spike."""
+    bars = spike_bars()  # the 10:10 spike bar opens at 20.19 and closes at 20.45
+    forming = bars[-1].model_copy(
+        update={"ts": bars[-1].ts + timedelta(minutes=5), "open": 20.45, "close": 20.10}
+    )
+    now = forming.ts + timedelta(minutes=2)
+
+    def at(last: float) -> Quote:
+        return Quote(instrument=STOCK, bid=last - 0.01, ask=last + 0.01, last=last, ts=now)
+
+    assert spike(scan([*bars, forming], now=now, quote=at(20.10))) is None  # below its open
+    assert spike(scan([*bars, forming], now=now, quote=at(20.40))) is not None  # held
+
+
 def test_volume_spike_needs_three_times_the_volume():
     assert spike(scan(spike_bars(multiple=2.5))) is None
     assert spike(scan(spike_bars(multiple=3.0))) is not None
@@ -341,13 +393,13 @@ def crypto_spike_bars(start: float) -> list[Bar]:
 
 def test_volume_spike_for_crypto_uses_the_20_day_trend():
     rising = crypto_spike_bars(15.0)
-    cand = spike(scan(rising, inst=CRYPTO, now=rising[-1].ts + timedelta(minutes=30)))
+    cand = spike(scan(rising, inst=CRYPTO, now=closed(rising)))
     assert cand is not None
     assert_sane(cand)
     assert cand.features["perf_20d_pct"] > 0
     assert "24h open" in cand.note
     falling = crypto_spike_bars(25.0)
-    now = falling[-1].ts + timedelta(minutes=30)
+    now = closed(falling)
     snap = Scanner(BotSettings()).snapshot(CRYPTO, falling)
     assert snap["perf_20d_pct"] < 0 and snap["price"] > snap["sma50"]
     assert spike(scan(falling, inst=CRYPTO, now=now)) is None

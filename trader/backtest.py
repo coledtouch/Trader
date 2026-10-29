@@ -45,6 +45,7 @@ from trader.broker.base import BrokerError
 from trader.broker.sim import SimBroker
 from trader.fees import Plan
 from trader.models import (
+    BAR_LOOKBACK,
     HARD_CAPS,
     AssetClass,
     Bar,
@@ -63,6 +64,13 @@ FLATTEN_BEFORE_CLOSE = timedelta(minutes=10)
 SMALL_SAMPLE = 30  # fewer trades than this cannot separate skill from luck
 
 
+def _lookback(interval: timedelta) -> int:
+    """Sessions of history the engine requests for bars of this size (BAR_LOOKBACK)."""
+    minutes = round(interval.total_seconds() / 60)
+    size = {1: "1 min", 5: "5 mins", 15: "15 mins"}.get(minutes, "5 mins")
+    return int(BAR_LOOKBACK[size].split()[0])
+
+
 @dataclass
 class BacktestConfig:
     starting_equity: float = 500.0
@@ -71,7 +79,9 @@ class BacktestConfig:
     slippage_bps: float = 5.0  # per market-type fill (entries, stops, flattening)
     target_usd: float = 100.0  # daily target for the report; never affects sizing
     allow_fractional: bool = False  # fractional stock shares
-    lookback_sessions: int = 2  # history the scanner sees, like the engine's "2 D" request
+    # History the scanner sees, in sessions; None = what the engine requests for the data's
+    # bar size (BAR_LOOKBACK: 2 for 1-minute bars, 5 for 5-minute, 10 for 15-minute).
+    lookback_sessions: int | None = None
     commission_plan: Plan = "tiered"  # IBKR Pro pricing plan for stock commissions
 
 
@@ -374,7 +384,7 @@ class _Backtest:
                 not self._entry_window_open(feed, signal_time) or not feed.same_session_next(i)
             ):
                 continue
-            window = feed.window(i, self.config.lookback_sessions)
+            window = feed.window(i, self.config.lookback_sessions or _lookback(feed.interval))
             candidates = self.scanner.scan(feed.instrument, window, None, signal_time)
             if candidates and candidates[0].score >= self.config.threshold:
                 if best is None or candidates[0].score > best[1].score:

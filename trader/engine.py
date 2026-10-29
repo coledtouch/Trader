@@ -46,6 +46,7 @@ from trader.broker.base import (
 from trader.config import AppConfig
 from trader.db import EQUITY_SINCE_KEY, Database
 from trader.models import (
+    BAR_LOOKBACK,
     LEVERAGED_ETFS,
     MAX_QUOTE_STREAMS,
     OPEN_ORDER_STATUSES,
@@ -163,7 +164,6 @@ SHUTDOWN_TICK_WAIT = 20.0  # s shutdown waits for a tick under way (compose grac
 FIRST_CYCLE_DELAY = 5.0
 MAX_BACKOFF = 120.0
 EPS = 1e-9
-BAR_LOOKBACK = {"1 min": "2 D", "5 mins": "5 D", "15 mins": "10 D"}
 EXTRA_PREFIX = "position_extra:"
 BASELINE_PREFIX = "halt_baseline:"
 ACCOUNT_KEY = "broker_account"  # kv: the broker account id the journal belongs to
@@ -3145,9 +3145,13 @@ class Engine:
             rationale="scanner eligibility check",
         )
         entry = (quote.ask or quote.price) if quote is not None else cand.price
+        # Sized at the higher of the ask and the candidate's price, so every cap still holds
+        # at the candidate's price the order is judged at below (the last can be above the
+        # ask after a downtick).
+        entry = max(entry or 0.0, cand.price or 0.0)
         qty, notes = self.risk.size_entry(
             decision=decision,
-            entry=entry or 0.0,
+            entry=entry,
             stop=cand.suggested_stop,
             account=account,
             positions=self._positions,
@@ -3160,9 +3164,9 @@ class Engine:
             instrument=cand.instrument,
             side=Side.BUY,
             qty=max(qty, EPS),
-            # Sized at the ask (conservative), judged at the candidate's own price: the
-            # entry the rules send and a model's BUY is validated at. At the ask, a last
-            # trade on the bid cut reward:risk below the minimum on low-ATR names.
+            # Judged at the candidate's own price: the entry the rules send and a model's
+            # BUY is validated at. At the ask, a last trade on the bid cut reward:risk
+            # below the minimum on low-ATR names.
             limit_price=cand.price or entry,
             stop_loss=cand.suggested_stop,
             take_profit=cand.suggested_target,

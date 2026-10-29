@@ -443,6 +443,8 @@ LEVERAGED_ETFS = frozenset(
 # universes within the streams (trader/web/app.py validate_settings).
 MAX_QUOTE_STREAMS = 95
 SCANNER_MOVERS = 10
+# Bar history the engine requests per bar size; the backtest shows the scanner as much.
+BAR_LOOKBACK = {"1 min": "2 D", "5 mins": "5 D", "15 mins": "10 D"}
 
 
 class ExitRules(BaseModel):
