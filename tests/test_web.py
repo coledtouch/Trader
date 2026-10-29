@@ -17,6 +17,7 @@ from trader.db import Database
 from trader.models import (
     AccountSnapshot,
     BotSettings,
+    DayStats,
     EngineStatus,
     Instrument,
     Mode,
@@ -25,6 +26,7 @@ from trader.models import (
     OrderStatus,
     Position,
     SignalRecord,
+    TradeRecord,
 )
 from trader.security import cf_access, crypto
 from trader.security.auth import Authenticator, new_totp_secret
@@ -612,6 +614,24 @@ def test_signals_endpoints(env):
     env.db.set_kv("journal_account_since", (now - timedelta(seconds=30)).isoformat())
     stats = {s["setup"]: s for s in env.client.get("/api/signals/stats?days=30").json()}
     assert stats["vwap_reclaim"]["signals"] == 1 and "orb_breakout" not in stats
+
+
+def test_days_and_trades_are_the_current_accounts(env):
+    """Review finding: after a switch (simulator to paper, paper to live) the per-day P&L
+    bars, their totals and the trades summary still counted the previous account's days and
+    trades, next to a profit summary that did not."""
+    login(env)
+    for day, start, end in [("2026-10-26", 50_000, 50_900), ("2026-10-28", 510, 460)]:
+        env.db.upsert_day(DayStats(day=day, start_equity=start, end_equity=end))
+    paper, live = datetime(2026, 10, 26, 15, tzinfo=UTC), datetime(2026, 10, 28, 15, tzinfo=UTC)
+    for i, exit_ts in enumerate([paper, live]):
+        env.db.insert_trade(
+            TradeRecord(instrument=Instrument(symbol="F"), qty=1, entry_price=10, exit_price=11,
+                        entry_ts=exit_ts - timedelta(minutes=5), exit_ts=exit_ts, pnl=1.0 + i)
+        )  # fmt: skip
+    env.db.set_kv("journal_account_since", "2026-10-28T04:00:00+00:00")  # the switch
+    assert [d["day"] for d in env.client.get("/api/days?limit=30").json()] == ["2026-10-28"]
+    assert [t["pnl"] for t in env.client.get("/api/trades").json()] == [2.0]
 
 
 # ---------------------------------------------------------------------- settings

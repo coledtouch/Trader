@@ -1229,6 +1229,8 @@
       if (lo === hi) out.push(lo);
       else out.push(...(lo.t < hi.t ? [lo, hi] : [hi, lo]));
     }
+    // The first and last points stay: the readout's change is measured between them.
+    if (out[0] !== points[0]) out.unshift(points[0]);
     const last = points[points.length - 1];
     if (out[out.length - 1] !== last) out.push(last);
     return out;

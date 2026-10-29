@@ -167,7 +167,8 @@ atr14, atr_pct, vwap, dist_vwap_pct, rel_volume, day_change_pct, high_of_day,
 low_of_day, ...). Setups (long-only), each with score 0..1, ATR-based stop and target
 with reward:risk >= 2 by default:
 - `orb_breakout` - price breaks the opening-range (first 15 min) high on rel volume > 1.5,
-  above VWAP, EMA9 > EMA21. (Stocks only.)
+  above VWAP, EMA9 > EMA21; the last complete bar closed above the high (an intrabar
+  poke is no break) and the live price is still above it. (Stocks only.)
 - `vwap_reclaim` - crosses back above VWAP after trading below, rising EMA9.
 - `trend_pullback` - EMA9 > EMA21 rising, pullback to EMA21 with bullish close; the live
   price must still hold EMA21.
@@ -224,7 +225,9 @@ class RuleBasedDecisionMaker:   # name = "rules"; __init__(settings: BotSettings
   by Stop or shutdown after it was accepted leaves the same estimate in
   `take_abandoned_cost()` (consensus does the same for a side that had already answered);
   the engine adds it to `DayStats.llm_cost` of the cycle's trading day (by date: a call can
-  outlast midnight), since the cancelled cycle journals no batch.
+  outlast midnight) and journals it as a cost-only batch (no decisions, an error saying it
+  was cut off), since the cancelled cycle journals no batch of its own and the performance
+  report sums AI spend from the decision journal.
 - Handle `stop_reason == "refusal"` (→ `refused=True`, no decisions), `max_tokens`
   (→ error, no decisions), API errors with the typed exception chain (→ error, no
   decisions). On any failure the batch has **no BUY decisions** (fail safe), but the
@@ -499,9 +502,9 @@ to `.env` if missing (Fernet key; TOTP secret stored encrypted with it).
 | GET | `/api/status` | - | `{"status": EngineStatus, "account": AccountSnapshot\|null, "positions": [Position], "open_orders": [OrderRecord], "pending": [OrderRecord], "today": DayStats\|null}` |
 | GET | `/api/decisions?limit=20` | - | `[DecisionBatch]` (limit ≤ 200) |
 | GET | `/api/orders?limit=50` | - | `[OrderRecord]` |
-| GET | `/api/trades?limit=50` | - | `[TradeRecord]` |
-| GET | `/api/equity?days=30` | - | `[{"ts", "equity"}]` |
-| GET | `/api/days?limit=30` | - | `[DayStats]` |
+| GET | `/api/trades?limit=50` | - | `[TradeRecord]` (current account: since `journal_account_since`) |
+| GET | `/api/equity?days=30` | - | `[{"ts", "equity"}]` (thinned to each bucket's low and high, keeping the first and last point) |
+| GET | `/api/days?limit=30` | - | `[DayStats]` (current account: from the day of `journal_account_since`) |
 | GET | `/api/audit?limit=50` | - | `[{"id","ts","actor","action","detail","ip"}]` |
 | GET | `/api/settings` | - | `{"settings": BotSettings, "hard_caps": {...}, "llm_available": bool (any AI key), "ai_keys": {"claude": bool, "grok": bool}, "grok_model": str, "live_allowed": bool}` |
 | PUT | `/api/settings` | `{"settings": BotSettings, "totp"?: str}` | same as GET; 403 `{"detail":"step_up_required"}` when TOTP needed/invalid; 422 invalid |
@@ -997,6 +1000,10 @@ Contracts changed by the confirmed review findings (each has a regression test).
 - **Loss limit after a resume**: `DecisionContext.loss_baseline` carries the resume baseline
   so the prompt's "left before the halt" matches the engine's halt check instead of showing
   $0 for the rest of the day.
+- **Candidate lines**: indicators are in the market table (built from all bars, the forming
+  one included); a candidate line adds only its setup's own levels (e.g. `or_high`,
+  `session_open`) and `rel_volume_at_signal` when the setup was judged on a different
+  relative volume than the table shows (complete bars vs the forming bar).
 - **Fees in the prompt**: each candidate line carries the round-trip fee estimate (same fee
   model and `DecisionContext.commission_plan` as the risk check) at the largest size the
   notional, position and risk limits allow, as a % (one decimal) of the reward at target
@@ -1087,7 +1094,12 @@ from the stop or target when this client has no order row for that perm id. A ro
 the bot did not open (no buy among its journaled orders and no `positions_meta` from
 before the first buy: the owner's own trading) is not journaled as a bot trade: account
 equity has its P&L, but it stays out of expectancy, profit factor, the day's wins/losses
-and the loss streak that halves the bot's size.
+and the loss streak that halves the bot's size. Once the bot's trade for a `positions_meta`
+row is journaled (its exit after the row was written), the row no longer describes
+anything held: later trips are judged without it, and the row is deleted even while shares
+are held under the symbol (the owner's buy since), which the engine then never manages.
+The first monitor tick of a connection journals the fills from while the app was down
+before it manages positions, so it never acts on such a row.
 
 ### 7.9 Economic reporting and paired research (2026-10-23)
 

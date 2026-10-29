@@ -204,6 +204,17 @@ def test_patterns_are_judged_on_the_last_complete_bar(make, inst, setup):
     assert setup in setups(scan(with_forming, inst=inst, now=now))
 
 
+def test_an_intrabar_poke_above_the_opening_range_is_no_breakout():
+    """Review finding: with the 09:55 bar closing inside the opening range, a tick above
+    its high in the forming bar fired orb_breakout; the backtest needs a bar to close
+    above it."""
+    inside = orb_bars(last_close=100.85)  # range high 100.9
+    assert scan(inside) == []
+    bars, now = _with_forming_bar(inside)
+    poke = Quote(instrument=STOCK, bid=100.99, ask=101.01, last=101.0, ts=now)
+    assert "orb_breakout" not in setups(scan(bars, now=now, quote=poke))
+
+
 def test_a_pullback_or_reversal_broken_since_its_bar_closed_is_no_entry():
     """Review finding: with patterns judged on the last complete bar, nothing re-checked the
     live price for trend_pullback and rsi_reversion, so the rules maker bought a pullback

@@ -287,8 +287,16 @@ def _candidate_line(cand: Candidate, snap: dict[str, float]) -> str:
         f"stop {_px(cand.suggested_stop)} target {_px(cand.suggested_target)} "
         f"R:R {'-' if rr is None else f'{rr:.2f}'}"
     )
-    # Features already shown in the market table are not repeated.
-    extra = {k: v for k, v in cand.features.items() if snap.get(k) != v}
+    # Indicators are in the market table; the candidate adds its setup's own levels. Its
+    # features are from the last complete bar and the table's from the bar still forming,
+    # so values differing only for that reason are not repeated, except the relative
+    # volume the setup was judged on.
+    extra = (
+        {k: v for k, v in cand.features.items() if k not in snap} if snap else dict(cand.features)
+    )
+    judged = cand.features.get("rel_volume")
+    if snap and judged is not None and snap.get("rel_volume") != judged:
+        extra["rel_volume_at_signal"] = judged
     if extra:
         line += " | " + _kv(extra, MAX_EXTRA_FIELDS)
     if cand.note:

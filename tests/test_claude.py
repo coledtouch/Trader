@@ -1069,6 +1069,35 @@ def test_render_context_lists_positions_candidates_and_market():
     assert text.count("STK:AMD +$1.50 (+0.8R)") == 5  # recent trades capped at 5
 
 
+def test_a_candidate_line_shows_its_setup_levels_not_a_second_set_of_indicators():
+    """Review finding: candidate features come from the last complete bar and the market
+    row from the bar still forming, so nearly every indicator differed and filled the
+    8-field cap with near-duplicates, cutting the opening-range levels and showing only the
+    market row's lower relative volume."""
+    orb = cand("AMD", score=0.7, price=101.1, stop=100.65, target=102.0, setup="orb_breakout")
+    orb = orb.model_copy(
+        update={
+            "features": {
+                "atr14": 0.2953, "ema9": 100.5386, "ema21": 100.298, "bb_upper": 100.86,
+                "bb_lower": 99.53, "bars": 84, "dist_vwap_pct": 0.49, "atr_pct": 0.29,
+                "rel_volume": 1.6, "or_high": 100.9, "or_low": 100.1,
+            }
+        }
+    )  # fmt: skip
+    market = {
+        "STK:AMD": {
+            "price": 101.1, "atr14": 0.2742, "ema9": 100.65, "ema21": 100.37, "bb_upper": 100.9,
+            "bb_lower": 99.6, "bars": 85, "dist_vwap_pct": 0.48, "atr_pct": 0.27,
+            "rel_volume": 1.39,
+        }
+    }  # fmt: skip
+    text = render_context(make_ctx(candidates=[orb], market=market))
+    [line] = [x for x in text.splitlines() if x.startswith("STK:AMD orb_breakout")]
+    assert "or_high=100.9" in line and "or_low=100.1" in line
+    assert "rel_volume_at_signal=1.6" in line
+    assert "ema9=" not in line and "atr14=" not in line
+
+
 def test_render_context_is_compact_and_deterministic():
     ctx = rich_ctx()
     text = render_context(ctx)

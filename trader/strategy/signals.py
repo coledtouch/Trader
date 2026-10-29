@@ -334,6 +334,7 @@ class Scanner:
         f, atr, price = ctx.features, ctx.atr or 0.0, ctx.price
         if not (
             or_high < price <= or_high + atr
+            and or_high < ctx.bars[-1].close <= or_high + atr  # a bar closed above, as tested
             and f["rel_volume"] > ORB_MIN_REL_VOLUME
             and price > f.get("vwap", math.inf)
             and f["ema9"] > f["ema21"]

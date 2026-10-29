@@ -12,7 +12,7 @@ import logging
 import re
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
-from datetime import datetime, time, timedelta
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -55,6 +55,7 @@ from trader.security.auth import (
 )
 from trader.security.cf_access import HEADER as CF_ACCESS_HEADER
 from trader.security.cf_access import CFAccessError, CFAccessVerifier
+from trader.timeutil import trading_day
 
 if TYPE_CHECKING:
     from trader.engine import Engine
@@ -394,6 +395,15 @@ async def _manual_cycle(engine: Engine) -> None:
         log.exception("manual decision cycle failed")
 
 
+def _account_since(db: Database) -> datetime | None:
+    """When the journal of the current broker account starts (None: one account so far)."""
+    raw = db.get_kv("journal_account_since")
+    if not raw:
+        return None
+    since = datetime.fromisoformat(raw)
+    return since if since.tzinfo else since.replace(tzinfo=UTC)
+
+
 def _research_window(db: Database, days: int) -> dict[str, Any] | None:
     since = utcnow() - timedelta(days=days)
     epoch = db.get_kv("journal_account_since")
@@ -725,7 +735,8 @@ def create_app(
         limit: int = Query(50, ge=1),
         session: Session = Depends(require_session),
     ) -> Any:
-        return _dump(state(request).db.list_trades(limit=min(limit, 500)))
+        db = state(request).db
+        return _dump(db.list_trades(limit=min(limit, 500), since=_account_since(db)))
 
     @app.get("/api/equity")
     async def equity(
@@ -747,7 +758,13 @@ def create_app(
         limit: int = Query(30, ge=1),
         session: Session = Depends(require_session),
     ) -> Any:
-        return _dump(state(request).db.list_days(limit=min(limit, 3650)))
+        db = state(request).db
+        rows = db.list_days(limit=min(limit, 3650))
+        since = _account_since(db)
+        if since is not None:  # the days of the simulator or a previous account
+            first = trading_day(since)
+            rows = [d for d in rows if d.day >= first]
+        return _dump(rows)
 
     @app.get("/api/audit")
     async def audit_log(
@@ -774,9 +791,9 @@ def create_app(
     ) -> Any:
         db = state(request).db
         since = utcnow() - timedelta(days=min(days, 3650))
-        epoch = db.get_kv("journal_account_since")
-        if epoch:  # signals of the simulator or a previous account are not this evidence
-            since = max(since, datetime.fromisoformat(epoch))
+        epoch = _account_since(db)
+        if epoch is not None:  # signals of the simulator or a previous account
+            since = max(since, epoch)
         return _dump(db.setup_stats(since=since))
 
     # ------------------------------------------------------------ settings

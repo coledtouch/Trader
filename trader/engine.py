@@ -444,6 +444,7 @@ class Engine:
         # a deposit, withdrawal or reset.
         self._fills_journaled_at: datetime | None = None
         self._last_exit: dict[str, datetime] | None = None
+        self._bot_exit: dict[str, datetime] | None = None  # last journaled bot trade's exit
         self._open_qty: dict[str, float] = {}
         self._pending_trades: set[str] = set()
 
@@ -658,10 +659,11 @@ class Engine:
         if self._day is not None:
             self.db.upsert_day(self._day)
 
-    def _charge_abandoned_calls(self, day: DayStats) -> None:
+    def _charge_abandoned_calls(self, day: DayStats, maker_name: str) -> None:
         """A cancelled cycle (Stop, shutdown) journals no batch, but an AI call it cut off
         after the provider accepted it is still billed: add the makers' estimates to the
-        day's AI spend so the daily budget does not under-count."""
+        day's AI spend so the daily budget does not under-count, and journal them as a
+        cost-only batch, from which the performance report sums AI spend."""
         lost = 0.0
         for maker in self._all_makers():
             take = getattr(maker, "take_abandoned_cost", None)
@@ -669,6 +671,14 @@ class Engine:
                 lost += take()
         if lost > 0:
             self._add_llm_cost(day.day, lost)
+            self.db.insert_decision(
+                DecisionBatch(
+                    ts=self._now(),
+                    maker=maker_name,
+                    error="AI call cut off by a stop or restart; tokens and cost are estimated",
+                    cost_usd=lost,
+                )
+            )
             log.warning(
                 "AI call cut off by a stop or restart: $%.2f (estimated) added to today's AI spend",
                 lost,
@@ -1606,12 +1616,17 @@ class Engine:
             armed = self._reprotect_armed  # likewise for re-protect armed after the reads
             raw_positions = await self.broker.positions()
             open_orders = await self.broker.open_orders()
-            # A bot position the crypto watchdog sold while the app was down: what is held
-            # under the symbol now (the owner's buy since) is not the bot's.
+            if self._fills_journaled_at is None:
+                # First tick on this connection: journal what filled while the app was down
+                # before managing anything, so a bot position that closed meanwhile is not
+                # managed again on shares held under its symbol now (the owner's buy since).
+                await self._step("journal", self._sync_fills(now))
+            # A bot position the crypto watchdog sold, or whose exit is already journaled:
+            # what is held under the symbol now (the owner's buy since) is not the bot's.
             metas = {
                 key: meta
                 for key, meta in self.db.all_position_meta().items()
-                if not sold_by_watchdog(self.db, key, meta)
+                if not sold_by_watchdog(self.db, key, meta) and not self._meta_used(key, meta)
             }
             quotes = await self._quotes([p.instrument for p in raw_positions if p.qty > 0], now)
             self._note_data_warning()
@@ -2734,6 +2749,23 @@ class Engine:
                     self._last_exit[k] = ts
         return self._last_exit.get(key)
 
+    def _bot_exit_for(self, key: str) -> datetime | None:
+        """Exit time of the last trade journaled for `key` (bot trades only)."""
+        if self._bot_exit is None:
+            self._bot_exit = {}
+            for tr in self.db.list_trades(limit=1000):
+                k, ts = tr.instrument.key, _aware(tr.exit_ts)
+                if k not in self._bot_exit or ts > self._bot_exit[k]:
+                    self._bot_exit[k] = ts
+        return self._bot_exit.get(key)
+
+    def _meta_used(self, key: str, meta: dict[str, Any] | None) -> bool:
+        """The bot's trade for this metadata's position is already journaled (its exit is
+        after the metadata was written): it no longer describes anything held."""
+        opened = meta.get("opened_at") if meta else None
+        exit_ts = self._bot_exit_for(key)
+        return opened is not None and exit_ts is not None and exit_ts >= _aware(opened)
+
     async def _reconstruct(self, key: str, now: datetime) -> None:
         """Journal every completed round trip for `key` since its last journaled exit."""
         last_exit = self._last_exit_for(key)
@@ -2750,6 +2782,8 @@ class Engine:
         ]
         fills.sort(key=lambda f: (f.ts, f.exec_id))
         meta = self.db.get_position_meta(key)
+        if self._meta_used(key, meta):
+            meta = None  # its position closed and is journaled: later trips are not the bot's
         fallback = None
         if meta and meta.get("entry_price"):
             fallback = (float(meta["entry_price"]), meta.get("opened_at") or now)
@@ -2766,8 +2800,11 @@ class Engine:
                 log.info("%s: a round trip the bot did not open; not journaled as its trade", key)
                 assert self._last_exit is not None
                 self._last_exit[key] = _aware(trip.exit_ts)
+                self._close_reasons.pop(key, None)  # a close of that trip, not of the next
                 continue
             await self._journal_trade(key, trip, meta)
+            if self._meta_used(key, meta):
+                meta = None  # the bot's position closed: what follows is someone else's
 
     def _bot_trip(self, trip: _Trip, meta: dict[str, Any] | None) -> bool:
         """Whether the bot opened this round trip: a buy is one of its journaled orders, or
@@ -2807,6 +2844,10 @@ class Engine:
         record.id = self.db.insert_trade(record)
         assert self._last_exit is not None
         self._last_exit[key] = _aware(trip.exit_ts)
+        exit_ts = _aware(trip.exit_ts)
+        known = self._bot_exit_for(key)  # (a first read seeds from the journal, this trade too)
+        assert self._bot_exit is not None
+        self._bot_exit[key] = max(exit_ts, known) if known is not None else exit_ts
 
         stats = self._stats_for(trading_day(record.exit_ts))
         stats.realized_pnl = round(stats.realized_pnl + record.pnl, 4)
@@ -2917,15 +2958,16 @@ class Engine:
         held = {p.instrument.key for p in positions if p.qty > 0}
         buying = self._working_buys(open_orders)
         for key, meta in self.db.all_position_meta().items():
-            # Sold by the crypto watchdog while the app was down: shares held now are not
-            # the bot's (they may be the owner's buy since, which the fills journal counts).
+            # Sold by the crypto watchdog while the app was down, or the bot's trade for it
+            # already journaled: shares held now are not the bot's (they may be the owner's
+            # buy since, which the fills journal counts).
             sold = sold_by_watchdog(self.db, key, meta)
-            if (key in held and not sold) or key in buying or key in self._pending_trades:
+            closed = self._meta_used(key, meta)
+            released = sold or closed
+            if (key in held and not released) or key in buying or key in self._pending_trades:
                 self._mismatch_logged.pop(key, None)  # flat reads must be consecutive
                 continue
             opened = meta.get("opened_at")
-            last_exit = self._last_exit_for(key)
-            closed = last_exit is not None and opened is not None and last_exit >= _aware(opened)
             # Without a journaled exit this may be an entry whose fills are still in flight.
             if not closed and opened is not None and now - _aware(opened) < STALE_META_GRACE:
                 continue
@@ -2933,7 +2975,7 @@ class Engine:
                 await self._reconstruct(key, now)
                 if key in self._pending_trades:
                     continue
-            if self._open_qty.get(key, 0.0) > EPS and not sold:
+            if self._open_qty.get(key, 0.0) > EPS and not released:
                 since = self._mismatch_logged.setdefault(key, now)
                 if since == now:
                     log.warning("%s: broker shows no position but the fills journal does", key)
@@ -2947,6 +2989,7 @@ class Engine:
                     and req.side == Side.SELL
                     and order.status in OPEN_ORDER_STATUSES
                     and order.broker_order_id
+                    and self.broker.can_cancel(order)  # never the owner's own orders
                 ):
                     await self.broker.cancel_order(order.broker_order_id)
                     log.info("cancelled leftover exit order %s for %s", order.broker_order_id, key)
@@ -3341,7 +3384,7 @@ class Engine:
         try:
             batch = await maker.decide(ctx)
         except asyncio.CancelledError:
-            self._charge_abandoned_calls(day)
+            self._charge_abandoned_calls(day, maker.name)
             raise
         except Exception as exc:
             log.exception("decision maker %s failed", maker.name)

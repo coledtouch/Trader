@@ -43,6 +43,7 @@ from trader.models import (
     TradeAction,
 )
 from trader.notify import Notifier
+from trader.performance import performance_report
 from trader.research import ReplayFrame
 from trader.strategy.decide import RuleBasedDecisionMaker
 from trader.watchdog import HEARTBEAT_KEY, read_heartbeat
@@ -2549,8 +2550,14 @@ async def test_stopping_mid_ai_call_still_counts_its_cost(db, config, how) -> No
     await stalled.started.wait()
     await getattr(h.engine, how)()
     assert h.day().llm_cost == pytest.approx(0.43)
-    assert len(db.list_decisions()) == 1  # the cancelled cycle journaled nothing
     assert stalled.take_abandoned_cost() == 0  # charged once
+    # Review finding: the performance report sums AI spend from the decision journal, and
+    # left the cut-off call out. It is journaled as a cost-only batch, without decisions.
+    cut_off = db.list_decisions()[0]
+    assert cut_off.cost_usd == pytest.approx(0.33) and cut_off.decisions == []
+    assert "cut off" in (cut_off.error or "")
+    report = performance_report(db, h.engine.settings, h.engine.status(), h.clock())
+    assert report["ai_cost"] == pytest.approx(0.43)
 
 
 async def test_stopping_mid_consensus_counts_both_calls(db, config) -> None:
@@ -2564,7 +2571,8 @@ async def test_stopping_mid_consensus_counts_both_calls(db, config) -> None:
     await grok.started.wait()
     await h.engine.stop()
     assert h.day().llm_cost == pytest.approx(0.38)
-    assert db.list_decisions() == []
+    [cut_off] = db.list_decisions()  # one cost-only batch for both calls
+    assert cut_off.cost_usd == pytest.approx(0.38) and cut_off.decisions == []
 
 
 async def test_stopping_mid_consensus_counts_the_side_that_already_answered(db, config) -> None:
@@ -2727,6 +2735,98 @@ async def test_the_owners_own_round_trip_is_not_a_bot_trade(db, config) -> None:
     h.clock.advance(minutes=1)
     await h.engine.monitor_tick()
     assert [tr.instrument.symbol for tr in db.list_trades()] == ["F"]
+
+
+async def test_an_owner_trip_after_the_bots_exit_is_not_a_bot_trade(db, config) -> None:
+    """Review finding: the bot's stop filled while the app was down, then the owner bought
+    and sold the same stock. On restart the bot's metadata was still there, so the owner's
+    round trip was journaled as a second bot trade (setup, loss streak)."""
+    f = Instrument(symbol="F")
+    h = await harness(db, config)
+    await enter_f(h)
+    h.decider.decisions = []
+    h.clock.advance(minutes=5)
+    h.broker.set_price("F", 9.7)  # the bracket stop fills while the app is down
+    h.clock.advance(minutes=20)
+    h.broker.fills.append(
+        Fill(exec_id="X1", broker_order_id="perm:1", instrument=f, side=Side.BUY, qty=50,
+             price=9.7, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    h.clock.advance(minutes=20)
+    h.broker.fills.append(
+        Fill(exec_id="X2", broker_order_id="perm:2", instrument=f, side=Side.SELL, qty=50,
+             price=9.2, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    h.clock.advance(minutes=5)
+    await h.engine.monitor_tick()
+    await h.engine.monitor_tick()
+    assert len(db.list_trades()) == 1
+    assert h.day().loss_streak == 1
+
+
+async def test_the_owners_buy_after_the_bots_exit_is_never_managed(db, config) -> None:
+    """Review finding: the owner bought the stock while the app was down after the bot's
+    stop had filled. After the restart the bot's metadata stayed, so the engine managed the
+    owner's shares as its own and its backup stop sold them."""
+    f = Instrument(symbol="F")
+    h = await harness(db, config)
+    await enter_f(h)
+    h.decider.decisions = []
+    h.clock.advance(minutes=5)
+    h.broker.set_price("F", 9.7)  # the bracket stop fills while the app is down
+    h.clock.advance(minutes=20)
+    h.broker.fills.append(
+        Fill(exec_id="X1", broker_order_id="perm:1", instrument=f, side=Side.BUY, qty=50,
+             price=9.7, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    h.broker.pos["STK:F"] = [50.0, 9.7]
+    h.broker.cash -= 485.0
+    sells = len([r for r in h.broker.placed if r.side == Side.SELL])
+    h.broker._connected = False  # the app restarts: the first tick is a new connection
+    h.clock.advance(minutes=5)
+    await h.engine.monitor_tick()
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    assert db.get_position_meta("STK:F") is None
+    assert len([r for r in h.broker.placed if r.side == Side.SELL]) == sells
+    assert h.broker.pos["STK:F"][0] == 50.0
+    assert len(db.list_trades()) == 1
+
+
+async def test_a_close_of_the_owners_position_does_not_label_the_bots_next_trade(
+    db, config
+) -> None:
+    """Review finding: Close on the owner's own position stamped "closed by the owner",
+    and since that trip is not a bot trade the stamp outlived it and labelled the bot's
+    next trade in the symbol."""
+    t = Instrument(symbol="T")
+    h = await harness(db, config)
+    await h.engine.monitor_tick()
+    h.broker.pos["STK:T"] = [10.0, 20.0]
+    h.broker.cash -= 200.0
+    h.broker.fills.append(
+        Fill(exec_id="X1", broker_order_id="perm:1", instrument=t, side=Side.BUY, qty=10,
+             price=20.0, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    await h.engine.close_position("STK:T")
+    for _ in range(2):
+        h.clock.advance(minutes=1)
+        await h.engine.monitor_tick()
+    assert db.list_trades() == []
+    h.clock.t = NOW + timedelta(days=1)
+    h.broker.set_price("T", 20.0)
+    h.scanner.candidates = {"STK:T": [cand("T", price=20.0, stop=19.6, target=21.0)]}
+    h.decider.decisions = [buy("T")]
+    await h.engine.run_cycle()
+    h.decider.decisions = []
+    h.broker.set_price("T", 19.5)
+    for _ in range(2):
+        h.clock.advance(minutes=1)
+        await h.engine.monitor_tick()
+    [trade] = db.list_trades()
+    assert trade.exit_reason == "stop-loss"
 
 
 async def test_signal_ledger_dedupes_repeated_setups(db, config) -> None:

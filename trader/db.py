@@ -205,7 +205,8 @@ def _dt(value: str | None) -> datetime | None:
 def thin_curve(points: list[dict[str, Any]], buckets: int) -> list[dict[str, Any]]:
     """At most about 2 * `buckets` points that still span the whole curve: the lowest and
     highest point of each run of consecutive points (so dips and spikes survive), in time
-    order, plus the last point."""
+    order, plus the first and the last point (the period's change is measured between
+    them)."""
     if buckets < 1 or len(points) <= buckets * 2:
         return points
     size = -(-len(points) // buckets)
@@ -218,6 +219,8 @@ def thin_curve(points: list[dict[str, Any]], buckets: int) -> list[dict[str, Any
             out.append(lo)
         else:
             out.extend((lo, hi) if lo["ts"] < hi["ts"] else (hi, lo))
+    if out[0] is not points[0]:
+        out.insert(0, points[0])
     if out[-1] is not points[-1]:
         out.append(points[-1])
     return out
