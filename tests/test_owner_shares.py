@@ -33,6 +33,7 @@ from trader.models import (
     Side,
     TradeAction,
 )
+from trader.timeutil import trading_day, trading_day_start
 
 F = Instrument(symbol="F")
 _ids = itertools.count(1)
@@ -770,3 +771,104 @@ async def test_a_restart_in_a_symbol_the_owner_traded_journals_the_bots_next_tra
     await ticks(h, 3)
     assert len(db.list_trades()) == 2
     assert db.get_day("2026-10-21").losses == losses + 1
+
+
+# ----------------------------------------------------------------------------- journal 37
+async def test_a_watchdog_sale_then_the_owners_sale_journal_the_bots_trade_once(db, config) -> None:
+    """The watchdog sold only the bot's BTC next to the owner's; once its trade is
+    journaled and its metadata released, the owner's later sales are his, never a second
+    bot trade."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 15, 0, tzinfo=UTC))
+    mine = h.broker.pos["CRYPTO:BTC"][0]
+    owner_buys(h, _BTC, 0.5, 60000.0)
+    await ticks(h, 1, seconds=15)
+    meta = db.get_position_meta("CRYPTO:BTC")
+    h.clock.advance(minutes=5)  # the app is down; the watchdog sells the bot's part
+    _watchdog_sells(h, meta, mine)
+    h.broker.set_price("BTC", 58000.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    await ticks(h, 10, seconds=15)
+    assert len(db.list_trades()) == 1 and db.get_position_meta("CRYPTO:BTC") is None
+    owner_sells(h, _BTC, 0.2, 58100.0)
+    await ticks(h, 3, seconds=15)
+    owner_buys(h, _BTC, 0.1, 58150.0)
+    await ticks(h, 3, seconds=15)
+    owner_sells(h, _BTC, 0.4, 58200.0)
+    await ticks(h, 3, seconds=15)
+    assert len(db.list_trades()) == 1
+    assert h.engine._open_qty.get("CRYPTO:BTC", 0.0) == pytest.approx(0.0)
+    assert bot_sells(h, "CRYPTO:BTC") == []
+
+
+async def test_an_owner_sale_the_journal_never_saw_leaves_the_bots_next_trade_alone(
+    db, config
+) -> None:
+    """The owner holds F next to the bot at its exit and sells it while the app is down
+    across midnight (never journaled). The bot enters F again the next day and the owner
+    closes that position by hand: the bot's trade is journaled at his price, at once."""
+    h = await harness(db, config, mode=Mode.PAPER)
+    await enter_f(h)
+    await ticks(h, 1)
+    owner_buys(h, F, 50, 10.2)
+    await ticks(h, 1)
+    h.clock.advance(minutes=46)
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()  # the time stop sells the bot's 24
+    await ticks(h, 3)
+    assert len(db.list_trades()) == 1
+    h.clock.t = datetime(2026, 10, 21, 18, 0, tzinfo=UTC)  # the app is down
+    owner_sells(h, F, 50, 10.3)
+    h.clock.t = datetime(2026, 10, 22, 14, 0, tzinfo=UTC)  # Thursday 10:00 New York
+    every_fill = h.broker.fills_since
+
+    async def today_only(since: datetime) -> list[Fill]:
+        midnight = trading_day_start(trading_day(h.clock()))
+        return [f for f in await every_fill(since) if f.ts >= midnight]
+
+    h.broker.fills_since = today_only
+    h.engine = Engine(config, db, h.broker, h.decider, notifier=h.notes, clock=h.clock,
+                      scanner=h.scanner)  # fmt: skip
+    await ticks(h, 2)
+    h.decider.decisions = [buy()]
+    await h.engine.run_cycle()  # the bot enters F again
+    h.decider.decisions = []
+    assert h.broker.pos["STK:F"][0] == 24
+    await ticks(h, 2)
+    for oid in h.broker.working("STK:F", "stop") + h.broker.working("STK:F", "target"):
+        await h.broker.cancel_order(oid)
+    owner_sells(h, F, 24, 10.6)  # the owner closes the bot's position in TWS
+    await ticks(h, 3)
+    trades = db.list_trades()
+    assert len(trades) == 2 and trades[0].exit_price == pytest.approx(10.6)
+    assert db.get_position_meta("STK:F") is None
+
+
+@pytest.mark.parametrize("owner_journaled", [True, False])
+async def test_a_watchdog_sale_on_an_earlier_day_releases_the_bots_position(
+    db, config, owner_journaled: bool
+) -> None:
+    """The watchdog sold the bot's BTC next to the owner's on Wednesday night; the app comes
+    back Thursday, when IBKR no longer reports that sale. The bot's trade is journaled at
+    an estimate and its metadata released; the owner's BTC is never sold."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 1, 0, tzinfo=UTC))
+    mine = h.broker.pos["CRYPTO:BTC"][0]
+    meta = db.get_position_meta("CRYPTO:BTC")
+    if owner_journaled:
+        owner_buys(h, _BTC, 0.5, 60000.0)
+        await ticks(h, 1, seconds=15)
+    h.clock.advance(minutes=30)  # the app is down
+    if not owner_journaled:
+        owner_buys(h, _BTC, 0.5, 60000.0)
+    h.clock.advance(hours=1)
+    _watchdog_sells(h, meta, mine)
+    engine = _restart_next_morning(h, config)
+    h.broker.set_price("BTC", 58500.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    for _ in range(80):
+        await engine.monitor_tick()
+        h.clock.advance(seconds=15)
+    assert h.broker.pos["CRYPTO:BTC"][0] == pytest.approx(0.5)
+    assert bot_sells(h, "CRYPTO:BTC") == []
+    assert db.get_position_meta("CRYPTO:BTC") is None
+    [trade] = db.list_trades()
+    assert trade.qty == pytest.approx(mine)
+    assert trade.exit_reason == "closed at broker (fill not reported; price estimated)"

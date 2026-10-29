@@ -1174,10 +1174,17 @@ The trade journal pairs only the bot's own lots (`_reconstruct` replays `split_f
 .bot_fills`): the bot's trade completes when its own units are sold, its metadata is
 released while the owner still holds the symbol, and the owner's units are never part of a
 bot trade (a sale of the owner's that takes the bot's units too closes the bot's trade at
-that price). Once a window holds another client's buy, kv `journal_flat:<key>` keeps the
-next window starting before the owner's units: at the last fill that left both sides flat,
-else at the window's own start (trips already journaled are skipped). Windows without
-another client's buy are replayed exactly as before. Open follow-up: exit rules read IBKR's
+that price). While the bot holds a position the window starts at its entry (`opened_at`
+less the skew): an entry goes out only with the symbol flat at the broker (the risk check
+never adds to a position), so nothing bought before it, the owner's included, is part of
+it, and an owner sale the journal never saw cannot leave phantom units. Otherwise it starts
+at the bot's last journaled exit, as before. Another client's sell beyond both sides' units
+(and the unseen part of the bot's entry) sold what was held before the window: it is
+nobody's there, never paired with the metadata's entry. A capped watchdog sale on an
+earlier day IBKR no longer reports is journaled at an estimate (the stop, `unreported-exit`,
+dated at the sale, with an alert), so the bot's trade closes and its metadata is released;
+a watchdog sale it does report closes it from the executions. Windows without another
+client's activity are replayed exactly as before. Open follow-up: exit rules read IBKR's
 blended average cost of a mixed position.
 
 ### 7.9 Economic reporting and paired research (2026-10-23)

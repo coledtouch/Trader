@@ -34,6 +34,9 @@ EXTRA_PREFIX = "position_extra:"  # the engine's per-position kv (same key as en
 # kv: {"marker", "first", "orders": {broker order id: qty}}, the crypto watchdog's sells of
 # one bot position (an IOC sell may fill in part: the watchdog reads what each one filled).
 WATCHDOG_SALES_PREFIX = "watchdog_sales:"
+# broker_order_id of an exit fill the engine journals at an estimate (its real execution
+# fell on a day IBKR no longer reports): this app's own sell of the bot's units.
+UNREPORTED_EXIT = "unreported-exit"
 EPS = 1e-9
 
 
@@ -85,7 +88,9 @@ def split_fills(
     owner's. This app's own sell comes out of the bot's units first. Another client's sell
     comes out of the owner's first (the owner's round trip leaves the bot's shares alone),
     except from `bot_first_from` on: the crypto watchdog sold this position then, and its
-    sells are not told apart from the owner's. Errs low on the bot's side, never high.
+    sells are not told apart from the owner's. Another client's sell beyond both sides'
+    units sold what was held before the window: nobody's here. Errs low on the bot's side,
+    never high.
 
     `entry` (the bot's entry quantity): the part of it no buy here shows may have filled
     unseen (on a day IBKR no longer reports). A sell of the bot's beyond its seen units
@@ -124,7 +129,10 @@ def split_fills(
             owner -= o
             a = min(q - o, bot)
             bot -= a
-            on_bot = q - o
+            u = min(q - o - a, unseen)
+            unseen -= u
+            # Beyond those, units held from before the window were sold: nobody's here.
+            on_bot = a + u
         if on_bot > EPS:
             out.append(
                 f
@@ -277,6 +285,10 @@ def unreported_sales(sold: float, fills: Iterable[Fill], first: datetime) -> flo
     longer reports still came out of the bot's units."""
     start = _aware(first)
     seen = sum(
-        f.qty for f in fills if f.side == Side.SELL and is_other_client(f) and _aware(f.ts) >= start
+        f.qty
+        for f in fills
+        if f.side == Side.SELL
+        and (is_other_client(f) or f.broker_order_id == UNREPORTED_EXIT)
+        and _aware(f.ts) >= start
     )
     return max(0.0, sold - seen)
