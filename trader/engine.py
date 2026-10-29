@@ -184,6 +184,7 @@ FIRST_CYCLE_DELAY = 5.0
 MAX_BACKOFF = 120.0
 EPS = 1e-9
 EXTRA_PREFIX = "position_extra:"
+JOURNAL_FLAT_PREFIX = "journal_flat:"  # kv: fills before it are settled (owner and bot flat)
 BASELINE_PREFIX = "halt_baseline:"
 ACCOUNT_KEY = "broker_account"  # kv: the broker account id the journal belongs to
 HALT_SEEN_PREFIX = "halt_seen:"  # kv: when an instrument was last seen halted (cooldown)
@@ -3041,8 +3042,11 @@ class Engine:
         )
 
     async def _reconstruct(self, key: str, now: datetime) -> None:
-        """Journal every completed round trip for `key` since its last journaled exit."""
-        last_exit = self._last_exit_for(key)
+        """Journal every completed round trip of the bot for `key` since its last journaled
+        exit. Only the bot's own lots make its trips (trader/ownership.split_fills): shares
+        the owner bought next to them are neither paired with them nor journaled."""
+        anchor = self._journal_anchor(key)
+        last_exit = anchor if anchor is not None else self._last_exit_for(key)
         epoch = self._epoch  # fills before it belong to an earlier (simulated) account
         since = last_exit or now - TRADE_LOOKBACK
         if epoch is not None:
@@ -3061,10 +3065,18 @@ class Engine:
         fallback = None
         if meta and meta.get("entry_price"):
             fallback = (float(meta["entry_price"]), meta.get("opened_at") or now)
-        trips, open_qty = replay_fills(fills, fallback)
+        bot_first = None
+        if meta is not None:
+            sales = watchdog_sales(self.db, key, position_marker(meta), meta.get("opened_at"))
+            bot_first = sales[0] - FILL_TIME_SKEW if sales is not None else None
+        split = split_fills(fills, bot_first_from=bot_first)
+        trips, open_qty = replay_fills(split.bot_fills, fallback)
         self._open_qty[key] = open_qty
         self._pending_trades.discard(key)
+        journaled = self._bot_exit_for(key) if anchor is not None else None
         for trip in trips:
+            if journaled is not None and _aware(trip.exit_ts) <= journaled:
+                continue  # the window starts at a flat point before it: already journaled
             if any(f.commission <= 0 and now - _aware(f.ts) < COMMISSION_GRACE for f in trip.fills):
                 self._pending_trades.add(key)  # wait briefly for the commission report
                 return
@@ -3079,6 +3091,26 @@ class Engine:
             await self._journal_trade(key, trip, meta)
             if self._meta_used(key, meta):
                 meta = None  # the bot's position closed: what follows is someone else's
+        if split.owner_bought <= EPS and anchor is None:
+            return  # no other client bought in this window: as before
+        if meta is None:
+            self._close_reasons.pop(key, None)  # a close of the owner's shares
+        if split.flat_at is not None:
+            self.db.set_kv(JOURNAL_FLAT_PREFIX + key, split.flat_at.isoformat())
+        elif anchor is None:
+            # The owner holds shares bought before the bot's exit: the next window must
+            # still start before them.
+            start = last_exit if last_exit is not None else since - timedelta(microseconds=1)
+            self.db.set_kv(JOURNAL_FLAT_PREFIX + key, _aware(start).isoformat())
+
+    def _journal_anchor(self, key: str) -> datetime | None:
+        raw = self.db.get_kv(JOURNAL_FLAT_PREFIX + key)
+        if not raw:
+            return None
+        try:
+            return _aware(datetime.fromisoformat(raw))
+        except ValueError:
+            return None
 
     def _bot_trip(self, trip: _Trip, meta: dict[str, Any] | None) -> bool:
         """Whether the bot opened this round trip: a buy is one of its journaled orders, or

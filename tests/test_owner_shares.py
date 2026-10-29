@@ -20,6 +20,7 @@ from tests.test_engine import (
     hold,
 )
 from trader.broker.base import BrokerError
+from trader.engine import Engine
 from trader.models import (
     AssetClass,
     Fill,
@@ -114,11 +115,11 @@ async def test_ai_close_and_dashboard_close_sell_only_the_bots_shares(db, config
     assert bot_sells(h, "STK:F") == [24]
     assert h.broker.pos["STK:F"][0] == 50
     await ticks(h, 2)
-    # The bot holds nothing of F now: the dashboard's Close refuses the owner's shares.
-    import pytest
-
-    with pytest.raises(ValueError):
-        await h.engine.close_position("STK:F")
+    # The bot's trade is journaled from its own 24 and its position released: F is the
+    # owner's now (the dashboard's Close of it is the owner's own, as for any owner row).
+    [trade] = db.list_trades()
+    assert trade.qty == 24
+    assert db.get_position_meta("STK:F") is None
     assert h.broker.pos["STK:F"][0] == 50
 
 
@@ -471,3 +472,60 @@ async def test_kill_still_closes_everything(db, config) -> None:
     await ticks(h, 1)
     await h.engine.kill()
     assert "STK:F" not in h.broker.pos
+
+
+# ----------------------------------------------------------------------------- journal
+async def test_the_bots_trade_is_journaled_while_the_owner_still_holds(db, config) -> None:
+    h = await harness(db, config)
+    await enter_f(h)
+    await ticks(h, 1)
+    owner_buys(h, F, 50, 10.2)
+    await ticks(h, 1)
+    h.clock.advance(minutes=46)
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()  # the time stop sells the bot's 24
+    await ticks(h, 3)
+    [trade] = db.list_trades()
+    assert trade.qty == 24 and trade.entry_price == pytest.approx(10.01)
+    assert db.get_position_meta("STK:F") is None
+    assert h.broker.pos["STK:F"][0] == 50 and bot_sells(h, "STK:F") == [24]
+    owner_sells(h, F, 50, 10.4)
+    await ticks(h, 3)
+    assert len(db.list_trades()) == 1  # the owner's round trip is not the bot's
+
+
+async def test_a_restart_between_the_bots_exit_and_the_owners_sale_adds_no_trade(
+    db, config
+) -> None:
+    h = await harness(db, config)
+    await enter_f(h)
+    await ticks(h, 1)
+    owner_buys(h, F, 50, 10.2)
+    await ticks(h, 1)
+    h.clock.advance(minutes=46)
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    await ticks(h, 2)
+    assert len(db.list_trades()) == 1
+    h.engine = Engine(config, db, h.broker, h.decider, notifier=h.notes, clock=h.clock,
+                      scanner=h.scanner)  # fmt: skip
+    owner_sells(h, F, 50, 10.4)
+    await ticks(h, 3)
+    assert len(db.list_trades()) == 1
+
+
+async def test_the_owner_selling_everything_closes_the_bots_trade_at_his_price(db, config) -> None:
+    h = await harness(db, config)
+    await enter_f(h)
+    await ticks(h, 1)
+    owner_buys(h, F, 50, 10.2)
+    await ticks(h, 1)
+    for oid in h.broker.working("STK:F", "stop") + h.broker.working("STK:F", "target"):
+        await h.broker.cancel_order(oid)
+    owner_sells(h, F, 74, 10.4)
+    await ticks(h, 3)
+    [trade] = db.list_trades()
+    assert trade.qty == 24 and trade.exit_price == pytest.approx(10.4)
+    assert db.get_position_meta("STK:F") is None

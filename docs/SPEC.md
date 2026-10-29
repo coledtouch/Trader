@@ -1156,9 +1156,17 @@ units. It records each accepted sell in kv `watchdog_sales:<key>` (`{"marker", "
 what it filled (an IOC sell may fill in part) and one still working by what it asked;
 without a record (an older watchdog) its audit rows count. A capped sale never marks the
 position sold flat (`WATCHDOG_CLOSED`). KILL and the daily-loss flatten outside shadow mode
-(`flatten_all`) still close everything (owner decision of 2026-10-23). Open follow-up: after
-a capped exit the metadata stays until the owner sells, and that trip is journaled as one
-bot trade; exit rules read IBKR's blended average cost of a mixed position.
+(`flatten_all`) still close everything (owner decision of 2026-10-23).
+
+The trade journal pairs only the bot's own lots (`_reconstruct` replays `split_fills(...)
+.bot_fills`): the bot's trade completes when its own units are sold, its metadata is
+released while the owner still holds the symbol, and the owner's units are never part of a
+bot trade (a sale of the owner's that takes the bot's units too closes the bot's trade at
+that price). Once a window holds another client's buy, kv `journal_flat:<key>` keeps the
+next window starting before the owner's units: at the last fill that left both sides flat,
+else at the window's own start (trips already journaled are skipped). Windows without
+another client's buy are replayed exactly as before. Open follow-up: exit rules read IBKR's
+blended average cost of a mixed position.
 
 ### 7.9 Economic reporting and paired research (2026-10-23)
 
