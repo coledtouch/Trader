@@ -472,3 +472,37 @@ async def test_a_stop_placed_in_the_releasing_tick_is_cancelled(db, config) -> N
     h.broker.set_price("F", 9.7)
     await ticks(h, 3, seconds=15)
     assert h.broker.pos["STK:F"][0] == 13
+
+
+# ------------------------------------------------- a lagging read, the executions unread
+@pytest.mark.parametrize("lagged", [2, 3])
+async def test_an_owner_buy_a_lagging_read_hides_is_never_sold_with_the_executions_unread(
+    db, config, lagged: int
+) -> None:
+    """The bot's 24 F, not journaled yet; the owner buys 50 seconds before he presses
+    Close. The executions read fails and the position reads up to the cap's still show the
+    bot's 24 (they lag): nothing says he bought. The close's own read holds 74: Close sells
+    the bot's 24, never his 50."""
+    h = await harness(db, config, exits={"time_stop_minutes": 0})
+    await enter_f(h)
+    h.clock.advance(seconds=5)
+    owner_buys(h, F, 50, 10.0)
+
+    async def failing(since):
+        raise BrokerError("IBKR executions timed out after 10s")
+
+    h.broker.fills_since = failing
+    real = h.broker.positions
+    calls = {"n": 0}
+
+    async def lagging():
+        calls["n"] += 1
+        out = await real()
+        if calls["n"] <= lagged:
+            return [p.model_copy(update={"qty": 24.0}) for p in out]
+        return out
+
+    h.broker.positions = lagging
+    rec = await h.engine.close_position("STK:F")
+    assert rec.request.qty == 24
+    assert h.broker.pos["STK:F"][0] == 50

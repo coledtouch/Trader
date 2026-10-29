@@ -210,6 +210,10 @@ def split_fills(
             b = min(lead - a - u, owner)
             owner -= b
             on_bot = lead - b
+            if charge and entry is not None:
+                # The bot never holds more than its entry: beyond its units (seen and unseen)
+                # and the owner's, units held from before the window were sold: nobody's.
+                on_bot = a + u
             rest = q - lead  # another client's: out of the owner's units first
             if rest > EPS:
                 o = min(rest, owner)

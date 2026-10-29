@@ -1132,7 +1132,8 @@ position on: its sells are not told apart from the owner's; at most what the wat
 have sold in all, less what the app already journaled of it at an estimate, and only until
 its last sale was sent, plus the skew, once every one of its orders is done; beyond that,
 another client's sells are the owner's again; the budget is charged only with what such a
-sell took of the bot's units). The entry's quantity
+sell took of the bot's units, and such a sell is the bot's only for what it took of them).
+The entry's quantity
 (`position_extra.qty`, older rows: planned risk over risk per unit, to 10 decimals so an
 8-decimal crypto quantity is not read as more than the entry) bounds the bot's part:
 the bot never adds to a position. Part of the entry may be in no fill (it filled on a day
@@ -1152,7 +1153,11 @@ buy of today; not while a fill of the last two minutes may be missing from the r
 quiet tick and before the journal replays a position another client sold in. Another
 client's sells come out of them after his seen units and before the bot's, so his sale of
 units he bought on a day IBKR no longer reports never closes the bot's trade; for sizing
-they are his like his seen ones, and the unseen part of the entry counts only beyond them.
+they are his like his seen ones, and the unseen part of the entry counts only beyond them
+(for a stock, also only up to what the app's working stops still cover: a bracket child
+that sold some of it on such a day shrank them). A replay that would close the bot's trade
+on another client's sell waits while those units could not be looked for yet (a fill of
+the last two minutes), unless a sale of the bot's own may have sold its units unseen.
 Once the entry's rest is settled (below), none of it is credited to an exit either.
 
 Evidence the owner bought is an owner buy in the window, more held than the entry asked
@@ -1166,7 +1171,9 @@ have filled beyond the journal: `app_entry_unjournaled`), keeping the owner's kn
 undecided while the executions are unread) or once the crypto watchdog's sales known to have
 filled are off (with the executions unread, also its sales still working, at what they
 asked: its IOC is done only on its next poll, and until then the rest held may be the
-owner's). Without it nothing changes: every exit sells the whole position, as before. With it,
+owner's). Without it nothing changes: every exit sells the whole position, as before (with the
+executions unread, at most what the position read that sized it held: a later read showing
+more only shrinks it). With it,
 every bot exit (the engine's stops, targets, time stop and backup stop, the flatten before
 the close, AI and approved closes, the dashboard Close of a bot position, the shadow-mode
 halt flatten, re-placed stops) sells at most `Cap.qty` (the bot's units, rounded down) and
@@ -1245,8 +1252,8 @@ never adds to a position), so nothing bought before it, the owner's included, is
 it, and an owner sale the journal never saw cannot leave phantom units. Otherwise it starts
 at the bot's last journaled exit, as before; when that exit is a trip of this same
 position (a partly filled entry whose first part exited), it replays from the entry and
-skips the trip already journaled. Consecutive sells of the bot's matched to the metadata's
-entry (no buy of it in the journal) are one exit in several executions: one trip. Part of
+skips the trip already journaled. Consecutive executions of one sell order of the bot's
+matched to the metadata's entry (no buy of it in the journal) are one exit: one trip. Part of
 the bot's entry the journal never saw fill (its
 rest filled while the app was down, on a day IBKR no longer reports; an entry the app last
 saw working that IBKR no longer lists, or the engine forgot) keeps the metadata while the

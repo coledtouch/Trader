@@ -32,7 +32,7 @@ import logging
 import math
 from collections import deque
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
@@ -315,13 +315,13 @@ def replay_fills(
                 and unsized
                 and nxt is not None
                 and nxt.side == Side.SELL
+                and nxt.broker_order_id == fill.broker_order_id
                 and (
                     journaled is None or _aware(fill.ts) > journaled or _aware(nxt.ts) <= journaled
                 )
             ):
-                # The metadata's lot is sized to each sell: the next sell of the bot's with
-                # no buy between is more of the same exit (one order in several
-                # executions), not a trip of its own.
+                # The metadata's lot is sized to each sell: the next execution of the same
+                # sell order is more of the same exit, not a trip of its own.
                 continue
             if trip.qty > EPS:
                 trips.append(trip)
@@ -2323,6 +2323,12 @@ class Engine:
             hidden=read_hidden(extra),
         )
         split = for_sizing(split, extra)
+        if extra.get(OWNER_HIDDEN) and inst.asset_class != AssetClass.CRYPTO and split.unseen > EPS:
+            # The owner's units no fill shows were found with all of the entry's unseen part
+            # taken as held; a bracket child that sold some of it on a day IBKR no longer
+            # reports shrank the stop: the bot holds no more than its stops cover.
+            cover = await self._stop_cover(inst)
+            split = replace(split, unseen=min(split.unseen, max(0.0, cover - split.bot)))
         base = split
         bought = lagging = False
         if sales is not None and bot_first is not None:
@@ -2384,6 +2390,12 @@ class Engine:
             return Cap(qty=mine, keep=max(0.0, split.owner))
         cap = sell_cap(held, limit, split, evidence=bought)
         if cap is None:
+            if not read:
+                # Nothing says the owner bought, but with the executions unread only as of
+                # this position read and the journal (a tick behind): the read may lag his
+                # buy. Sell no more than this read holds: the broker's fresh read after its
+                # cancels only shrinks it, never sells what a later read shows beyond it.
+                return Cap(qty=held, keep=0.0)
             return None
         if not read and abs(held - (split.bot + split.owner)) > max(EPS, 1e-6 * held):
             # The journal is behind the position and the executions could not say whose
@@ -2448,7 +2460,11 @@ class Engine:
             return True
         if inst.asset_class == AssetClass.CRYPTO:
             return False  # no bracket at IBKR: every sell of the bot's is journaled
-        working = sum(
+        return await self._stop_cover(inst) < bot - max(EPS, 1e-6 * bot)
+
+    async def _stop_cover(self, inst: Instrument) -> float:
+        """What a stock's protective stops of the app's working at the broker cover."""
+        return sum(
             o.request.qty - o.filled_qty
             for o in await self.broker.open_orders()
             if o.request.instrument.key == inst.key
@@ -2457,7 +2473,6 @@ class Engine:
             and o.status in OPEN_ORDER_STATUSES
             and self.broker.can_cancel(o)
         )
-        return working < bot - max(EPS, 1e-6 * bot)
 
     def _note_unknown_sale(
         self, inst: Instrument, meta: dict[str, Any], held: float, bot: float, owner: float
@@ -3253,35 +3268,66 @@ class Engine:
         self._fill_commissions = {
             k: v for k, v in self._fill_commissions.items() if _aware(v[1]) >= cutoff
         }
-        await self._note_hidden_before_replay(touched, now)
+        undecided = await self._note_hidden_before_replay(touched, now)
         for key in sorted(touched):
-            await self._reconstruct(key, now)
+            await self._reconstruct(key, now, hidden_undecided=key in undecided)
         self._fills_journaled_at = now
 
-    async def _note_hidden_before_replay(self, keys: set[str], now: datetime) -> None:
+    async def _note_hidden_before_replay(self, keys: set[str], now: datetime) -> set[str]:
         """Before the journal replays a bot position that another client sold in, note the
         owner's units no fill shows (`_note_hidden`): his sale of units he bought on a day
         IBKR no longer reports must not close the bot's trade. One positions read, and only
-        for such positions (none on the pure-bot path)."""
+        for such positions (none on the pure-bot path). Returns the positions it could not
+        look at yet (a fill of the last moments, or no positions read) while nothing of the
+        bot's can have sold unseen: their replay must not journal another client's sell as
+        the bot's until it can."""
         held: dict[str, float] | None = None
+        unread = False
+        undecided: set[str] = set()
         for key in sorted(keys):
             meta = self.db.get_position_meta(key)
             opened = meta.get("opened_at") if meta else None
             if meta is None or opened is None or self._meta_used(key, meta):
                 continue
             since = _aware(opened) - FILL_TIME_SKEW
-            if not any(
-                f.instrument.key == key and f.side == Side.SELL and is_other_client(f)
+            fills = [
+                f
                 for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
-            ):
+                if f.instrument.key == key and _aware(f.ts) >= since
+            ]
+            if not any(f.side == Side.SELL and is_other_client(f) for f in fills):
                 continue
-            if held is None:
+            if held is None and not unread:
                 try:
                     held = {p.instrument.key: p.qty for p in await self.broker.positions()}
                 except BrokerError as exc:
                     log.warning("positions not read before the journal replay: %s", exc)
-                    return
-            self._note_hidden(key, meta, held.get(key, 0.0), now)
+                    unread = True
+            if (
+                held is None or not self._note_hidden(key, meta, held.get(key, 0.0), now)
+            ) and not await self._bot_units_may_be_gone(key, meta, fills):
+                undecided.add(key)
+        return undecided
+
+    async def _bot_units_may_be_gone(
+        self, key: str, meta: dict[str, Any], fills: list[Fill]
+    ) -> bool:
+        """Whether a sale of the bot's own may have sold its units where no fill shows it
+        (the crypto watchdog's, an exit of the app's, a bracket child): then another
+        client's sell beyond the owner's units is no sure sign of units of his no fill
+        shows. Undecided (a failed read) counts as yes."""
+        opened = _aware(meta["opened_at"])
+        if watchdog_sales(self.db, key, position_marker(meta), opened) is not None:
+            return True
+        own = self._bot_split(
+            key, meta, [f for f in fills if not (f.side == Side.SELL and is_other_client(f))]
+        )
+        try:
+            return await self._bot_sold_unseen(
+                Instrument.from_key(key), opened, fills, own.bot + own.unseen
+            )
+        except BrokerError:
+            return True
 
     def _last_exit_for(self, key: str) -> datetime | None:
         if self._last_exit is None:
@@ -3422,7 +3468,7 @@ class Engine:
             hidden=read_hidden(self._extra(key)) if hidden is None else hidden,
         )
 
-    def _note_hidden(self, key: str, meta: dict[str, Any], held: float, now: datetime) -> None:
+    def _note_hidden(self, key: str, meta: dict[str, Any], held: float, now: datetime) -> bool:
         """Units held beyond what the fills explain and beyond the unseen part of the bot's
         entry are the owner's, bought where IBKR no longer reports (the bot never adds to a
         position, and its entry went out with the symbol flat): record them, so another
@@ -3430,10 +3476,10 @@ class Engine:
         (today's executions show every buy): dated at the trading day's start, so his sale
         of them earlier today is his too, all of it (a split that charged part of it to the
         bot explains less: look again with what was found). Not while a fill of the last
-        moments may be missing from the position read."""
+        moments may be missing from the position read (returns False: it could not look)."""
         opened = meta.get("opened_at")
         if opened is None or held <= EPS or entry_qty(self._extra(key), meta) is None:
-            return
+            return True
         since = _aware(opened) - FILL_TIME_SKEW
         fills = [
             f
@@ -3441,7 +3487,7 @@ class Engine:
             if f.instrument.key == key and _aware(f.ts) >= since
         ]
         if any(now - _aware(f.ts) < 2 * FILL_TIME_SKEW for f in fills):
-            return
+            return False
         settled = bool(self._extra(key).get(REST_SETTLED))
         possible: float | None = None  # what of the entry may have filled unseen
         pools = read_hidden(self._extra(key))
@@ -3462,13 +3508,14 @@ class Engine:
                 break
             found += excess
         if found <= max(EPS, 1e-6 * held):
-            return
+            return True
         seen = list(self._extra(key).get(OWNER_HIDDEN) or [])
         seen.append([day.isoformat(), round(found, 10)])
         self._set_extra(key, **{OWNER_HIDDEN: seen})
         log.warning("%s: %g held beyond what the fills explain: the owner's", key, found)
+        return True
 
-    async def _reconstruct(self, key: str, now: datetime) -> None:
+    async def _reconstruct(self, key: str, now: datetime, hidden_undecided: bool = False) -> None:
         """Journal every completed round trip of the bot for `key` since its last journaled
         exit. Only the bot's own lots make its trips (trader/ownership.split_fills): shares
         the owner bought next to them are neither paired with them nor journaled. While the
@@ -3515,6 +3562,14 @@ class Engine:
                 continue
             if any(f.commission <= 0 and now - _aware(f.ts) < COMMISSION_GRACE for f in trip.fills):
                 self._pending_trades.add(key)  # wait briefly for the commission report
+                return
+            if hidden_undecided and any(
+                f.side == Side.SELL and is_other_client(f) for f in trip.fills
+            ):
+                # Another client's sell taken from the bot's units while the owner's units no
+                # fill shows could not be looked for (`_note_hidden`): it may be his sale of
+                # them. Wait until they can be.
+                self._pending_trades.add(key)
                 return
             if not self._bot_trip(trip, meta):
                 # The owner's own round trip in TWS or IBKR Mobile: account equity has its
