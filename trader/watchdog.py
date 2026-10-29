@@ -52,6 +52,7 @@ from trader.ownership import (
     FILL_TIME_SKEW,
     WATCHDOG_TAG_PREFIX,
     app_sold_unjournaled,
+    bought_since,
     entry_qty,
     is_other_client,
     less_sold,
@@ -489,10 +490,7 @@ class CryptoWatchdog:
         # More held than the bot can still hold once its known sales are off: bought since.
         filled = watchdog_filled(self.db, key, marker)
         after = less_sold(split, filled[1]) if filled is not None else split
-        bought_since = limit is not None and held > after.bot + after.unseen + after.owner + (
-            max(1e-9, 1e-6 * limit)
-        )
-        if not owner_evidence(held, limit, split) and not bought_since:
+        if not owner_evidence(held, limit, split) and not bought_since(held, limit, after):
             return None
         if cut is not None:
             # What the journal shows of this process's sales (the app's estimate of an

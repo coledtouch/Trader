@@ -1132,13 +1132,15 @@ position on: its sells are not told apart from the owner's). The entry's quantit
 the bot never adds to a position. Part of the entry may be in no fill (it filled on a day
 IBKR no longer reports): a sell of the bot's beyond its seen units comes out of that unseen
 part before the owner's (so does another client's beyond the owner's and the bot's seen
-units, unless it came before the entry was sent: the symbol was flat then), and units no
+units). A sell before the entry was sent and any buy of the bot's (the bot's previous trip,
+or another client's) sold nothing of the position: the symbol was flat then. Units no
 fill explains count as the bot's when they fit in what is left of it (so its own position
 keeps its exits); more than that, and whose they are is unknown (the bot sells only what its
 fills show, and the owner is alerted).
 
-Evidence the owner bought is an owner buy in the window, or more held than the entry asked
-for. Without it nothing changes: every exit sells the whole position, as before. With it,
+Evidence the owner bought is an owner buy in the window, more held than the entry asked
+for, or more held than the bot can still hold once the crypto watchdog's sales known to have
+filled are off. Without it nothing changes: every exit sells the whole position, as before. With it,
 every bot exit (the engine's stops, targets, time stop and backup stop, the flatten before
 the close, AI and approved closes, the dashboard Close of a bot position, the shadow-mode
 halt flatten, re-placed stops) sells at most `Cap.qty` (the bot's units, rounded down) and
@@ -1193,12 +1195,15 @@ that price). While the bot holds a position the window starts at its entry (`ope
 less the skew): an entry goes out only with the symbol flat at the broker (the risk check
 never adds to a position), so nothing bought before it, the owner's included, is part of
 it, and an owner sale the journal never saw cannot leave phantom units. Otherwise it starts
-at the bot's last journaled exit, as before. Another client's sell beyond both sides' units
+at the bot's last journaled exit, as before; when that exit is a trip of this same
+position (a partly filled entry whose first part exited), it replays from the entry and
+skips the trip already journaled. Another client's sell beyond both sides' units
 (and the unseen part of the bot's entry) sold what was held before the window: it is
 nobody's there, never paired with the metadata's entry. A capped watchdog sale on an
 earlier day IBKR no longer reports (the owner's units next to the bot's) is journaled at an
 estimate of what the watchdog saw filled (done orders only, never an order of unknown fill;
-the stop, `unreported-exit`, dated at the sale, with an alert), so the bot's trade closes
+the stop, `unreported-exit`, dated at the latest sale it covers, so a later outage's sale
+gets its own; with an alert), so the bot's trade closes
 and its metadata is released; without the owner's units, everything held is the bot's,
 still unsold, and only the flat-position path (`_close_unreported_exit`) estimates. A
 watchdog sale IBKR does report closes it from the executions. Windows without another

@@ -97,9 +97,9 @@ def split_fills(
     `entry` (the bot's entry quantity): the part of it no buy here shows may have filled
     unseen (on a day IBKR no longer reports). A sell of the bot's beyond its seen units
     comes out of that part before the owner's (`Split.unseen` is what is left of it); so
-    does another client's beyond the owner's and the bot's seen units, unless it came
-    before the entry was sent (`entry_sent`) and any buy of the bot's: the symbol was flat
-    then, so it sold nothing of the bot's."""
+    does another client's beyond the owner's and the bot's seen units. A sell before the
+    entry was sent (`entry_sent`) and any buy of the bot's sold nothing of the bot's
+    position: the symbol was flat at the broker when the entry went out."""
     bot = owner = owner_bought = bot_bought = 0.0
     ordered = sorted(fills, key=lambda f: (_aware(f.ts), f.exec_id))
     seen = sum(f.qty for f in ordered if f.side == Side.BUY and not is_other_client(f))
@@ -122,7 +122,13 @@ def split_fills(
                 bot_bought += q
                 out.append(f)
             continue
-        if not other or (start is not None and _aware(f.ts) >= start):
+        if sent_at is not None and bot_bought <= EPS and _aware(f.ts) < sent_at:
+            # Before the entry was sent (and any buy of the bot's): the symbol was flat at
+            # the broker when it went out, so this sold nothing of the bot's position (the
+            # bot's previous trip, or units held from before the window).
+            owner -= min(q, owner)
+            on_bot = 0.0
+        elif not other or (start is not None and _aware(f.ts) >= start):
             a = min(q, bot)
             bot -= a
             u = min(q - a, unseen)
@@ -135,8 +141,7 @@ def split_fills(
             owner -= o
             a = min(q - o, bot)
             bot -= a
-            early = sent_at is not None and bot_bought <= EPS and _aware(f.ts) < sent_at
-            u = 0.0 if early else min(q - o - a, unseen)
+            u = min(q - o - a, unseen)
             unseen -= u
             # Beyond those, units held from before the window were sold: nobody's here.
             on_bot = a + u
@@ -195,6 +200,12 @@ def owner_evidence(held: float, limit: float | None, split: Split) -> bool:
     """Something says the owner bought next to the bot: another client's buy in the
     window, or more held than the bot's entry order asked for."""
     return split.owner_bought > EPS or (limit is not None and held > limit + _tol(limit))
+
+
+def bought_since(held: float, limit: float | None, after: Split) -> bool:
+    """More held than the bot can still hold (`after`: the split less the crypto
+    watchdog's sales known to have filled that no fill in it shows): someone else bought."""
+    return limit is not None and held > after.bot + after.unseen + after.owner + _tol(limit)
 
 
 def sell_cap(
@@ -277,6 +288,24 @@ def _record_sales(rec: dict[str, Any], *, done_only: bool) -> tuple[datetime, fl
         first = stamp if first is None or stamp < first else first
         total += q
     return None if first is None else (first, total)
+
+
+def watchdog_last_filled(db: Database, key: str, marker: str, before: datetime) -> datetime | None:
+    """When the watchdog sent the latest of its sells for this bot position that is done
+    and filled something, among those sent before `before`."""
+    rec = read_sales_record(db, key, marker)
+    if rec is None:
+        return None
+    finished = set(rec.get("done", []))
+    sent = rec.get("at", {})
+    last: datetime | None = None
+    for order_id, qty in rec.get("orders", {}).items():
+        if order_id not in finished or float(qty) <= EPS:
+            continue
+        stamp = _aware(datetime.fromisoformat(sent.get(order_id, rec["first"])))
+        if stamp < _aware(before) and (last is None or stamp > last):
+            last = stamp
+    return last
 
 
 def watchdog_filled(db: Database, key: str, marker: str) -> tuple[datetime, float] | None:

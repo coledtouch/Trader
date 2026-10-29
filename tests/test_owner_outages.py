@@ -32,6 +32,7 @@ from trader.models import (
     TradeAction,
 )
 from trader.ownership import UNREPORTED_EXIT, note_watchdog_sale
+from trader.timeutil import trading_day, trading_day_start
 from trader.watchdog import position_marker
 
 KEY = "CRYPTO:BTC"
@@ -292,3 +293,136 @@ async def test_the_owner_buying_after_a_partial_watchdog_sale_keeps_his_coins(
         tw.beat(db, clock, age=60)
         await watchdog.tick()
     assert [round(o.qty, 6) for o in broker.placed] == [BOT, 0.006]
+
+
+# ----------------------------------------------------------------------------- review 39
+def _watchdog_sold_overnight(h, meta: dict, sold: float, asked: float) -> None:
+    """The watchdog's sell of the bot's BTC at 58900, done and recorded as it keeps it."""
+    h.broker.pos[KEY][0] -= sold
+    h.broker.cash += sold * 58900.0
+    h.broker.fills.append(
+        Fill(exec_id=f"WD{next(_ids)}", broker_order_id=f"perm:{next(_ids)}", instrument=_BTC,
+             side=Side.SELL, qty=sold, price=58900.0, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    marker = position_marker(meta)
+    order_id = f"B{next(_ids)}"
+    note_watchdog_sale(h.db, KEY, marker, order_id, asked, h.clock())
+    note_watchdog_sale(h.db, KEY, marker, order_id, sold, h.clock(), done=True)
+
+
+@pytest.mark.parametrize("part", [1.0, 0.6])
+async def test_a_small_owner_buy_next_to_the_watchdogs_sale_is_never_sold_next_day(
+    db, config, part: float
+) -> None:
+    """The owner buys less BTC than the bot's entry while the app is down; the watchdog
+    sells the bot's (all, or 60% of it); the app comes back the next day. The owner's
+    coins are never sold: the bot sells only its own rest, if any."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 1, 0, tzinfo=UTC))
+    mine = h.broker.pos[KEY][0]
+    meta = db.get_position_meta(KEY)
+    h.clock.t = datetime(2026, 10, 29, 2, 0, tzinfo=UTC)
+    owner = 0.001
+    owner_buys(h, _BTC, owner, 59400.0)
+    h.clock.t = datetime(2026, 10, 29, 2, 10, tzinfo=UTC)
+    sold = round(mine * part, 8)
+    _watchdog_sold_overnight(h, meta, sold, mine)
+    engine = _restart_next_morning(h, config)
+    h.broker.set_price("BTC", 59500.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    for _ in range(12):
+        await engine.monitor_tick()
+        h.clock.advance(seconds=15)
+    rest = round(mine - sold, 8)
+    assert bot_sells(h, KEY) == ([pytest.approx(rest, abs=1e-6)] if rest > 0 else [])
+    assert h.broker.pos[KEY][0] == pytest.approx(owner, abs=1e-6)  # crypto rounds down
+
+
+async def test_a_second_earlier_day_watchdog_sale_is_journaled(db, config) -> None:
+    """Two outages, each ending the next day, each with a watchdog sale of the bot's BTC
+    next to the owner's: both are journaled and the bot's trade closes."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 1, 0, tzinfo=UTC))
+    mine = h.broker.pos[KEY][0]
+    meta = db.get_position_meta(KEY)
+    owner_buys(h, _BTC, 0.5, 60000.0)
+    await ticks(h, 2, seconds=15)
+    h.clock.advance(minutes=30)
+    part = round(mine * 0.6, 8)
+    _watchdog_sold_overnight(h, meta, part, mine)
+    h.engine = _restart_next_morning(h, config)
+    h.broker.set_price("BTC", 60600.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    await ticks(h, 6, seconds=15)
+    assert db.get_position_meta(KEY) is not None  # the bot's rest is still held
+    h.clock.t = datetime(2026, 10, 30, 2, 0, tzinfo=UTC)  # Thursday night: down again
+    rest = round(mine - part, 8)
+    _watchdog_sold_overnight(h, meta, rest, rest)
+    h.clock.t = datetime(2026, 10, 30, 14, 0, tzinfo=UTC)  # Friday 10:00 New York
+    every_fill = h.broker.fills_since
+
+    async def today_only(since: datetime) -> list[Fill]:
+        midnight = trading_day_start(trading_day(h.clock()))
+        return [f for f in await every_fill(since) if f.ts >= midnight]
+
+    h.broker.fills_since = today_only
+    h.engine = Engine(config, db, h.broker, h.decider, notifier=h.notes, clock=h.clock,
+                      scanner=h.scanner)  # fmt: skip
+    await ticks(h, 20, seconds=15)
+    assert h.broker.pos[KEY][0] == pytest.approx(0.5)
+    assert db.get_position_meta(KEY) is None
+    [trade] = db.list_trades()
+    assert trade.qty == pytest.approx(mine)
+
+
+async def test_an_owner_buy_before_the_first_part_of_an_entry_exits_stays_his(db, config) -> None:
+    """7 of the bot's 24 fill and its target sells them while the rest still works; the
+    owner bought 50 in between. When the rest has filled, the owner's sale of 20 is his,
+    not the bot's trade, and the bot's 17 keep their stop."""
+    h = await _f_harness(db, config)
+    b = h.broker
+    entry, total = await _resting_entry(h)
+    h.clock.advance(minutes=1)
+    _part(b, entry, 7, 10.01)
+    await ticks(h, 2, seconds=15)
+    owner_buys(h, F, 50, 10.2)
+    await ticks(h, 2, seconds=15)
+    _part(b, f"{entry}-TP", 7, 10.5)
+    await ticks(h, 2, seconds=15)
+    assert [t.qty for t in db.list_trades()] == [7]
+    h.clock.advance(minutes=5)
+    _part(b, entry, total - 7, 10.01)
+    await ticks(h, 3, seconds=15)
+    h.clock.advance(minutes=5)
+    owner_sells(h, F, 20, 10.3)
+    await ticks(h, 4, seconds=15)
+    assert [t.qty for t in db.list_trades()] == [7]
+    assert db.get_position_meta("STK:F") is not None
+    assert b.working("STK:F", "stop")
+
+
+@pytest.mark.parametrize("journaled", [0.0, 0.004])
+async def test_a_quick_reentry_after_the_bots_own_exit_is_still_guarded(
+    db: Database, journaled: float
+) -> None:
+    """No other client in BTC. The bot's previous trip sold 30 s before its new entry was
+    sent; the new entry filled while the app was down (or in part before): that earlier
+    sell is no sale of the new position, and the watchdog sells all of it."""
+    btc = tw.crypto()
+    opened = tw.NOW - timedelta(hours=1)
+    db.insert_fill(Fill(exec_id="P1", broker_order_id="7", instrument=btc, side=Side.BUY,
+                        qty=0.02, price=100.0, ts=opened - timedelta(minutes=20)))  # fmt: skip
+    db.insert_fill(Fill(exec_id="P2", broker_order_id="8", instrument=btc, side=Side.SELL,
+                        qty=0.02, price=101.0, ts=opened - timedelta(seconds=30)))  # fmt: skip
+    db.set_position_meta(btc.key, stop_loss=95.0, take_profit=110.0, entry_price=100.0,
+                         initial_risk=5.0 * 0.01, opened_at=opened)  # fmt: skip
+    db.set_kv("position_extra:" + btc.key, '{"unit_risk": 5.0, "qty": 0.01}')
+    if journaled:
+        at = opened + timedelta(seconds=2)
+        db.insert_fill(Fill(exec_id="E1", broker_order_id="12", instrument=btc, side=Side.BUY,
+                            qty=journaled, price=100.0, ts=at))  # fmt: skip
+    clock = tw.Clock()
+    broker = tw.FakeBroker()
+    broker.positions_list.append(Position(instrument=btc, qty=0.01, avg_cost=100.0))
+    broker.quotes[btc.key] = tw.q(btc, 90.0, 90.0)  # below the 95 stop
+    tw.beat(db, clock, age=60)
+    watchdog, _ = tw.make(db, broker, clock)
+    await watchdog.tick()
+    await watchdog.tick()
+    assert [o.qty for o in broker.placed] == [pytest.approx(0.01)]
