@@ -687,15 +687,19 @@
     pnlNode.classList.toggle('neg', toneOf(pnl) === 'neg');
 
     const lim = limits();
-    // The server's figure follows a resume (halts are then measured from the resume equity).
-    const loss = isNum(s.loss_limit_usd) && s.loss_limit_usd > 0
+    // The server's figure follows a resume (halts are then measured from the resume equity);
+    // after a resume while up it is negative: the halt fires above the day's start.
+    const loss = isNum(s.loss_limit_usd)
       ? s.loss_limit_usd
       : lim && isNum(lim.lossPct) && base ? (base * lim.lossPct) / 100 : null;
     renderMeter(pnl, loss);
-    setText($('pnl-loss-label'), loss ? `Loss limit ${signedMoney(-loss)}` : 'Loss limit unavailable');
+    const lossLabel = loss > 0 ? `Loss limit ${signedMoney(-loss)}` : `Halt at ${signedMoney(-loss)}`;
+    setText($('pnl-loss-label'), isNum(loss) ? lossLabel : 'Loss limit unavailable');
 
     let note = '';
-    if (pnl !== null && pnl < 0 && loss) {
+    if (isNum(loss) && loss <= 0) {
+      note = `Halts and closes everything at ${signedMoney(-loss)} today (measured from the resume).`;
+    } else if (pnl !== null && pnl < 0 && loss) {
       note = `${Math.min(100, Math.round((-pnl / loss) * 100))}% of today's loss limit used.`;
     } else if (pnl !== null && loss) {
       note = 'No daily loss budget used.';

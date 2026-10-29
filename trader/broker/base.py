@@ -144,6 +144,11 @@ class Broker(ABC):
         at once never list one, so the default is False."""
         return False
 
+    def holds_untracked_positions(self) -> bool:
+        """True when the account holds something positions() leaves out (on IBKR: options,
+        futures, bonds, FX): its value moves equity, so the account is not flat."""
+        return False
+
     def supports_standalone_stops(self, instrument: Instrument) -> bool:
         """True if place_order rests a stop order for a SELL exit carrying stop_loss (used to
         re-place a missing protective stop). False means such a request is rejected."""

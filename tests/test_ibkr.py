@@ -1710,3 +1710,28 @@ async def test_a_raised_stop_reads_back_raised_and_is_put_back_there() -> None:
     rec = await broker.close_position(AAPL, "time stop")
     assert rec is not None and rec.status == OrderStatus.REJECTED
     assert _working(fake, "STP") == [("AAPL", 100.5)]
+
+
+async def test_a_reopened_quote_line_never_serves_its_old_prices() -> None:
+    """Review finding: ib_async hands back an earlier subscription's Ticker with its old
+    values, so a quote line reopened after eviction answered at once with prices one cycle
+    (or one halt) old, and a stale halted flag."""
+    broker, fake = await connected_broker()
+    broker.QUOTE_TIMEOUT = 0.2
+    kept: dict[int, Ticker] = {}
+
+    def req_mkt_data(contract, *args, **kwargs):  # like ib_async: one Ticker per contract
+        ticker = kept.setdefault(contract.conId, Ticker(contract=contract))
+        for name, value in fake.ticker_values.get(contract.conId, {}).items():
+            setattr(ticker, name, value)
+        return ticker
+
+    fake.reqMktData = req_mkt_data
+    fake.ticker = lambda contract: kept.get(contract.conId)
+    fake.ticker_values[stock().conId] = {"bid": 100.0, "ask": 100.02, "last": 100.01}
+    first = await broker.quote(AAPL)
+    assert first.bid == 100.0
+    broker._tickers.clear()  # the line was evicted; IBKR sends nothing new for a while
+    fake.ticker_values[stock().conId] = {}
+    again = await broker.quote(AAPL)
+    assert again.bid is None and again.last is None

@@ -47,6 +47,7 @@ from trader.config import AppConfig
 from trader.db import EQUITY_SINCE_KEY, Database
 from trader.models import (
     LEVERAGED_ETFS,
+    MAX_QUOTE_STREAMS,
     OPEN_ORDER_STATUSES,
     SCANNER_MOVERS,
     AccountSnapshot,
@@ -1295,7 +1296,8 @@ class Engine:
         if day is not None and start:
             baseline = self._halt_eval_day(day).start_equity or start
             floor = baseline * (1 - self.risk.limits.max_daily_loss_pct / 100)
-            loss_limit = round(max(0.0, start - floor), 2)
+            # Negative after a resume while up: the halt then fires above the day's start.
+            loss_limit = round(start - floor, 2)
         quotes = sorted(self._latest_quotes.values(), key=lambda q: q.instrument.key)
         return EngineStatus(
             running=self._running,
@@ -1509,7 +1511,11 @@ class Engine:
             positions = self._mark_positions(raw_positions, quotes, metas)
             account = self._mark_account(account, raw_positions, positions)
             previous = self._account
-            if any(p.qty > 0 for p in raw_positions) or open_orders:
+            if (
+                any(p.qty != 0 for p in raw_positions)
+                or open_orders
+                or self.broker.holds_untracked_positions()
+            ):
                 self._busy_at = now
             self._account, self._positions, self._open_orders = account, positions, open_orders
             self._prune_quote_cache(now)
@@ -2894,6 +2900,10 @@ class Engine:
                 for s in settings.crypto_universe
             ]
         out: dict[str, Instrument] = {}
+        for pos in self._positions:  # always look at held positions so they can be managed
+            stock = pos.instrument.asset_class == AssetClass.STOCK
+            if pos.qty > 0 and (stocks_open or not stock):
+                out.setdefault(pos.instrument.key, pos.instrument)
         for inst in symbols:
             symbol = inst.symbol.strip().upper()
             if not symbol:
@@ -2907,10 +2917,12 @@ class Engine:
                 self._log_skip_once(symbol, "leveraged/inverse ETF (not allowed in settings)")
                 continue
             out.setdefault(inst.key, inst)
-        for pos in self._positions:  # always look at held positions so they can be managed
-            stock = pos.instrument.asset_class == AssetClass.STOCK
-            if pos.qty > 0 and (stocks_open or not stock):
-                out.setdefault(pos.instrument.key, pos.instrument)
+        if len(out) > MAX_QUOTE_STREAMS:
+            # More symbols than quote lines would reopen every line each cycle (a held
+            # symbol outside a full universe): the last ones wait, held positions first.
+            for inst in list(out.values())[MAX_QUOTE_STREAMS:]:
+                self._log_skip_once(inst.symbol, f"more than {MAX_QUOTE_STREAMS} quote lines")
+            out = dict(list(out.items())[:MAX_QUOTE_STREAMS])
         self._cycle_quote_scope = set(out) & dynamic_keys
         self._cycle_quote_scope_at = now
         self._prune_quote_cache(now)
@@ -3432,6 +3444,9 @@ class Engine:
         if self._is_delayed_paper_entry(order):
             extra["delayed_data"] = 1.0  # not evidence of an edge (performance report)
         self.db.set_kv(EXTRA_PREFIX + key, json.dumps(extra))
+        # Activity: an entry that fills and is stopped out before the next monitor tick
+        # must not read as a cash flow on a quiet account.
+        self._busy_at = now
         try:
             placed = await self.broker.place_order(order)
         except Exception as exc:

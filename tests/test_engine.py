@@ -3554,6 +3554,88 @@ async def test_the_engine_sells_at_the_target_when_no_take_profit_works(db, conf
     assert not h.broker.pos
 
 
+async def test_a_stop_out_between_two_ticks_is_no_withdrawal(db, config) -> None:
+    """Review finding: after a quiet spell, an entry that filled and was stopped out before
+    the next monitor tick looked like a withdrawal: the loss left the day's P&L and the
+    daily loss limit."""
+    h = await harness(db, config)
+    await h.engine.monitor_tick()
+    h.clock.advance(minutes=11)  # flat and quiet, e.g. before the first entry
+    await enter_f(h)
+    start = h.day().start_equity
+    h.broker.set_price("F", 9.50)  # the bracket stop at 9.80 fills before the next tick
+    assert h.broker.pos == {}
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    assert not [a for a in db.list_audit() if a["action"] == "cash_flow"]
+    assert h.day().start_equity == pytest.approx(start)
+
+
+@pytest.mark.parametrize("kind", ["option", "short"])
+async def test_holdings_the_bot_does_not_trade_are_no_cash_flow(db, config, kind) -> None:
+    """Review finding: an option (or a short) in the account was invisible to the bot, so
+    the account looked flat and every move of its value was taken for a deposit or a
+    withdrawal: an alert every few minutes and a drifting start of day."""
+    from ib_async import Option, PortfolioItem
+    from ib_async import Position as IBPosition
+
+    from tests.test_ibkr import NOW as IB_NOW
+    from tests.test_ibkr import PAPER, av, connected_broker, stock
+
+    broker, fake = await connected_broker()
+    held = Option("AAPL", "20261120", 200, "C", conId=7) if kind == "option" else stock()
+    qty = 2.0 if kind == "option" else -10.0
+    fake.portfolio_items = [PortfolioItem(held, qty, 5.0, 1000.0, 4.0, 200.0, 0.0, PAPER)]
+    fake.position_items = [IBPosition(PAPER, held, qty, 400.0)]
+    equity = 50_000.0
+    fake.summary = [av("NetLiquidation", str(equity)), av("TotalCashValue", "49000")]
+    notes, clock = RecordingNotifier(), FakeClock(IB_NOW)
+    engine = Engine(config, db, broker, FakeDecisionMaker(), notifier=notes, clock=clock)
+    await engine.monitor_tick()
+    for _ in range(10):  # its value moves; IBKR pushes NetLiquidation every 3 minutes
+        clock.advance(minutes=3)
+        equity -= 150.0
+        fake.summary = [av("NetLiquidation", str(equity)), av("TotalCashValue", "49000")]
+        await engine.monitor_tick()
+    assert not [a for a in db.list_audit() if a["action"] == "cash_flow"]
+    assert "Balance change detected" not in notes.titles()
+
+
+async def test_the_loss_limit_after_a_resume_while_up_is_where_the_halt_fires(db, config) -> None:
+    """Review finding: after a resume on a day up more than the loss limit, the status
+    reported no loss limit (clamped at 0) and the dashboard fell back to one measured
+    from the day's start: twice the real room before the halt closes everything."""
+    h = await harness(db, config, native=False)
+    await enter_f(h)  # 24 F @ 10.01
+    h.broker.set_price("F", 11.60)  # up about 7.6% of the day's start
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    await h.engine.kill()
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    await h.engine.resume()
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    s = h.engine.status()
+    baseline = float(db.get_kv("halt_baseline:" + s.day))
+    floor = baseline * (1 - h.engine.risk.limits.max_daily_loss_pct / 100)
+    assert s.loss_limit_usd == pytest.approx(s.start_equity - floor, abs=0.01)
+    assert s.loss_limit_usd < 0  # the halt fires while the day is still up
+
+
+async def test_held_symbols_get_quote_lines_first_and_never_more_than_there_are(db, config) -> None:
+    """Review finding: a held symbol outside a full universe made each cycle ask for more
+    symbols than quote lines, so every line was reopened every cycle."""
+    from trader.models import MAX_QUOTE_STREAMS
+
+    h = await harness(db, config, stock_universe=[f"S{i}" for i in range(MAX_QUOTE_STREAMS)])
+    held = Instrument(symbol="HELD")
+    h.engine._positions = [Position(instrument=held, qty=5, avg_cost=10.0)]
+    universe = await h.engine._universe(h.clock())
+    assert len(universe) == MAX_QUOTE_STREAMS
+    assert universe[0].key == held.key
+
+
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:
     h = await harness(db, config)
     h.broker.standalone_stops = False

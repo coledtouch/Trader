@@ -516,7 +516,9 @@ code-only login over the daily cap → 429 `{"detail": "too many failed codes to
 /api/settings → 422 with a string detail when a risk value exceeds HARD_CAPS, the entry
 window is invalid, a universe has an invalid symbol, or the stock symbols plus the 10
 scanner movers (when on) plus the crypto symbols (when traded) exceed the 95 live quote
-streams (`MAX_QUOTE_STREAMS`); engine
+streams (`MAX_QUOTE_STREAMS`). A cycle quotes held positions first and at most that many
+symbols (the rest wait, logged once); a reopened quote line never serves the earlier
+subscription's values (ib_async reuses its Ticker). Engine
 failures map PermissionError → 403, ValueError/LookupError → 409, anything else → 503.
 `/static/sw.js` carries `Service-Worker-Allowed: /`.
 
@@ -924,7 +926,9 @@ Contracts changed by the confirmed review findings (each has a regression test).
   `Database.start_equity_history(ts)` stores kv `equity_since`; `list_equity` hides earlier
   points. Older journals start the curve at the last `account_changed` audit entry.
 - **External cash flows** (deposits, withdrawals, paper resets): when the account has had no
-  position, working order or fill for `CASH_FLOW_QUIET` (10 min), an equity change of at
+  position (long or short, or one the bot does not trade: `Broker.holds_untracked_positions`,
+  e.g. an option), working order, fill or entry sent by the app for `CASH_FLOW_QUIET`
+  (10 min), an equity change of at
   least $1 between monitor ticks is applied to `DayStats.start_equity` (and any resume
   baseline) instead of counting as P&L; audit `cash_flow`, notification "Balance change
   detected"; a change of 50%+ restarts the equity curve. Changes while a position is open or

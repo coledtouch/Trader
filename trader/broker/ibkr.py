@@ -689,6 +689,15 @@ class IBKRBroker(Broker):
             with contextlib.suppress(Exception):
                 if evicted.ticker.contract is not None:
                     self._ib.cancelMktData(evicted.ticker.contract)
+        # ib_async hands back the Ticker of an earlier subscription to the contract with its
+        # old values: cleared, so quote() waits for this line's first tick.
+        with contextlib.suppress(Exception):
+            prev = self._ib.ticker(contract)
+            if prev is not None:
+                prev.bid = prev.ask = prev.last = math.nan
+                prev.bidSize = prev.askSize = math.nan
+                prev.halted = math.nan
+                prev.time = None
         try:
             ticker = self._ib.reqMktData(contract, "", False, False)
         except ConnectionError as exc:
@@ -1229,6 +1238,18 @@ class IBKRBroker(Broker):
             seen.add(broker_id)
             records.append(self._record(trade, request))
         return records
+
+    def holds_untracked_positions(self) -> bool:
+        try:
+            acct = self._require_connected()
+        except BrokerError:
+            return False
+        items = [(p.contract, p.position) for p in self._ib.portfolio(acct)]
+        items += [(p.contract, p.position) for p in self._ib.positions(acct)]
+        return any(
+            (_to_float(qty) or 0.0) != 0 and instrument_from_contract(contract) is None
+            for contract, qty in items
+        )
 
     def can_cancel(self, order: OrderRecord) -> bool:
         # Other clients' orders (TWS, IBKR Mobile) are listed as "perm:<permId>".
