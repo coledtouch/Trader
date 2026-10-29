@@ -384,18 +384,19 @@ class CryptoWatchdog:
             closes.append(Close(pos.instrument, qty, kind, reason))
 
         allowed, why = orders_allowed(self.broker.mode, self.settings)
-        await self._alert(
-            age, unhealthy, flatten, killed, closes, bool(managed), allowed, why, result
-        )
-        if not allowed:
-            if closes:
+        try:  # sells first: an alert channel that hangs must not hold one up
+            if allowed:
+                for close in closes:
+                    marker = position_marker(metas[close.instrument.key])
+                    sent = await self._send(close, now, result, marker)
+                    if sent is not None:
+                        result.closes.append(sent)
+            elif closes:
                 result.skipped.append(f"not sending: {why}")
-            return result
-        for close in closes:
-            marker = position_marker(metas[close.instrument.key])
-            sent = await self._send(close, now, result, marker)
-            if sent is not None:
-                result.closes.append(sent)
+        finally:
+            await self._alert(
+                age, unhealthy, flatten, killed, closes, bool(managed), allowed, why, result
+            )
         return result
 
     async def _note_sold_flat(
@@ -652,9 +653,10 @@ class CryptoWatchdog:
         for title, message, priority in wanted:
             if title in self._active_alerts:
                 continue
-            self._active_alerts.add(title)
             result.alerts.append(title)
-            await self.notifier.send(title, message, priority=priority, tags=["warning"])
+            sent = await self.notifier.send(title, message, priority=priority, tags=["warning"])
+            if sent is not False:  # not delivered: the next poll tries again
+                self._active_alerts.add(title)
         self._active_alerts &= titles
 
 

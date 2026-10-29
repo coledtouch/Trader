@@ -157,6 +157,7 @@ LEDGER_GIVE_UP = timedelta(days=5)
 LEDGER_RETRY = timedelta(hours=1)  # wait before re-requesting bars that were missing
 CRYPTO_HORIZON = timedelta(hours=24)
 FETCH_CONCURRENCY = 4
+NOTIFY_WAIT_S = 1.0  # longest a trading path waits for an alert to go out
 SHUTDOWN_TICK_WAIT = 20.0  # s shutdown waits for a tick under way (compose grace: 30 s)
 FIRST_CYCLE_DELAY = 5.0
 MAX_BACKOFF = 120.0
@@ -452,6 +453,7 @@ class Engine:
         self._close_refused: set[str] = set()
         self._close_seq: dict[str, int] = {}  # close attempts per instrument (latest wins)
         self._close_failed_at: dict[str, datetime] = {}  # last "Close X FAILED" alert
+        self._alert_tasks: set[asyncio.Future[bool]] = set()  # alerts still sending
         self._last_halt_at: dict[str, datetime] = {}
         self._skip_logged: set[tuple[str, str]] = set()
         # instrument -> when the broker first read flat while the fills journal did not
@@ -585,13 +587,25 @@ class Engine:
 
     async def _notify(
         self, title: str, message: str, priority: str = "default", tags: list[str] | None = None
-    ) -> None:
+    ) -> bool:
+        """Send an alert; True once it was delivered. Trading paths wait for it at most
+        NOTIFY_WAIT_S (a hung ntfy or push service takes 5-10 s): a slower send finishes
+        in the background, and counts as not delivered here."""
         if self.notifier is None:
-            return
+            return False
+        send = asyncio.ensure_future(
+            self.notifier.send(title, message, priority=priority, tags=tags)
+        )
+        self._alert_tasks.add(send)
+        send.add_done_callback(self._alert_tasks.discard)
         try:
-            await self.notifier.send(title, message, priority=priority, tags=tags)
+            return bool(await asyncio.wait_for(asyncio.shield(send), NOTIFY_WAIT_S))
+        except TimeoutError:
+            log.warning("alert %r still sending in the background", title)
+            send.add_done_callback(lambda t: t.cancelled() or t.exception())
         except Exception as exc:  # Notifier never raises; this guards custom notifiers
             log.warning("notification failed: %s", type(exc).__name__)
+        return False
 
     async def _step(self, name: str, work: Awaitable[object]) -> None:
         """Run one monitor step; a failure is logged and the remaining steps still run."""
@@ -1528,8 +1542,8 @@ class Engine:
             log.warning("broker %s is disconnected", self.broker.name)
             self.db.audit("broker_disconnected", {"broker": self.broker.name}, actor="engine")
         if not self._down_notified and now - self._down_since >= BROKER_DOWN_NOTIFY_AFTER:
-            self._down_notified = True
-            await self._notify(
+            # Retried each tick until delivered (the network may be what is down).
+            self._down_notified = await self._notify(
                 "Broker disconnected",
                 f"{self.broker.name} has been unreachable since "
                 f"{self._down_since:%H:%M:%S} UTC. Broker-side stops still protect stocks.",
@@ -2072,9 +2086,8 @@ class Engine:
         last = self._close_failed_at.get(inst.key)
         if last is not None and now - last < CLOSE_FAILED_ALERT_EVERY:
             return  # retried every CLOSE_RETRY: one alert per stretch, not one a minute
-        self._close_failed_at[inst.key] = now
         restored = "protective stop re-placed at" in (rec.message or "")
-        await self._notify(
+        sent = await self._notify(
             f"Close {inst.symbol} FAILED",
             f"{reason}: the broker refused the sell ({_short(refused)}). "
             + ("The stop was put back. " if restored else "No stop is working at IBKR. ")
@@ -2082,6 +2095,8 @@ class Engine:
             priority="high" if restored else "urgent",
             tags=["warning"] if restored else ["rotating_light"],
         )
+        if sent:  # not delivered: the next retry alerts again
+            self._close_failed_at[inst.key] = now
 
     def _native_stops(self, open_orders: list[OrderRecord]) -> dict[str, float]:
         """Highest working broker-side protective stop of this app per instrument. An
@@ -2483,8 +2498,8 @@ class Engine:
                 log.warning("re-placed missing protective stop for %s at %g", key, stop)
                 self.db.audit("reprotect", {"instrument": key, "stop": stop}, actor="engine")
             else:
-                await self._notify(
-                    f"Unprotected {pos.instrument.symbol}",
+                await self._notify(  # its own title: an "Unprotected X" may be minutes old
+                    f"Stop re-place failed {pos.instrument.symbol}",
                     f"Broker rejected the re-placed stop at {stop:g}: {rec.message}. "
                     "The engine's backup stop still watches it.",
                     priority="high",

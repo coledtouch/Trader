@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from datetime import UTC, datetime, timedelta
 
@@ -858,3 +859,56 @@ async def test_kill_then_resume_never_reports_a_restored_heartbeat(db: Database)
     beat(db, clock, age=5)
     await watchdog.tick()
     assert notes.sent == []
+
+
+async def test_an_alert_that_failed_is_tried_again(db: Database) -> None:
+    """Review finding: an alert counted as active before it was delivered, so one failed
+    send meant the urgent alert never went out for the rest of the outage."""
+
+    class Flaky(Notes):
+        failed = False
+
+        async def send(self, title, message, priority="default", tags=None) -> bool:
+            await super().send(title, message, priority, tags)
+            if not self.failed:
+                self.failed = True
+                return False
+            return True
+
+    clock = Clock()
+    broker = FakeBroker(Mode.LIVE)
+    hold(db, broker)
+    beat(db, clock, age=200)
+    notes = Flaky()
+    watchdog = CryptoWatchdog(
+        db, broker, settings(), notes, clock, started_at=clock.t - timedelta(hours=1)
+    )
+    for _ in range(3):
+        await watchdog.tick()
+        clock.advance(seconds=10)
+    assert notes.sent.count("Crypto watchdog: flattening crypto") == 2  # failed, then sent
+
+
+async def test_the_watchdog_sells_before_it_alerts(db: Database) -> None:
+    """Review finding: the watchdog sent its alerts before its sells, so an alert channel
+    that hung (5-10 s) held up a stop or flatten sell."""
+
+    class Hung(Notes):
+        async def send(self, title, message, priority="default", tags=None) -> bool:
+            await asyncio.sleep(3600)
+            return True
+
+    clock = Clock()
+    broker = FakeBroker()
+    hold(db, broker)
+    beat(db, clock, age=200)
+    watchdog = CryptoWatchdog(
+        db, broker, settings(), Hung(), clock, started_at=clock.t - timedelta(hours=1)
+    )
+    tick = asyncio.create_task(watchdog.tick())
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if sells(broker):
+            break
+    tick.cancel()
+    assert sells(broker)

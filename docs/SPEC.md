@@ -879,6 +879,12 @@ Contracts changed by the confirmed review findings (each has a regression test).
   A cycle's monitor tick is shielded from stop(), and shutdown lets a tick under way finish
   (up to 20 s, inside the 30 s compose stop grace), so a halt's flatten or the journal is never cut off halfway. An approval
   reads the account, positions and orders under the entry lock.
+- **Alerts on trading paths** (ENG-14): a trading path waits at most `NOTIFY_WAIT_S` (1 s)
+  for an alert; a slower send (a hung ntfy or push service takes 5-10 s) finishes in the
+  background. "Broker disconnected" and "Close X FAILED" count as sent only once
+  delivered (retried otherwise); a rejected re-placed stop alerts "Stop re-place failed X"
+  (its own title, past the 60 s same-title guard). The crypto watchdog sends its sells
+  before its alerts, and retries an alert that was not delivered.
 - **Engine closes** (ENG-7): a monitor exit the broker refuses alerts "Close X FAILED"
   (urgent when no stop is working; at most every `CLOSE_FAILED_ALERT_EVERY`, 15 min, while
   the 60 s retries go on), not "Closing X". An approved close whose broker call raised

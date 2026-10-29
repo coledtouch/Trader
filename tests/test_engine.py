@@ -16,7 +16,7 @@ from pydantic import SecretStr
 from trader.broker.base import Broker, BrokerError
 from trader.config import AppConfig
 from trader.db import Database
-from trader.engine import Engine, build_engine, replay_fills, score_signal
+from trader.engine import NOTIFY_WAIT_S, Engine, build_engine, replay_fills, score_signal
 from trader.models import (
     OPEN_ORDER_STATUSES,
     AccountSnapshot,
@@ -3907,9 +3907,9 @@ async def test_stop_never_cuts_a_halts_flatten_short(db, config) -> None:
     await entered.wait()
     await h.engine.stop()
     gate.set()
-    for _ in range(20):
-        await asyncio.sleep(0)
-        if "STK:F" not in h.broker.pos:
+    for _ in range(100):  # the shielded tick finishes on its own
+        await asyncio.sleep(0.01)
+        if "Trading halted" in h.notes.titles():
             break
     assert "STK:F" not in h.broker.pos
     assert "Trading halted" in h.notes.titles()
@@ -3946,6 +3946,79 @@ async def test_two_quick_approvals_respect_max_open_positions(db, config) -> Non
     h.clock.advance(seconds=20)
     await asyncio.gather(*(h.engine.approve_order(o.id) for o in pending))
     assert len(h.broker.pos) == 1
+
+
+class _HungNotifier(RecordingNotifier):
+    """An alert channel that accepts the connection and never answers."""
+
+    async def send(self, title, message, priority="default", tags=None) -> bool:
+        self.sent.append((title, message, priority))
+        await asyncio.sleep(3600)
+        return True
+
+
+class _FlakyNotifier(RecordingNotifier):
+    """Fails the first `failures` sends, then delivers."""
+
+    def __init__(self, failures: int = 1) -> None:
+        super().__init__()
+        self.failures = failures
+
+    async def send(self, title, message, priority="default", tags=None) -> bool:
+        self.sent.append((title, message, priority))
+        if self.failures:
+            self.failures -= 1
+            return False
+        return True
+
+
+async def test_a_hung_alert_channel_never_holds_up_kill(db, config) -> None:
+    """Review finding: alerts were awaited under the entry lock and before the next sell,
+    so an alert channel that hung (5-10 s a send) held up KILL, closes and exits."""
+    h = await harness(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.engine.notifier = _HungNotifier()
+    await asyncio.wait_for(h.engine.kill(), 5 * NOTIFY_WAIT_S)
+    assert "STK:F" not in h.broker.pos
+    for task in list(h.engine._alert_tasks):
+        task.cancel()
+
+
+async def test_a_disconnect_alert_that_failed_is_sent_again(db, config) -> None:
+    """Review finding: "Broker disconnected" was marked sent before it was delivered, so one
+    failed send meant no alert for the whole outage."""
+    h = await harness(db, config)
+    await h.engine.monitor_tick()
+    notes = _FlakyNotifier(failures=1)
+    h.engine.notifier = notes
+    h.broker._connected = h.broker.can_connect = False
+    for _ in range(8):  # two minutes
+        with contextlib.suppress(BrokerError):
+            await h.engine.monitor_tick()
+        h.clock.advance(seconds=15)
+    assert notes.titles().count("Broker disconnected") == 2  # failed, then delivered
+
+
+async def test_a_rejected_replaced_stop_alerts_under_its_own_title(db, config) -> None:
+    """Review finding: the alert that the re-placed stop was rejected shared its title with
+    the "Unprotected X" alert seconds before, so the 60 s same-title guard dropped it."""
+    from tests.test_ibkr import log_error
+
+    engine, _broker, fake, notes, clock = await _ibkr_entry_engine(db, config)
+    fake.on_place = _refuse_child(fake, "STP")
+    await engine.run_cycle()
+
+    def refuse_stops(trade) -> None:
+        if trade.order.orderType == "STP":
+            trade.orderStatus.status = "Inactive"
+            log_error(trade, 201, "Order rejected - reason: stop price invalid")
+
+    fake.on_place = refuse_stops
+    clock.advance(seconds=15)
+    await engine.monitor_tick()
+    assert "Unprotected AAPL" in notes.titles()
+    assert "Stop re-place failed AAPL" in notes.titles()
 
 
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:
