@@ -1128,7 +1128,8 @@ re-placed stops) are the bot's buys, and its sells come out of the bot's units f
 another client's (`perm:`) buys are the owner's, and another client's sells come out of the
 owner's units first (out of the bot's first from the crypto watchdog's first sale of the
 position on: its sells are not told apart from the owner's; at most what the watchdog may
-have sold in all, beyond which another client's sells are the owner's again). The entry's quantity
+have sold in all, less what the app already journaled of it at an estimate; beyond that,
+another client's sells are the owner's again). The entry's quantity
 (`position_extra.qty`, older rows: planned risk over risk per unit, to 10 decimals so an
 8-decimal crypto quantity is not read as more than the entry) bounds the bot's part:
 the bot never adds to a position. Part of the entry may be in no fill (it filled on a day
@@ -1177,9 +1178,10 @@ own; a sale the app already journaled at an estimate is not taken off twice), le
 already sold of the position. More held than the bot can still hold once its known (done)
 sales are off is the owner buying since: then it sells only the bot's part too. It never
 sells into the owner's journaled units when an exit of the app's may have sold the bot's
-unseen (`ownership.app_sold_unjournaled`: an app sell still working or filled beyond what
-the journal shows of it; a done sell the journal fully shows, and rows never sent, such as
-a rejected or expired approval, do not count); otherwise less held than both is the
+unseen (`ownership.app_sold_unjournaled`, over every app sell since the bot's entry: one
+still working, filled beyond what the journal shows of it, or forgotten by the engine before
+the journal showed all of it, its fill unknown; a done sell the journal fully shows, and
+rows never sent, such as a rejected or expired approval, do not count); otherwise less held than both is the
 owner selling his (another client's sells come out of his units first) and the bot's units
 are still sold. It records each sell that was accepted or filled anything in kv
 `watchdog_sales:<key>` (`{"marker", "first", "orders": {order id: qty}, "at": {order id:

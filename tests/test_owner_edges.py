@@ -4,6 +4,7 @@ older position rows)."""
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import json
 from datetime import UTC, datetime, timedelta
@@ -35,7 +36,8 @@ from trader.models import (
     Side,
     TradeAction,
 )
-from trader.ownership import note_watchdog_sale
+from trader.ownership import UNREPORTED_EXIT, note_watchdog_sale
+from trader.timeutil import trading_day, trading_day_start
 from trader.watchdog import position_marker
 
 KEY = "CRYPTO:BTC"
@@ -228,3 +230,105 @@ async def test_an_older_btc_row_held_across_the_upgrade_is_sold_in_full(db, conf
         await h.engine.monitor_tick()
     assert bot_sells(h, KEY) == [pytest.approx(qty, abs=1e-12)]
     assert KEY not in h.broker.pos
+
+
+# ----------------------------------------------------------------------------- review 41
+@pytest.mark.parametrize("own", [0.003, 0.002])
+async def test_a_bot_exit_the_broker_forgot_is_never_read_as_the_owners_sale(
+    db, config, own: float
+) -> None:
+    """The bot's crypto exit filled but its ack was lost (row SUBMITTED, fill never
+    journaled); the app is back a day later, when the row is forgotten and IBKR no longer
+    reports the sale. The shortfall is maybe the bot's: the owner's coins are never sold."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 28, 13, 0, tzinfo=UTC))  # Wed 09:00 NY
+    mine = h.broker.pos[KEY][0]
+    owner_buys(h, _BTC, own, 60000.0)
+    await ticks(h, 4, seconds=15)  # the owner's buy is journaled
+    real = h.broker.place_order
+    sent: list[str] = []
+
+    async def lost_ack(req):
+        rec = await real(req)
+        if req.side == Side.SELL and req.stop_loss is None and not sent:
+            sent.append(rec.broker_order_id)
+            # IBKR filled it; the gateway dropped before the ack reached the app.
+            h.broker._connected = False
+            h.broker.can_connect = False
+            return rec.model_copy(
+                update={
+                    "status": OrderStatus.SUBMITTED,
+                    "filled_qty": 0.0,
+                    "avg_fill_price": None,
+                    "message": "sent; awaiting IBKR acknowledgement",
+                }
+            )
+        return rec
+
+    h.broker.place_order = lost_ack
+    h.broker.set_price("BTC", 58000.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    for _ in range(8):
+        h.clock.advance(seconds=15)
+        with contextlib.suppress(Exception):
+            await h.engine.monitor_tick()
+    assert sent, "the bot's stop sent its exit"
+    assert bot_sells(h, KEY) == [pytest.approx(mine)]
+    assert h.broker.pos[KEY][0] == pytest.approx(own)  # only the owner's coins are left
+    row = [o for o in db.list_orders(limit=50) if o.broker_order_id == sent[0]]
+    assert row and row[0].status == OrderStatus.SUBMITTED and row[0].filled_qty == 0
+    # Back Thursday 10:00 New York: IBKR reports only today's executions and no longer
+    # knows Wednesday's IOC.
+    del h.broker.orders[sent[0]]
+    h.broker.place_order = real
+    h.broker.can_connect = True
+    h.broker._connected = True
+    h.clock.t = datetime(2026, 10, 29, 14, 0, tzinfo=UTC)
+    every_fill = h.broker.fills_since
+
+    async def today_only(since):
+        midnight = trading_day_start(trading_day(h.clock()))
+        return [f for f in await every_fill(since) if f.ts >= midnight]
+
+    h.broker.fills_since = today_only
+    h.engine = Engine(config, h.db, h.broker, h.decider, notifier=h.notes, clock=h.clock,
+                      scanner=h.scanner)  # fmt: skip
+    h.broker.set_price("BTC", 58000.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    await ticks(h, 12, seconds=15)
+    assert bot_sells(h, KEY) == [pytest.approx(mine)], "the owner's coins were sold"
+    assert h.broker.pos[KEY][0] == pytest.approx(own)
+
+
+@pytest.mark.parametrize("o", [0.001, 0.0025, 0.005])
+async def test_the_owners_sale_after_an_estimated_watchdog_sale_leaves_the_bots_rest(
+    db, config, o: float
+) -> None:
+    """An earlier-day partial watchdog sale journaled at an estimate, then a sale of the
+    owner's own coins: the bot's rest keeps its stop (the estimate used up the budget)."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 1, 0, tzinfo=UTC))  # Wed 21:00 NY
+    mine = h.broker.pos[KEY][0]
+    meta = db.get_position_meta(KEY)
+    owner_buys(h, _BTC, 0.006, 60000.0)  # journaled
+    await ticks(h, 2, seconds=15)
+    h.clock.advance(minutes=30)  # app down; the watchdog's IOC fills 60% of the bot's part
+    part = round(mine * 0.6, 6)
+    h.broker.pos[KEY][0] -= part
+    h.broker.cash += part * 58900.0
+    h.broker.fills.append(
+        Fill(exec_id=f"WD{next(_ids)}", broker_order_id=f"perm:{next(_ids)}", instrument=_BTC,
+             side=Side.SELL, qty=part, price=58900.0, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    marker = position_marker(meta)
+    note_watchdog_sale(db, KEY, marker, "B1", mine, h.clock())
+    note_watchdog_sale(db, KEY, marker, "B1", part, h.clock(), done=True)
+    h.engine = _restart_next_morning(h, config)
+    h.broker.set_price("BTC", 60600.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    await ticks(h, 6, seconds=15)
+    since = datetime(2026, 10, 1, tzinfo=UTC)
+    assert any(f.broker_order_id == UNREPORTED_EXIT for f in db.list_fills(since=since))
+    assert db.get_position_meta(KEY) is not None
+    assert db.list_trades() == []
+    owner_sells(h, _BTC, o, 60600.0)  # the owner sells some of his own coins
+    await ticks(h, 4, seconds=15)
+    h.broker.set_price("BTC", 58900.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    await ticks(h, 8, seconds=15)
+    assert bot_sells(h, KEY) == [pytest.approx(round(mine - part, 8), abs=1e-6)]
+    assert h.broker.pos[KEY][0] == pytest.approx(0.006 - o, abs=1e-9)

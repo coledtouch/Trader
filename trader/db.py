@@ -12,7 +12,7 @@ import os
 import sqlite3
 import threading
 from collections.abc import Iterable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -601,6 +601,18 @@ class Database:
         else:
             rows = self._all("SELECT * FROM orders ORDER BY id DESC LIMIT ?", (limit,))
         return [self._order_from_row(r) for r in rows]
+
+    def list_orders_since(self, since: datetime) -> list[OrderRecord]:
+        """Every order created at or after `since`, newest first (no row limit)."""
+        bound = since.astimezone(UTC) if since.tzinfo else since.replace(tzinfo=UTC)
+        rows = self._all(
+            "SELECT * FROM orders WHERE created_at >= ? ORDER BY id DESC",
+            (_iso(bound - timedelta(seconds=1)),),
+        )
+        records = [self._order_from_row(r) for r in rows]
+        return [
+            r for r in records if (r.created_at.replace(tzinfo=r.created_at.tzinfo or UTC)) >= bound
+        ]
 
     # ------------------------------------------------------------------ fills
     def insert_fill(self, fill: Fill) -> bool:

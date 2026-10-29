@@ -38,6 +38,9 @@ WATCHDOG_SALES_PREFIX = "watchdog_sales:"
 # broker_order_id of an exit fill the engine journals at an estimate (its real execution
 # fell on a day IBKR no longer reports): this app's own sell of the bot's units.
 UNREPORTED_EXIT = "unreported-exit"
+# Message of an app order row the engine stopped tracking (the broker no longer knows it):
+# what it filled is unknown.
+ORDER_FORGOTTEN = "no longer known to the broker"
 EPS = 1e-9
 
 
@@ -137,6 +140,15 @@ def split_fills(
             lead = 0.0  # the part sold out of the bot's units first
             if not other:
                 lead = q
+                if (
+                    f.broker_order_id == UNREPORTED_EXIT
+                    and start is not None
+                    and budget is not None
+                    and _aware(f.ts) >= start
+                ):
+                    # The app's estimate of the watchdog's sale no fill shows: part of what
+                    # the watchdog sold, not left for another client's sells.
+                    budget -= min(q, budget)
             elif start is not None and _aware(f.ts) >= start:
                 lead = q if budget is None else min(q, budget)
                 if budget is not None:
@@ -379,7 +391,8 @@ def unreported_sales(sold: float, fills: Iterable[Fill], first: datetime) -> flo
 
 def app_sold_unjournaled(db: Database, key: str, opened: datetime, fills: Iterable[Fill]) -> bool:
     """A sell of the app's for this bot position the journal may not show yet: one still
-    working (its fills may come), or one that filled beyond what the journal shows of it.
+    working (its fills may come), one that filled beyond what the journal shows of it, or
+    one the engine stopped tracking before the journal showed all of it (its fill unknown).
     A done sell whose fills the journal shows sold nothing unseen; rows never sent (a
     rejected, expired or cancelled approval) sold nothing. The crypto watchdog's own sells
     are not the app's."""
@@ -388,7 +401,7 @@ def app_sold_unjournaled(db: Database, key: str, opened: datetime, fills: Iterab
     for f in own:
         journaled[f.broker_order_id] = journaled.get(f.broker_order_id, 0.0) + f.qty
     since = _aware(opened) - FILL_TIME_SKEW
-    for rec in db.list_orders(limit=200):
+    for rec in db.list_orders_since(since):
         req = rec.request
         if (
             req.instrument.key != key
@@ -398,9 +411,11 @@ def app_sold_unjournaled(db: Database, key: str, opened: datetime, fills: Iterab
             or rec.status == OrderStatus.REJECTED
         ):
             continue
-        if _aware(rec.created_at) >= since and (
+        seen = journaled.get(rec.broker_order_id, 0.0)
+        if (
             rec.status in OPEN_ORDER_STATUSES
-            or rec.filled_qty > journaled.get(rec.broker_order_id, 0.0) + EPS
+            or rec.filled_qty > seen + EPS
+            or (rec.message == ORDER_FORGOTTEN and seen < rec.request.qty - EPS)
         ):
             return True
     return False

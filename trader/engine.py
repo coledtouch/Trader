@@ -80,6 +80,7 @@ from trader.models import (
 from trader.notify import Notifier
 from trader.ownership import (
     FILL_TIME_SKEW,
+    ORDER_FORGOTTEN,
     UNREPORTED_EXIT,
     WATCHDOG_SALES_PREFIX,
     Cap,
@@ -2985,9 +2986,7 @@ class Engine:
                     self.db.update_order(
                         rec.id,
                         status=OrderStatus.CANCELLED,
-                        message=self._epoch_reason
-                        if restarted
-                        else "no longer known to the broker",
+                        message=self._epoch_reason if restarted else ORDER_FORGOTTEN,
                     )
                 continue
             updates: dict[str, Any] = {}
