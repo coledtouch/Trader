@@ -117,3 +117,33 @@ async def test_bots_entry_filling_after_the_app_stopped_is_still_sold(db: Databa
     await watchdog.tick()
     await watchdog.tick()
     assert [o.qty for o in broker.placed] == [pytest.approx(BOT)]
+
+
+async def test_an_ioc_sale_filled_in_part_is_finished_but_never_into_the_owners(
+    db: Database,
+) -> None:
+    """The watchdog's IOC sell of the bot's 0.01 fills 0.004 and the rest is cancelled: it
+    sells the bot's other 0.006 next, and never the owner's 0.5."""
+    clock = Clock()
+    broker = FakeBroker()
+    setup(db, broker, owner=0.5, journal_owner=True)
+    beat(db, clock, age=60)
+    watchdog, _ = make(db, broker, clock)
+    await watchdog.tick()
+    await watchdog.tick()
+    assert [o.qty for o in broker.placed] == [pytest.approx(BOT)]
+    rec = broker.orders.pop()  # IOC: 0.004 filled, the rest cancelled
+    rec.status, rec.filled_qty = OrderStatus.CANCELLED, 0.004
+    pos = broker.positions_list[0]
+    broker.positions_list[0] = pos.model_copy(update={"qty": pos.qty - 0.004})
+    for _ in range(4):
+        clock.advance(seconds=30)
+        beat(db, clock, age=60)
+        await watchdog.tick()
+        for r in broker.orders:  # later sells fill in full
+            r.status, r.filled_qty = OrderStatus.FILLED, r.request.qty
+            p = broker.positions_list[0]
+            broker.positions_list[0] = p.model_copy(update={"qty": p.qty - r.request.qty})
+        broker.orders.clear()
+    assert [round(o.qty, 6) for o in broker.placed] == [BOT, 0.006]
+    assert broker.positions_list[0].qty == pytest.approx(0.5)

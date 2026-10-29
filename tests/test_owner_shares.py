@@ -331,40 +331,48 @@ def _f(side: Side, qty: float, minute: int, other: bool = False) -> Fill:
                 ts=NOW + timedelta(minutes=minute))  # fmt: skip
 
 
-def test_bot_holding_attribution() -> None:
-    from trader.ownership import bot_holding, entry_qty, sell_cap
+def test_split_attribution() -> None:
+    from trader.ownership import Cap, entry_qty, sell_cap, split_fills
 
-    since = NOW
     B, S = Side.BUY, Side.SELL
     # the owner adds 50 to the bot's 24
-    h = bot_holding([_f(B, 24, 1), _f(B, 50, 2, True)], since, watchdog_sold=False)
-    assert (h.bot, h.owner_bought) == (24, 50)
-    assert sell_cap(74, 24, h) == 24
+    s = split_fills([_f(B, 24, 1), _f(B, 50, 2, True)])
+    assert (s.bot, s.owner, s.owner_bought) == (24, 50, 50)
+    assert sell_cap(74, 24, s) == Cap(qty=24, keep=50)
+    # the owner sells his own first; past them, the bot's
+    s = split_fills([_f(B, 24, 1), _f(B, 50, 2, True), _f(S, 30, 3, True)])
+    assert (s.bot, s.owner) == (24, 20)
+    s = split_fills([_f(B, 24, 1), _f(B, 50, 2, True), _f(S, 60, 3, True)])
+    assert (s.bot, s.owner) == (14, 0)
     # the owner's round trip leaves the bot's 24
-    h = bot_holding([_f(B, 24, 1), _f(B, 10, 2, True), _f(S, 10, 3, True)], since,
-                    watchdog_sold=False)  # fmt: skip
-    assert h.bot == 24 and sell_cap(24, 24, h) == 24
+    s = split_fills([_f(B, 24, 1), _f(B, 10, 2, True), _f(S, 10, 3, True)])
+    assert s.bot == 24 and sell_cap(24, 24, s) == Cap(qty=24, keep=0)
     # the owner sells 5 of the bot's (he bought none): the bot holds the 19 left
-    h = bot_holding([_f(B, 24, 1), _f(S, 5, 2, True)], since, watchdog_sold=False)
-    assert h.bot == 19 and sell_cap(19, 24, h) is None  # nothing of the owner's: sell all
+    s = split_fills([_f(B, 24, 1), _f(S, 5, 2, True)])
+    assert s.bot == 19 and sell_cap(19, 24, s) is None  # nothing of the owner's: sell all
     # the owner sells before he buys: the sale came out of the bot's shares
-    h = bot_holding([_f(B, 24, 1), _f(S, 5, 2, True), _f(B, 5, 3, True)], since,
-                    watchdog_sold=False)  # fmt: skip
-    assert h.bot == 19 and sell_cap(24, 24, h) == 19
+    s = split_fills([_f(B, 24, 1), _f(S, 5, 2, True), _f(B, 5, 3, True)])
+    assert sell_cap(24, 24, s) == Cap(qty=19, keep=5)
+    # this app's own sell (KILL of a mixed position) comes out of the bot's first
+    s = split_fills([_f(B, 24, 1), _f(B, 50, 2, True), _f(S, 74, 3)])
+    assert (s.bot, s.owner) == (0, 0) and [f.qty for f in s.bot_fills] == [24, 24]
     # once the watchdog sold, another client's sell comes out of the bot's first
-    h = bot_holding([_f(B, 24, 1), _f(B, 50, 2, True), _f(S, 24, 3, True)], since,
-                    watchdog_sold=True)  # fmt: skip
-    assert h.bot == 0 and sell_cap(50, 24, h) == 0
+    s = split_fills(
+        [_f(B, 24, 1), _f(B, 50, 2, True), _f(S, 24, 3, True)],
+        bot_first_from=NOW + timedelta(minutes=3),
+    )
+    assert (s.bot, s.owner) == (0, 50) and sell_cap(50, 24, s) == Cap(qty=0, keep=50)
     # more held than the bot's entry bought: the owner's, even with no owner fill journaled
-    h = bot_holding([_f(B, 24, 1)], since, watchdog_sold=False)
-    assert sell_cap(30, 24, h) == 24
+    s = split_fills([_f(B, 24, 1)])
+    assert sell_cap(30, 24, s) == Cap(qty=24, keep=0)
     # held within the entry and no owner fill: the bot's (e.g. its fills not reported)
-    assert sell_cap(24, 24, bot_holding([], since, watchdog_sold=False)) is None
-    # fills before the entry was sent are not this position's
-    h = bot_holding([_f(B, 50, -10, True), _f(B, 24, 1)], since, watchdog_sold=False)
-    assert h.owner_bought == 0
+    assert sell_cap(24, 24, split_fills([])) is None
+    # no other client bought: the bot's fills come back unchanged
+    plain = [_f(B, 24, 1), _f(S, 10, 2, True), _f(S, 14, 3)]
+    assert split_fills(plain).bot_fills == plain
     # entry quantity: recorded, or from the planned risk of an older row
     assert entry_qty({"qty": 24}, {}) == 24
+    assert entry_qty({"qty": True}, {}) is None
     assert entry_qty({"unit_risk": 0.21}, {"initial_risk": 0.21 * 24}) == 24
     assert entry_qty({}, {"initial_risk": 5.04}) is None
 
@@ -384,3 +392,82 @@ async def test_restart_next_day_with_the_owners_btc_next_to_the_bots(db, config)
         h.clock.advance(seconds=15)
     assert bot_sells(h, "CRYPTO:BTC") == [pytest.approx(mine)]
     assert h.broker.pos["CRYPTO:BTC"][0] == pytest.approx(0.5)
+
+
+# ----------------------------------------------------------------------------- races
+async def test_bracket_stop_filling_while_the_exit_is_sized_never_sells_the_owners(
+    db, config
+) -> None:
+    """The bot's bracket stop fills after the executions read that sized the exit, before
+    the close reads the position: the close must not sell the owner's shares instead."""
+    h = await harness(db, config)
+    await enter_f(h)
+    await ticks(h, 1)
+    owner_buys(h, F, 50, 10.0)
+    await ticks(h, 1)  # the owner's buy is journaled
+    h.clock.advance(minutes=46)
+    await h.engine.monitor_tick()  # time stop seen once
+    real = h.broker.fills_since
+    armed = {"on": True}
+
+    async def read_then_stop_fills(since):
+        out = await real(since)
+        if armed["on"]:
+            armed["on"] = False
+            h.broker.set_price("F", 9.7)  # the bracket stop fills right after the read
+        return out
+
+    h.broker.fills_since = read_then_stop_fills
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()  # confirmed: the time stop closes
+    h.broker.fills_since = real
+    await ticks(h, 3)
+    assert h.broker.pos["STK:F"][0] == 50, bot_sells(h, "STK:F")
+
+
+async def test_owner_buy_inside_the_confirming_tick_is_not_sold(db, config) -> None:
+    """The owner buys after the tick read the positions, before its exit is sent."""
+    h = await harness(db, config)
+    await enter_f(h)
+    h.clock.advance(minutes=46)
+    await h.engine.monitor_tick()  # time stop seen once
+    real = h.broker.quote
+
+    async def owner_buys_during_quotes(inst):
+        q = await real(inst)
+        if inst.key == "STK:F" and h.broker.pos.get("STK:F", [0])[0] == 24:
+            owner_buys(h, F, 50, 10.0)
+        return q
+
+    h.broker.quote = owner_buys_during_quotes
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    h.broker.quote = real
+    await ticks(h, 3)
+    assert h.broker.pos["STK:F"][0] == 50, bot_sells(h, "STK:F")
+
+
+async def test_a_refused_sized_close_puts_back_a_stop_for_the_bots_shares_only(db, config) -> None:
+    h = await harness(db, config)
+    await enter_f(h)
+    await ticks(h, 1)
+    owner_buys(h, F, 50, 10.0)
+    await ticks(h, 1)
+    h.broker.reject_exits = True
+    h.clock.advance(minutes=46)
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()  # the time stop's sell is refused; the stop goes back
+    stops = [r for r in h.broker.placed if r.side == Side.SELL and r.stop_loss is not None]
+    assert stops and stops[-1].qty == 24
+
+
+async def test_kill_still_closes_everything(db, config) -> None:
+    """KILL is the owner's own command: it sells the owner's shares too (SPEC 7.3)."""
+    h = await harness(db, config)
+    await enter_f(h)
+    await ticks(h, 1)
+    owner_buys(h, F, 50, 10.0)
+    await ticks(h, 1)
+    await h.engine.kill()
+    assert "STK:F" not in h.broker.pos

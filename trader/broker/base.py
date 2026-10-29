@@ -192,9 +192,11 @@ class Broker(ABC):
         restore_stop: float | None = None,
         trace_id: str | None = None,
         max_qty: float | None = None,
+        keep: float = 0.0,
     ) -> OrderRecord | None:
         """Cancel working orders for the instrument, then market-sell the whole long position,
-        or at most `max_qty` of it (the bot's own shares next to ones the owner bought).
+        or at most `max_qty` of it and never into the last `keep` units (the bot's own
+        shares next to ones the owner bought).
 
         If the broker rejects that sell, the protective stop that was cancelled (or
         `restore_stop`, for callers that cancelled it already) is re-placed when the broker
@@ -203,7 +205,12 @@ class Broker(ABC):
         (its sell, or the stop it put back), never a half-finished close."""
         async with self.close_lock(instrument):
             return await self._close_position(
-                instrument, reason, restore_stop=restore_stop, trace_id=trace_id, max_qty=max_qty
+                instrument,
+                reason,
+                restore_stop=restore_stop,
+                trace_id=trace_id,
+                max_qty=max_qty,
+                keep=keep,
             )
 
     def close_lock(self, instrument: Instrument) -> asyncio.Lock:
@@ -221,18 +228,24 @@ class Broker(ABC):
         restore_stop: float | None,
         trace_id: str | None,
         max_qty: float | None = None,
+        keep: float = 0.0,
     ) -> OrderRecord | None:
-        if max_qty is not None and max_qty <= 0:
+        if max_qty is not None and max_qty <= 1e-9:
             return None  # nothing to sell: never cancel the stop of a held position
         positions = {p.instrument.key: p for p in await self.positions()}
         pos = positions.get(instrument.key)
         stops = [] if restore_stop is None else [restore_stop]
         cancelled: set[str] = set()
         held = pos.qty if pos is not None and pos.qty > 0 else 0.0
+        qty = held
+        if max_qty is not None and held > 0:
+            qty = self._capped(instrument, held, max_qty, keep)
+            if qty <= 1e-9:
+                return None  # none of it is the bot's: its stop stays
         req = OrderRequest(
             instrument=instrument,
             side=Side.SELL,
-            qty=(min(held, max_qty) if max_qty is not None else held) or 1.0,
+            qty=qty or 1.0,
             order_type=OrderType.MARKET,
             is_exit=True,
             reason=reason or "close position",
@@ -250,6 +263,21 @@ class Broker(ABC):
             if pos is None or pos.qty <= 0:
                 return None
             working = await self.open_orders()
+            if max_qty is not None:
+                # A bracket child may have filled during the cancels: size again on a fresh
+                # read, so the sell never reaches the owner's units.
+                now_held = next(
+                    (
+                        p.qty
+                        for p in await self.positions()
+                        if p.instrument.key == instrument.key and p.qty > 0
+                    ),
+                    0.0,
+                )
+                qty = self._capped(instrument, now_held, max_qty, keep)
+                if qty <= 1e-9:
+                    return None
+                req = req.model_copy(update={"qty": qty})
         except BrokerError:
             # A stop may already be cancelled (here, or by flatten_all's cancel_all): never
             # leave a held position without it, nor with two (a stop next to another sell
@@ -326,6 +354,14 @@ class Broker(ABC):
         if errors:
             raise PartialFlattenError("; ".join(errors), results)
         return results
+
+    def _capped(self, instrument: Instrument, held: float, max_qty: float, keep: float) -> float:
+        raw = min(max_qty, held - keep)
+        if raw >= held - 1e-9:
+            return held
+        if raw <= 1e-9:
+            return 0.0
+        return self.round_qty(instrument, round(raw, 8), allow_fractional=True)
 
     def _own_market_sell(self, orders: list[OrderRecord], instrument: Instrument) -> bool:
         """A market sell of this app's for the instrument is working. Only this client's

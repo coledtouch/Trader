@@ -50,10 +50,13 @@ from trader.models import (
 from trader.notify import Notifier
 from trader.ownership import (
     FILL_TIME_SKEW,
-    bot_holding,
     entry_qty,
+    is_other_client,
+    note_watchdog_sale,
     read_extra,
+    read_sales_record,
     sell_cap,
+    split_fills,
     watchdog_sales,
 )
 from trader.risk import sane_exit_price
@@ -374,7 +377,7 @@ class CryptoWatchdog:
         closes: list[Close] = []
         for pos in managed:
             key = pos.instrument.key
-            own = self._own_qty(key, metas[key], pos.qty)
+            own = await self._own_qty(key, metas[key], pos.qty)
             if own is not None and own <= QTY_EPS:
                 result.skipped.append(f"{key}: nothing held is the bot's (the owner's coins)")
                 continue
@@ -449,24 +452,54 @@ class CryptoWatchdog:
             self._forget_sold(key)
             log.info("%s: sold flat by the watchdog; a later buy is not the bot's", key)
 
-    def _own_qty(self, key: str, meta: dict[str, Any], held: float) -> float | None:
+    async def _own_qty(self, key: str, meta: dict[str, Any], held: float) -> float | None:
         """Most this process may still sell of a bot position, or None (all of it, as
-        before). When the owner bought the coin too (a buy of another client in the journal
-        the app kept until it stopped, or more held than the bot's entry bought): the bot's
-        own part from that journal, less what this watchdog already sent to sell of it (not
-        in the journal while the app is down; counted twice when it is: errs low)."""
+        before). With the owner's coins next to the bot's: the bot's part from the journal
+        the app kept until it stopped (another client's sells after this process's first
+        sale are left out: they may be its own), less what this process sent to sell of
+        it, and never into the owner's journaled coins."""
         opened = meta.get("opened_at")
         if not isinstance(opened, datetime):
             return None
         since = opened - FILL_TIME_SKEW
-        fills = [f for f in self.db.list_fills(since=since, limit=5000) if f.instrument.key == key]
-        sent = watchdog_sales(self.db, key, position_marker(meta), opened)
+        sales = watchdog_sales(self.db, key, position_marker(meta), opened)
+        cut = sales[0] - FILL_TIME_SKEW if sales is not None else None
+        fills = [
+            f
+            for f in self.db.list_fills(since=since, limit=5000)
+            if f.instrument.key == key
+            and not (
+                cut is not None
+                and f.side == Side.SELL
+                and is_other_client(f)
+                and f.ts.replace(tzinfo=f.ts.tzinfo or UTC) >= cut
+            )
+        ]
         limit = entry_qty(read_extra(self.db, key), meta)
-        cap = sell_cap(held, limit, bot_holding(fills, since, watchdog_sold=sent is not None))
+        cap = sell_cap(held, limit, split_fills(fills))
         if cap is None:
             return None
-        cap = max(0.0, cap - (sent or 0.0))
-        return self.broker.round_qty(Instrument.from_key(key), round(cap, 6))
+        sent = await self._sent_qty(key, meta, sales)
+        mine = max(0.0, min(cap.qty - sent, held - cap.keep))
+        return self.broker.round_qty(Instrument.from_key(key), round(mine, 8))
+
+    async def _sent_qty(
+        self, key: str, meta: dict[str, Any], sales: tuple[datetime, float] | None
+    ) -> float:
+        """What this watchdog sold of the position: an order that is done counts what
+        filled (an IOC sell may fill in part), one still working or unknown what it asked."""
+        rec = read_sales_record(self.db, key, position_marker(meta))
+        if rec is None:
+            return sales[1] if sales is not None else 0.0
+        total = 0.0
+        for order_id, qty in rec.get("orders", {}).items():
+            try:
+                status = await self.broker.order_status(order_id)
+            except BrokerError:
+                status = None
+            done = status is not None and status.status not in OPEN_ORDER_STATUSES
+            total += status.filled_qty if done else float(qty)
+        return total
 
     def _forget_sold(self, key: str) -> None:
         self._sold.pop(key, None)
@@ -588,6 +621,9 @@ class CryptoWatchdog:
         ):
             self._sold[close.instrument.key] = (marker, placed.broker_order_id)
             self._flat_seen.pop(close.instrument.key, None)
+            note_watchdog_sale(
+                self.db, close.instrument.key, marker, placed.broker_order_id, close.qty, now
+            )
         self.db.audit(
             "watchdog_close",
             {
