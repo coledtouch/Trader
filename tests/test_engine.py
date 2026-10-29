@@ -4000,6 +4000,78 @@ async def test_a_disconnect_alert_that_failed_is_sent_again(db, config) -> None:
     assert notes.titles().count("Broker disconnected") == 2  # failed, then delivered
 
 
+class _SlowNotifier(RecordingNotifier):
+    """Delivers every alert, but slower than the engine waits for one."""
+
+    async def send(self, title, message, priority="default", tags=None) -> bool:
+        self.sent.append((title, message, priority))
+        await asyncio.sleep(0.05)
+        return True
+
+
+async def _let_alerts_finish(engine: Engine) -> None:
+    await asyncio.gather(*engine._alert_tasks, return_exceptions=True)
+    await asyncio.sleep(0)  # their done-callbacks run on the next loop pass
+
+
+async def test_a_slow_disconnect_alert_goes_out_once_and_reconnect_follows(
+    db, config, monkeypatch
+) -> None:
+    """Review finding: an alert slower than NOTIFY_WAIT_S counted as not delivered, so
+    "Broker disconnected" went out again all outage long and "Broker reconnected" never."""
+    monkeypatch.setattr("trader.engine.NOTIFY_WAIT_S", 0.01)
+    h = await harness(db, config)
+    await h.engine.monitor_tick()
+    notes = _SlowNotifier()
+    h.engine.notifier = notes
+    h.broker._connected = h.broker.can_connect = False
+    for _ in range(12):  # three minutes
+        with contextlib.suppress(BrokerError):
+            await h.engine.monitor_tick()
+        await _let_alerts_finish(h.engine)
+        h.clock.advance(seconds=15)
+    h.broker.can_connect = True
+    await h.engine.monitor_tick()
+    await _let_alerts_finish(h.engine)
+    assert notes.titles().count("Broker disconnected") == 1
+    assert notes.titles().count("Broker reconnected") == 1
+
+
+async def test_a_slow_close_failed_alert_still_goes_out_once_per_stretch(
+    db, config, monkeypatch
+) -> None:
+    """Review finding: a "Close X FAILED" send slower than NOTIFY_WAIT_S was not stamped, so
+    the urgent alert went out on every retry instead of once per 15 minutes."""
+    monkeypatch.setattr("trader.engine.NOTIFY_WAIT_S", 0.01)
+    h = await harness(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    notes = _SlowNotifier()
+    h.engine.notifier = notes
+    h.clock.t = datetime(2026, 10, 21, 19, 51, tzinfo=UTC)  # 15:51 New York
+    h.broker.reject_exits = True
+    for _ in range(9):
+        await h.engine.monitor_tick()
+        await _let_alerts_finish(h.engine)
+        h.clock.advance(minutes=1)
+    assert notes.titles().count("Close F FAILED") == 1
+
+
+async def test_an_undelivered_close_failed_alert_is_sent_on_the_next_retry(db, config) -> None:
+    h = await harness(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    notes = _FlakyNotifier(failures=1)
+    h.engine.notifier = notes
+    h.clock.t = datetime(2026, 10, 21, 19, 51, tzinfo=UTC)  # 15:51 New York
+    h.broker.reject_exits = True
+    for _ in range(5):
+        await h.engine.monitor_tick()
+        await _let_alerts_finish(h.engine)
+        h.clock.advance(minutes=1)
+    assert notes.titles().count("Close F FAILED") == 2  # failed, then delivered
+
+
 async def test_a_rejected_replaced_stop_alerts_under_its_own_title(db, config) -> None:
     """Review finding: the alert that the re-placed stop was rejected shared its title with
     the "Unprotected X" alert seconds before, so the 60 s same-title guard dropped it."""

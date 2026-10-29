@@ -881,8 +881,9 @@ Contracts changed by the confirmed review findings (each has a regression test).
   reads the account, positions and orders under the entry lock.
 - **Alerts on trading paths** (ENG-14): a trading path waits at most `NOTIFY_WAIT_S` (1 s)
   for an alert; a slower send (a hung ntfy or push service takes 5-10 s) finishes in the
-  background. "Broker disconnected" and "Close X FAILED" count as sent only once
-  delivered (retried otherwise); a rejected re-placed stop alerts "Stop re-place failed X"
+  background. "Broker disconnected" and "Close X FAILED" are marked sent as they go out,
+  so a slow send is not repeated, and the mark is cleared when the send ends undelivered
+  (the next tick or retry sends it again); a rejected re-placed stop alerts "Stop re-place failed X"
   (its own title, past the 60 s same-title guard). The crypto watchdog sends its sells
   before its alerts, and retries an alert that was not delivered.
 - **Engine closes** (ENG-7): a monitor exit the broker refuses alerts "Close X FAILED"

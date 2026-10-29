@@ -586,18 +586,32 @@ class Engine:
         return max(self._errors.values(), key=lambda item: item[0])[1]
 
     async def _notify(
-        self, title: str, message: str, priority: str = "default", tags: list[str] | None = None
+        self,
+        title: str,
+        message: str,
+        priority: str = "default",
+        tags: list[str] | None = None,
+        on_result: Callable[[bool], None] | None = None,
     ) -> bool:
         """Send an alert; True once it was delivered. Trading paths wait for it at most
         NOTIFY_WAIT_S (a hung ntfy or push service takes 5-10 s): a slower send finishes
-        in the background, and counts as not delivered here."""
+        in the background, and counts as not delivered here. on_result gets the real
+        outcome whenever the send ends, however slow."""
         if self.notifier is None:
+            if on_result is not None:
+                on_result(False)
             return False
         send = asyncio.ensure_future(
             self.notifier.send(title, message, priority=priority, tags=tags)
         )
         self._alert_tasks.add(send)
         send.add_done_callback(self._alert_tasks.discard)
+        if on_result is not None:
+            send.add_done_callback(
+                lambda t: on_result(
+                    not t.cancelled() and t.exception() is None and bool(t.result())
+                )
+            )
         try:
             return bool(await asyncio.wait_for(asyncio.shield(send), NOTIFY_WAIT_S))
         except TimeoutError:
@@ -1542,18 +1556,27 @@ class Engine:
             log.warning("broker %s is disconnected", self.broker.name)
             self.db.audit("broker_disconnected", {"broker": self.broker.name}, actor="engine")
         if not self._down_notified and now - self._down_since >= BROKER_DOWN_NOTIFY_AFTER:
-            # Retried each tick until delivered (the network may be what is down).
-            self._down_notified = await self._notify(
+            # Marked before it goes out, so a slow send is not sent again each tick; one
+            # that was not delivered clears the mark and the next tick retries (the network
+            # may be what is down).
+            self._down_notified = True
+            outage = self._down_since
+            await self._notify(
                 "Broker disconnected",
                 f"{self.broker.name} has been unreachable since "
                 f"{self._down_since:%H:%M:%S} UTC. Broker-side stops still protect stocks.",
                 priority="high",
                 tags=["warning"],
+                on_result=lambda sent: self._down_alert_result(outage, sent),
             )
         await self.broker.connect()
         if not self.broker.connected:
             raise BrokerError("broker did not report connected after connect()")
         await self._on_reconnected(now)
+
+    def _down_alert_result(self, outage: datetime, delivered: bool) -> None:
+        if not delivered and self._down_since == outage:
+            self._down_notified = False  # still down: the next tick sends it again
 
     async def _on_reconnected(self, now: datetime) -> None:
         down_for = (now - self._down_since).total_seconds() if self._down_since else 0.0
@@ -2087,16 +2110,20 @@ class Engine:
         if last is not None and now - last < CLOSE_FAILED_ALERT_EVERY:
             return  # retried every CLOSE_RETRY: one alert per stretch, not one a minute
         restored = "protective stop re-placed at" in (rec.message or "")
-        sent = await self._notify(
+        self._close_failed_at[inst.key] = now  # cleared if not delivered: the next retry alerts
+        await self._notify(
             f"Close {inst.symbol} FAILED",
             f"{reason}: the broker refused the sell ({_short(refused)}). "
             + ("The stop was put back. " if restored else "No stop is working at IBKR. ")
             + "The bot retries; check IBKR.",
             priority="high" if restored else "urgent",
             tags=["warning"] if restored else ["rotating_light"],
+            on_result=lambda sent: self._close_alert_result(inst.key, now, sent),
         )
-        if sent:  # not delivered: the next retry alerts again
-            self._close_failed_at[inst.key] = now
+
+    def _close_alert_result(self, key: str, stamped: datetime, delivered: bool) -> None:
+        if not delivered and self._close_failed_at.get(key) == stamped:
+            del self._close_failed_at[key]
 
     def _native_stops(self, open_orders: list[OrderRecord]) -> dict[str, float]:
         """Highest working broker-side protective stop of this app per instrument. An
