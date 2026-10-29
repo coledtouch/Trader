@@ -51,16 +51,19 @@ from trader.models import (
 from trader.notify import Notifier
 from trader.ownership import (
     FILL_TIME_SKEW,
+    REST_SETTLED,
     WATCHDOG_TAG_PREFIX,
     app_entry_unjournaled,
     app_sold_unjournaled,
     bought_since,
     entry_qty,
+    for_sizing,
     is_other_client,
     less_sold,
     note_watchdog_sale,
     owner_evidence,
     read_extra,
+    read_hidden,
     read_sales_record,
     sell_cap,
     split_fills,
@@ -519,7 +522,11 @@ class CryptoWatchdog:
             )
         ]
         limit = entry_qty(read_extra(self.db, key), meta)
-        split = split_fills(fills, entry=limit, entry_sent=opened)
+        extra = read_extra(self.db, key)
+        raw = split_fills(fills, entry=limit, entry_sent=opened, hidden=read_hidden(extra))
+        if extra.get(REST_SETTLED):
+            raw = dataclasses.replace(raw, unseen=0.0)  # the entry's rest is not held
+        split = for_sizing(raw, extra)
         # More held than the bot can still hold once its known sales are off: bought since.
         filled = watchdog_filled(self.db, key, marker)
         after = less_sold(split, filled[1]) if filled is not None else split
@@ -533,15 +540,17 @@ class CryptoWatchdog:
         # was down): the bot's, even when the owner sold some of his meanwhile (less held
         # than both sides' journaled units would otherwise hide it).
         late, unknown = app_entry_unjournaled(self.db, key, opened, fills, open_orders)
-        late = min(split.unseen, late)
+        late = min(raw.unseen, late)
         if late > QTY_EPS:
-            split = dataclasses.replace(split, bot=split.bot + late, unseen=split.unseen - late)
-        split = less_sold(split, sent)
-        vanished = min(unknown, split.unseen)
-        if vanished > QTY_EPS and abs(held - (split.bot + split.owner + vanished)) > QTY_EPS:
+            raw = dataclasses.replace(raw, bot=raw.bot + late, unseen=raw.unseen - late)
+        raw = less_sold(raw, sent)
+        vanished = min(unknown, raw.unseen)
+        known = raw.bot + raw.owner + raw.hidden
+        if vanished > QTY_EPS and abs(held - (known + vanished)) > QTY_EPS:
             # Not what is held if all of it had filled: it lapsed, or the owner sold or
             # bought some meanwhile. Whose coins are left is unknown.
             self._unsure.add(key)
+        split = for_sizing(raw, extra)
         cap = sell_cap(held, limit, split, evidence=True)
         if cap is None:
             return None

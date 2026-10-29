@@ -54,6 +54,12 @@ UNREPORTED_EXIT = "unreported-exit"
 # what it filled is unknown.
 ORDER_FORGOTTEN = "no longer known to the broker"
 EPS = 1e-9
+# Position extra: [[seen at (ISO), qty], ...] units held beyond what the fills explain and
+# beyond the unseen part of the bot's entry: the owner's, bought where IBKR no longer
+# reports (the bot never adds to a position, and its entry went out with the symbol flat).
+OWNER_HIDDEN = "owner_hidden"
+# Position extra: the unseen rest of the bot's entry is settled (not held, none can come).
+REST_SETTLED = "rest_settled"
 
 
 @dataclass(frozen=True)
@@ -63,6 +69,7 @@ class Split:
     owner_bought: float = 0.0  # bought by another client in the window
     bot_bought: float = 0.0  # bought by this app in the window (its entry's fills)
     unseen: float = 0.0  # of the bot's entry quantity, what no fill shows and none sold
+    hidden: float = 0.0  # the owner's units no fill shows (`split_fills(hidden=)`) still held
     bot_fills: list[Fill] = field(default_factory=list)  # the bot's part of each fill
     flat_at: datetime | None = None  # last fill after which neither side held anything
 
@@ -101,6 +108,7 @@ def split_fills(
     bot_first_until: datetime | None = None,
     entry: float | None = None,
     entry_sent: datetime | None = None,
+    hidden: Iterable[tuple[datetime, float]] = (),
 ) -> Split:
     """Who holds what of one instrument after `fills` (the window from the bot's entry, less
     FILL_TIME_SKEW), in time order. The bot's buys are this app's own executions (the bot
@@ -119,8 +127,13 @@ def split_fills(
     comes out of that part before the owner's (`Split.unseen` is what is left of it); so
     does another client's beyond the owner's and the bot's seen units. A sell before the
     entry was sent (`entry_sent`) and any buy of the bot's sold nothing of the bot's
-    position: the symbol was flat at the broker when the entry went out."""
+    position: the symbol was flat at the broker when the entry went out.
+
+    `hidden`: units of the owner's that no fill shows (he bought them where IBKR no longer
+    reports), each seen held at a time (`OWNER_HIDDEN`): another client's sells after it
+    come out of them after his seen units, before the bot's."""
     bot = owner = owner_bought = bot_bought = 0.0
+    pools = sorted([_aware(at), max(0.0, qty)] for at, qty in hidden)
     ordered = sorted(fills, key=lambda f: (_aware(f.ts), f.exec_id))
     sent_at = _aware(entry_sent) if entry_sent is not None else None
     # The bot's previous trip: what it bought and sold back to flat before this entry was
@@ -169,6 +182,7 @@ def split_fills(
             on_bot = 0.0
         else:
             lead = 0.0  # the part sold out of the bot's units first
+            charge = False  # another client's sell inside the watchdog's window
             if not other:
                 lead = q
                 if (
@@ -186,12 +200,13 @@ def split_fills(
                 and (until is None or _aware(f.ts) <= until)
             ):
                 lead = q if budget is None else min(q, budget)
-                if budget is not None:
-                    budget -= lead
+                charge = True
             a = min(lead, bot)
             bot -= a
             u = min(lead - a, unseen)
             unseen -= u
+            if charge and budget is not None:
+                budget -= a + u  # only what it took of the bot's may have been the watchdog's
             b = min(lead - a - u, owner)
             owner -= b
             on_bot = lead - b
@@ -199,6 +214,11 @@ def split_fills(
             if rest > EPS:
                 o = min(rest, owner)
                 owner -= o
+                for pool in pools:  # his units no fill shows, held before this sell
+                    if pool[0] <= _aware(f.ts) and rest - o > EPS:
+                        h = min(rest - o, pool[1])
+                        pool[1] -= h
+                        o += h
                 a = min(rest - o, bot)
                 bot -= a
                 u = min(rest - o - a, unseen)
@@ -221,8 +241,37 @@ def split_fills(
         owner_bought=owner_bought,
         bot_bought=bot_bought,
         unseen=unseen,
+        hidden=sum(pool[1] for pool in pools),
         bot_fills=out,
         flat_at=flat_at,
+    )
+
+
+def read_hidden(extra: Mapping[str, Any]) -> list[tuple[datetime, float]]:
+    """The owner's units no fill shows, as the engine recorded them (`OWNER_HIDDEN`)."""
+    out: list[tuple[datetime, float]] = []
+    for item in extra.get(OWNER_HIDDEN) or []:
+        try:
+            at, qty = item
+            out.append((_aware(datetime.fromisoformat(at)), float(qty)))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def for_sizing(split: Split, extra: Mapping[str, Any]) -> Split:
+    """The split an exit of the bot's is sized from: the owner's units no fill shows
+    (`Split.hidden`) are his like his seen ones, and once the entry's rest is settled
+    (`REST_SETTLED`) none of it is the bot's. The unseen part is lessened by those units,
+    so sell_cap's test that all the units no fill explains fit in it is the same as before
+    they were counted as his."""
+    unseen = 0.0 if extra.get(REST_SETTLED) else max(0.0, split.unseen - split.hidden)
+    return dataclasses.replace(
+        split,
+        owner=split.owner + split.hidden,
+        owner_bought=split.owner_bought + split.hidden,  # he bought them: evidence
+        hidden=0.0,
+        unseen=unseen,
     )
 
 
