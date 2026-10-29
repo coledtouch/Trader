@@ -83,9 +83,11 @@ from trader.ownership import (
     WATCHDOG_SALES_PREFIX,
     Cap,
     entry_qty,
+    less_sold,
     merge_fills,
     sell_cap,
     split_fills,
+    unreported_sales,
     watchdog_sales,
 )
 from trader.risk import (
@@ -522,7 +524,7 @@ class Engine:
         recorded broker account change so it does not jump between accounts."""
         if self.db.get_kv(EQUITY_SINCE_KEY) is not None:
             return
-        changes = [a for a in self.db.list_audit(limit=1000) if a["action"] == "account_changed"]
+        changes = self.db.list_audit(limit=1, action="account_changed")
         if changes:
             self.db.set_kv(EQUITY_SINCE_KEY, changes[0]["ts"])  # newest first
 
@@ -871,7 +873,7 @@ class Engine:
     def _backfill_curve_after_cash_flow(self) -> None:
         """Journals from before the check above: a paper reset recognised only later (the
         untraded-day rebase) left a cliff on the curve. Start the curve after it. Idempotent."""
-        flows = [a for a in self.db.list_audit(limit=1000) if a["action"] == "cash_flow"]
+        flows = self.db.list_audit(limit=1, action="cash_flow")
         if not flows:
             return
         latest = flows[0]  # newest first
@@ -1175,6 +1177,8 @@ class Engine:
         if rec is None:  # sold in between (a stop or target filled)
             self._unmark_closing(key, seq)
             raise LookupError(f"no open {inst.symbol} position")
+        if cap is not None and rec.request.qty < cap.qty - EPS:
+            self._unmark_closing(key, seq)  # see _note_capped_close
         self._journal_order(rec, now)
         refused = _refused_exits([rec])
         if refused:
@@ -1372,12 +1376,14 @@ class Engine:
                     # owner may approve again. A stop it cancelled is put back (re-protect).
                     self._unmark_closing(key, seq)
                     raise
-                self._note_close(key, placed, seq)
+                self._note_capped_close(key, cap, placed, seq)
                 if placed is None:
                     self.db.update_order(
                         order_id, status=OrderStatus.CANCELLED, message="no position to close"
                     )
                     return self._get_order(order_id)
+                # Journal what was sold: the bot's part when the owner holds the rest.
+                order = order.model_copy(update={"qty": placed.request.qty})
             else:
                 placed = await self._send_entry(order, now)
                 # Journal the target as sent: none when winners run (exits.no_target).
@@ -2153,7 +2159,7 @@ class Engine:
                     except BrokerError as exc:  # close_position put the stop back
                         failed.append(f"{pos.instrument.symbol}: {exc}")
                         continue
-                    self._note_close(key, rec, seq)
+                    self._note_capped_close(key, cap, rec, seq)
                     if rec is not None:
                         records.append(rec)
         finally:
@@ -2212,12 +2218,25 @@ class Engine:
         if rec is None or rec.status == OrderStatus.REJECTED:
             self._close_refused.add(key)
 
+    def _note_capped_close(
+        self, key: str, cap: Cap | None, rec: OrderRecord | None, seq: int
+    ) -> None:
+        """_note_close for a close sized to the bot's part. The broker sizes it again after
+        cancelling the bot's stop: when the position changed meanwhile (the owner sold) and
+        it sold less than the bot's part, or nothing, the bot's units may be left with no
+        stop. Look again on the next tick (re-protect, a fresh cap), not after CLOSE_RETRY."""
+        if cap is not None and (rec is None or rec.request.qty < cap.qty - EPS):
+            self._unmark_closing(key, seq)
+            return
+        self._note_close(key, rec, seq)
+
     async def _bot_cap(self, inst: Instrument) -> Cap | None:
         """How much a bot exit may sell of `inst` right now: None when nothing says the
         owner bought the symbol since the bot's entry was sent (sell all of it, as before);
         else the bot's own quantity (`qty`, 0: none of it) and the owner's known units
-        (`keep`). The position is read fresh; the journal first, the broker's executions
-        only when the journal does not explain the position as the bot's."""
+        (`keep`). The position is read fresh, and the fills are the journal and the
+        broker's executions: the journal alone is a tick behind (a bot sale and an owner
+        buy since then may net out)."""
         key = inst.key
         meta = self.db.get_position_meta(key)
         opened = meta.get("opened_at") if meta else None
@@ -2237,21 +2256,36 @@ class Engine:
             for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
             if f.instrument.key == key
         ]
-        split = split_fills(journal, bot_first_from=bot_first)
-        limit = entry_qty(self._extra(key), meta)
-        if split.owner_bought <= EPS and abs(held - split.bot) <= max(EPS, 1e-6 * held):
-            return None  # the journal explains everything held as the bot's
+        read = True
         try:
             fresh = [f for f in await self.broker.fills_since(since) if f.instrument.key == key]
         except BrokerError as exc:
             log.warning(
                 "%s: executions not read (%s); the journal decides the bot's part", key, exc
             )
-            fresh = []
-        split = split_fills(merge_fills(journal, fresh), bot_first_from=bot_first)
+            fresh, read = [], False
+        fills = merge_fills(journal, fresh)
+        limit = entry_qty(self._extra(key), meta)
+        split = split_fills(fills, bot_first_from=bot_first, entry=limit)
+        if sales is not None and bot_first is not None:
+            # The watchdog's sales no fill shows (an earlier day IBKR no longer reports)
+            # came out of the bot's units all the same.
+            split = less_sold(split, unreported_sales(sales[1], fills, bot_first))
         cap = sell_cap(held, limit, split)
         if cap is None:
             return None
+        if not read and abs(held - (split.bot + split.owner)) > max(EPS, 1e-6 * held):
+            # The journal is behind the position and the executions could not say whose
+            # the difference is: sell nothing now (looked at again after CLOSE_RETRY).
+            log.warning(
+                "%s: %g held, the journal shows %g of the bot's and %g of the owner's; not "
+                "sized until the executions are read",
+                key,
+                held,
+                split.bot,
+                split.owner,
+            )
+            return Cap(qty=0.0, keep=held)
         mine = self.broker.round_qty(
             inst, round(cap.qty, 8), allow_fractional=self.settings.allow_fractional_stocks
         )
@@ -2260,7 +2294,7 @@ class Engine:
         cap = Cap(qty=mine, keep=max(cap.keep, held - mine))
         if mine < held - EPS:
             self._note_owner_shares(inst, meta, held, mine)
-        if held - (split.bot + split.owner) > max(EPS, 1e-6 * held):
+        if held - (split.bot + split.owner) > max(EPS, mine - split.bot, 1e-6 * held):
             self._note_unexplained(inst, meta, held, split.bot, split.owner)
         return cap
 
@@ -2328,7 +2362,7 @@ class Engine:
             max_qty=cap.qty if cap else None,
             keep=cap.keep if cap else 0.0,
         )
-        self._note_close(inst.key, rec, seq)
+        self._note_capped_close(inst.key, cap, rec, seq)
         if rec is not None:
             self._journal_order(rec, now)
         self.db.audit("engine_close", {"instrument": inst.key, "reason": reason}, actor="engine")
@@ -3046,7 +3080,8 @@ class Engine:
         exit. Only the bot's own lots make its trips (trader/ownership.split_fills): shares
         the owner bought next to them are neither paired with them nor journaled."""
         anchor = self._journal_anchor(key)
-        last_exit = anchor if anchor is not None else self._last_exit_for(key)
+        journaled_exit = self._last_exit_for(key)  # also loads the cache _journal_trade keeps
+        last_exit = anchor if anchor is not None else journaled_exit
         epoch = self._epoch  # fills before it belong to an earlier (simulated) account
         since = last_exit or now - TRADE_LOOKBACK
         if epoch is not None:
@@ -3065,11 +3100,12 @@ class Engine:
         fallback = None
         if meta and meta.get("entry_price"):
             fallback = (float(meta["entry_price"]), meta.get("opened_at") or now)
-        bot_first = None
+        bot_first = entry = None
         if meta is not None:
             sales = watchdog_sales(self.db, key, position_marker(meta), meta.get("opened_at"))
             bot_first = sales[0] - FILL_TIME_SKEW if sales is not None else None
-        split = split_fills(fills, bot_first_from=bot_first)
+            entry = entry_qty(self._extra(key), meta)
+        split = split_fills(fills, bot_first_from=bot_first, entry=entry)
         trips, open_qty = replay_fills(split.bot_fills, fallback)
         self._open_qty[key] = open_qty
         self._pending_trades.discard(key)
@@ -3289,8 +3325,8 @@ class Engine:
 
     def _watchdog_sale_at(self, key: str) -> datetime | None:
         """When the crypto watchdog last sold `key` (its audit row), if it is recorded."""
-        for row in self.db.list_audit(limit=1000):
-            if row["action"] == "watchdog_close" and row["detail"].get("instrument") == key:
+        for row in self.db.list_audit(limit=None, action="watchdog_close"):
+            if row["detail"].get("instrument") == key:
                 stamp = datetime.fromisoformat(row["ts"])
                 return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
         return None
@@ -4179,6 +4215,17 @@ class Engine:
         if not self.settings.autopilot:
             if inst.key in self._awaiting_approval():
                 return
+            try:
+                cap = await self._bot_cap(inst)
+            except BrokerError as exc:
+                log.warning("CLOSE %s: the bot's part not read (%s)", inst.key, exc)
+                cap = None
+            if cap is not None:
+                if cap.qty <= EPS:
+                    log.info("CLOSE %s: none of it is the bot's", inst.key)
+                    return
+                # The owner is asked to approve selling the bot's part, never his own.
+                req = req.model_copy(update={"qty": min(pos.qty, cap.qty)})
             self._journal_order(
                 OrderRecord(
                     request=req,
@@ -4206,7 +4253,7 @@ class Engine:
                 max_qty=cap.qty if cap else None,
                 keep=cap.keep if cap else 0.0,
             )
-            self._note_close(inst.key, rec, seq)
+            self._note_capped_close(inst.key, cap, rec, seq)
         if rec is not None:
             req = req.model_copy(update={"qty": rec.request.qty})
             if rec.request.trace_id:

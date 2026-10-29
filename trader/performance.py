@@ -93,7 +93,7 @@ def performance_report(
     epoch_raw = db.get_kv("journal_account_since")
     if epoch_raw is None:
         # Upgrade existing journals without merging an old simulator/account history.
-        switched = [a for a in db.list_audit(limit=1000) if a["action"] == "account_changed"]
+        switched = db.list_audit(limit=1, action="account_changed")
         epoch_raw = switched[0]["ts"] if switched else None
     epoch = _at(epoch_raw) if epoch_raw else None
     if epoch is not None:

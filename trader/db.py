@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS audit (
     detail TEXT,
     ip TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit(action, id);
 CREATE TABLE IF NOT EXISTS decisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,
@@ -421,8 +422,12 @@ class Database:
             (_iso(utcnow()), actor, action, json.dumps(detail or {}, default=str), ip),
         )
 
-    def list_audit(self, limit: int = 50) -> list[dict[str, Any]]:
-        rows = self._all("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (limit,))
+    def list_audit(self, limit: int | None = 50, action: str | None = None) -> list[dict[str, Any]]:
+        """Newest first; `action` keeps only that kind of row, `limit` None keeps all."""
+        rows = self._all(
+            "SELECT * FROM audit WHERE (? IS NULL OR action = ?) ORDER BY id DESC LIMIT ?",
+            (action, action, -1 if limit is None else limit),
+        )
         return [
             {
                 "id": r["id"],

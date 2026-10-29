@@ -1129,7 +1129,11 @@ another client's (`perm:`) buys are the owner's, and another client's sells come
 owner's units first (out of the bot's first from the crypto watchdog's first sale of the
 position on: its sells are not told apart from the owner's). The entry's quantity
 (`position_extra.qty`, older rows: planned risk over risk per unit) bounds the bot's part:
-the bot never adds to a position.
+the bot never adds to a position. Part of the entry may be in no fill (it filled on a day
+IBKR no longer reports): a sell of the bot's beyond its seen units comes out of that unseen
+part before the owner's, and units no fill explains count as the bot's when they fit in what
+is left of it (so its own position keeps its exits); more than that, and whose they are is
+unknown (the bot sells only what its fills show, and the owner is alerted).
 
 Evidence the owner bought is an owner buy in the window, or more held than the entry asked
 for. Without it nothing changes: every exit sells the whole position, as before. With it,
@@ -1141,21 +1145,29 @@ never into `Cap.keep` (the owner's units, at least everything held that is not t
 keep)` sizes the sell again on a fresh position read after its cancels, so a bracket child
 that fills meanwhile, or an owner buy since the tick read the positions, only shrinks it. A
 size of 0 sends nothing and leaves the bot's stop in place (Close refuses: "sell it in
-IBKR"; an approval is cancelled; the engine looks again after CLOSE_RETRY). The journal is
-read first; only when it does not explain the position as the bot's are the broker's
-executions read too (when that read fails, the journal alone decides: the bot may sell
-less, never the owner's). The owner is told once per bot position (audit `owner_shares`); a
-position larger than the bot's and the owner's journaled units together gets one alert
-("shares of unknown owner": urgent for crypto, nothing guards the rest).
+IBKR"; an approval is cancelled; the engine looks again after CLOSE_RETRY). A close that,
+sized again after its cancels, sold less than the bot's part or nothing (the owner sold in
+between) is not left in flight: the next tick re-protects and re-sizes the bot's units. The
+fills are the journal and the broker's executions (the journal alone is a tick behind: a bot
+sale and an equal owner buy since then would net out); when the executions read fails and
+the journal does not explain the position, nothing is sold until it can. Sales of the crypto
+watchdog's that no fill shows (an earlier day IBKR no longer reports) come out of the bot's
+units. An approval asks to sell, and journals, the bot's part only. The owner is told once
+per bot position (audit `owner_shares`); a position larger than the bot's and the owner's
+known units together gets one alert ("shares of unknown owner": urgent for crypto).
 
 The crypto watchdog, with the app down, sells at most the bot's part from the journal the
 app kept (another client's sells after its own first sale are left out: they may be its
-own), less what it already sold of the position, and never into the owner's journaled
-units. It records each accepted sell in kv `watchdog_sales:<key>` (`{"marker", "first",
-"orders": {order id: qty}}`, cleared with the metadata) and counts an order that is done by
-what it filled (an IOC sell may fill in part) and one still working by what it asked;
-without a record (an older watchdog) its audit rows count. A capped sale never marks the
-position sold flat (`WATCHDOG_CLOSED`). KILL and the daily-loss flatten outside shadow mode
+own), less what it already sold of the position. It never sells into the owner's journaled
+units when an exit of the app's since the last journaled fill may have sold the bot's;
+otherwise less held than both is the owner selling his (another client's sells come out of
+his units first) and the bot's units are still sold. It records each sell that was accepted
+or filled anything in kv `watchdog_sales:<key>` (`{"marker", "first", "orders": {order id:
+qty}, "done": [...]}`, cleared with the metadata): what it asked while an order works, what
+filled once it is done (an IOC sell may fill in part, and come back cancelled with a fill),
+so the app reads the same. Without a record (an older watchdog) its audit rows count (by
+action, with no row limit; a cancelled row with a fill counts what filled). A capped sale
+never marks the position sold flat (`WATCHDOG_CLOSED`). KILL and the daily-loss flatten outside shadow mode
 (`flatten_all`) still close everything (owner decision of 2026-10-23).
 
 The trade journal pairs only the bot's own lots (`_reconstruct` replays `split_fills(...)

@@ -3,6 +3,7 @@ and the bot's own position keeps its protection and management."""
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 from datetime import UTC, datetime, timedelta
 
@@ -14,7 +15,9 @@ from tests.test_engine import (
     H,
     _hold_btc,
     _part,
+    _restart_next_morning,
     _resting_entry,
+    buy,
     enter_f,
     harness,
     hold,
@@ -25,6 +28,8 @@ from trader.models import (
     AssetClass,
     Fill,
     Instrument,
+    Mode,
+    OrderStatus,
     Side,
     TradeAction,
 )
@@ -529,3 +534,239 @@ async def test_the_owner_selling_everything_closes_the_bots_trade_at_his_price(d
     [trade] = db.list_trades()
     assert trade.qty == 24 and trade.exit_price == pytest.approx(10.4)
     assert db.get_position_meta("STK:F") is None
+
+
+# ----------------------------------------------------------------------------- review 36/37
+def _stops(h: H, key: str = "STK:F") -> list[float]:
+    return [h.broker.orders[oid].request.qty for oid in h.broker.working(key, "stop")]
+
+
+async def _f_with_owner(db, config) -> H:
+    h = await harness(db, config)
+    await enter_f(h)
+    await ticks(h, 1)
+    owner_buys(h, F, 50, 10.0)
+    await ticks(h, 1)
+    return h
+
+
+async def test_an_owner_sale_during_a_capped_close_has_the_bot_guarded_next_tick(
+    db, config
+) -> None:
+    """The owner's own TWS stop sells his 50 while the bot's close cancels its stop: the
+    close, sized again, sells nothing. The bot's 24 are looked at again on the next tick
+    (stopped or sold), not left bare for CLOSE_RETRY."""
+    h = await _f_with_owner(db, config)
+    h.clock.advance(minutes=46)
+    await h.engine.monitor_tick()  # time stop seen once
+    real = h.broker.cancel_order
+    armed = {"on": True}
+
+    async def cancel_then_owner_sells(oid: str) -> None:
+        await real(oid)
+        if armed["on"]:
+            armed["on"] = False
+            owner_sells(h, F, 50, 9.95)
+
+    h.broker.cancel_order = cancel_then_owner_sells
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    h.broker.cancel_order = real
+    await ticks(h, 2, seconds=15)  # well inside CLOSE_RETRY
+    assert "STK:F" not in h.broker.pos or _stops(h) == [24]
+
+
+async def test_an_approved_close_asks_for_and_journals_the_bots_part(db, config) -> None:
+    h = await _f_with_owner(db, config)
+    h.db.save_settings(h.db.get_settings().model_copy(update={"autopilot": False}))
+    h.engine.reload_settings()
+    h.clock.advance(minutes=5)
+    h.decider.decisions = [
+        hold("F").model_copy(update={"action": TradeAction.CLOSE, "rationale": "fading"})
+    ]
+    await h.engine.run_cycle()
+    [pending] = h.orders(OrderStatus.PENDING_APPROVAL)
+    assert pending.request.qty == 24
+    await h.engine.approve_order(pending.id)
+    await ticks(h, 2)
+    row = h.db.get_order(pending.id)
+    assert (row.request.qty, row.filled_qty) == (24, 24)
+    assert h.broker.pos["STK:F"][0] == 50
+
+
+async def test_a_bot_sale_and_an_equal_owner_buy_between_ticks_are_told_apart(db, config) -> None:
+    """The bracket stop sells the bot's 24 and the owner buys 24 before the journal sees
+    either: the journal alone reads 24 held as the bot's. The executions say otherwise."""
+    h = await harness(db, config)
+    await enter_f(h)
+    await ticks(h, 1)
+    h.clock.advance(minutes=46)
+    await h.engine.monitor_tick()  # time stop seen once
+    h.broker._fill(h.broker.working("STK:F", "stop")[0], 9.8)
+    owner_buys(h, F, 24, 10.0)
+    await ticks(h, 4)
+    assert bot_sells(h, "STK:F") == [] and h.broker.pos["STK:F"][0] == 24
+
+
+async def test_a_failed_executions_read_never_sizes_from_a_stale_journal(db, config) -> None:
+    """Time stop pending; the bracket stop sells the bot's 24 and the owner buys 50, and
+    the executions read fails: the journal (bot 24, nothing of the owner's) cannot say whose
+    the 50 are. Nothing is sold until it can."""
+    h = await harness(db, config)
+    await enter_f(h)
+    await ticks(h, 1)
+    h.clock.advance(minutes=46)
+    await h.engine.monitor_tick()
+    owner_buys(h, F, 50, 10.0)
+    h.broker._fill(h.broker.working("STK:F", "stop")[0], 9.8)
+    real = h.broker.fills_since
+
+    async def failing(since: datetime) -> list[Fill]:
+        raise BrokerError("IBKR executions timed out after 10s")
+
+    h.broker.fills_since = failing
+    h.clock.advance(seconds=15)
+    with contextlib.suppress(BrokerError):
+        await h.engine.monitor_tick()
+    h.broker.fills_since = real
+    await ticks(h, 2)
+    assert bot_sells(h, "STK:F") == [] and h.broker.pos["STK:F"][0] == 50
+
+
+def _watchdog_sells(
+    h: H, meta: dict, qty: float, *, filled: float | None = None, record: bool = True
+) -> None:
+    """The crypto watchdog (another client) sells `qty` of the bot's BTC, as it records it
+    (`record` False: an older watchdog, its audit row only)."""
+    from trader.ownership import note_watchdog_sale
+    from trader.watchdog import position_marker
+
+    sold = qty if filled is None else filled
+    h.broker.pos["CRYPTO:BTC"][0] -= sold
+    h.broker.fills.append(
+        Fill(exec_id=f"WD{next(_ids)}", broker_order_id=f"perm:{next(_ids)}", instrument=_BTC,
+             side=Side.SELL, qty=sold, price=58900.0, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    marker = position_marker(meta)
+    if filled is None and record:
+        note_watchdog_sale(h.db, "CRYPTO:BTC", marker, "77", qty, h.clock())
+    h.db.audit("watchdog_close", {"instrument": "CRYPTO:BTC", "kind": "stop", "qty": qty,
+               "filled": sold, "status": "submitted" if filled is None else "cancelled",
+               "marker": marker}, actor="watchdog")  # fmt: skip
+
+
+@pytest.mark.parametrize("owner_journaled", [True, False])
+async def test_a_watchdog_sale_ibkr_no_longer_reports_still_came_out_of_the_bots(
+    db, config, owner_journaled: bool
+) -> None:
+    """The watchdog sold the bot's BTC overnight next to the owner's (bought before the app
+    went down, or while it was down); the app comes back the next day, when IBKR no longer
+    reports that sale. The owner's coins are never sold."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 1, 0, tzinfo=UTC))  # Wed 21:00
+    mine = h.broker.pos["CRYPTO:BTC"][0]
+    meta = db.get_position_meta("CRYPTO:BTC")
+    if owner_journaled:
+        owner_buys(h, _BTC, 0.5, 60000.0)
+        await ticks(h, 2, seconds=15)
+    h.clock.t = datetime(2026, 10, 29, 2, 0, tzinfo=UTC)  # the app is down
+    if not owner_journaled:
+        owner_buys(h, _BTC, 0.5, 60000.0)
+    h.clock.t = datetime(2026, 10, 29, 3, 0, tzinfo=UTC)
+    _watchdog_sells(h, meta, mine)
+    h.broker.set_price("BTC", 58900.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    engine = _restart_next_morning(h, config)
+    for _ in range(8):
+        await engine.monitor_tick()
+        h.clock.advance(seconds=15)
+    assert bot_sells(h, "CRYPTO:BTC") == []
+    assert h.broker.pos["CRYPTO:BTC"][0] == pytest.approx(0.5)
+
+
+async def test_a_watchdog_ioc_sale_cancelled_with_a_fill_came_out_of_the_bots(db, config) -> None:
+    """An older watchdog's IOC sell filled 60% and came back cancelled (audit row only):
+    that part is the bot's, so the app sells only the bot's other 40%."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 15, 0, tzinfo=UTC))
+    mine = h.broker.pos["CRYPTO:BTC"][0]
+    owner_buys(h, _BTC, 0.5, 60000.0)
+    await ticks(h, 1, seconds=15)
+    meta = db.get_position_meta("CRYPTO:BTC")
+    h.clock.advance(minutes=5)  # the app is down
+    _watchdog_sells(h, meta, mine, filled=round(mine * 0.6, 8))
+    h.broker.set_price("BTC", 58000.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    await ticks(h, 10, seconds=15)
+    assert h.broker.pos["CRYPTO:BTC"][0] == pytest.approx(0.5)
+
+
+async def test_a_watchdog_sale_long_back_in_the_audit_still_counts(db, config) -> None:
+    """An older watchdog (audit row only, no sales record) sold the bot's BTC overnight next
+    to the owner's; the app comes back the next day after more than 1000 other audit rows.
+    That sale is still the bot's, so the owner's BTC is never sold."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 1, 0, tzinfo=UTC))
+    mine = h.broker.pos["CRYPTO:BTC"][0]
+    meta = db.get_position_meta("CRYPTO:BTC")
+    h.clock.t = datetime(2026, 10, 29, 2, 0, tzinfo=UTC)  # the app is down
+    owner_buys(h, _BTC, 0.5, 60000.0)
+    h.clock.t = datetime(2026, 10, 29, 3, 0, tzinfo=UTC)
+    _watchdog_sells(h, meta, mine, record=False)
+    for _ in range(1200):
+        db.audit("login", {}, actor="owner")
+    h.broker.set_price("BTC", 58900.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    engine = _restart_next_morning(h, config)
+    for _ in range(8):
+        await engine.monitor_tick()
+        h.clock.advance(seconds=15)
+    assert bot_sells(h, "CRYPTO:BTC") == []
+    assert h.broker.pos["CRYPTO:BTC"][0] == pytest.approx(0.5)
+
+
+async def test_an_unjournaled_bot_entry_next_to_the_owners_btc_keeps_its_stop(db, config) -> None:
+    """The bot's BTC entry filled while the app was down on an earlier day (never
+    journaled); the owner buys 0.5 today. The units no fill explains fit the bot's entry:
+    they are the bot's, and its stop still sells them (only them)."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 1, 0, tzinfo=UTC))
+    mine = h.broker.pos["CRYPTO:BTC"][0]
+    db._exec("DELETE FROM fills")
+    engine = _restart_next_morning(h, config)
+    owner_buys(h, _BTC, 0.5, 60000.0)
+    h.broker.set_price("BTC", 58900.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    for _ in range(8):
+        await engine.monitor_tick()
+        h.clock.advance(seconds=15)
+    assert bot_sells(h, "CRYPTO:BTC") == [pytest.approx(mine)]
+    assert h.broker.pos["CRYPTO:BTC"][0] == pytest.approx(0.5)
+
+
+async def test_a_restart_in_a_symbol_the_owner_traded_journals_the_bots_next_trades(
+    db, config
+) -> None:
+    h = await harness(db, config, mode=Mode.PAPER)
+    await enter_f(h)
+    await ticks(h, 1)
+    owner_buys(h, F, 50, 10.2)
+    await ticks(h, 1)
+    h.clock.advance(minutes=46)
+    await h.engine.monitor_tick()
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()  # the time stop sells the bot's 24
+    await ticks(h, 3)
+    owner_sells(h, F, 50, 10.4)
+    await ticks(h, 3)
+    assert len(db.list_trades()) == 1
+    losses = db.get_day("2026-10-21").losses
+    h.engine = Engine(config, db, h.broker, h.decider, notifier=h.notes, clock=h.clock,
+                      scanner=h.scanner)  # fmt: skip
+    await ticks(h, 2)
+    h.decider.decisions = [buy()]
+    await h.engine.run_cycle()  # the bot enters F again, no owner involved
+    h.decider.decisions = []
+    await ticks(h, 2)
+    h.broker.set_price("F", 9.7)  # its bracket stop fills
+    await ticks(h, 5)
+    h.broker.set_price("F", 10.0)
+    h.clock.advance(minutes=20)
+    h.decider.decisions = [buy()]
+    await h.engine.run_cycle()  # and once more
+    h.decider.decisions = []
+    await ticks(h, 3)
+    assert len(db.list_trades()) == 2
+    assert db.get_day("2026-10-21").losses == losses + 1

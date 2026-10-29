@@ -37,6 +37,7 @@ from trader.models import (
     OPEN_ORDER_STATUSES,
     AssetClass,
     DayStats,
+    Fill,
     Instrument,
     Mode,
     OrderRecord,
@@ -52,7 +53,9 @@ from trader.ownership import (
     FILL_TIME_SKEW,
     entry_qty,
     is_other_client,
+    less_sold,
     note_watchdog_sale,
+    owner_evidence,
     read_extra,
     read_sales_record,
     sell_cap,
@@ -476,29 +479,77 @@ class CryptoWatchdog:
             )
         ]
         limit = entry_qty(read_extra(self.db, key), meta)
-        cap = sell_cap(held, limit, split_fills(fills))
+        split = split_fills(fills, entry=limit)
+        if not owner_evidence(held, limit, split):
+            return None
+        # What this process sold of it is in no journaled fill (the app is down).
+        split = less_sold(split, await self._sent_qty(key, meta, sales))
+        cap = sell_cap(held, limit, split)
         if cap is None:
             return None
-        sent = await self._sent_qty(key, meta, sales)
-        mine = max(0.0, min(cap.qty - sent, held - cap.keep))
+        mine = min(cap.qty, held)
+        if held - cap.keep < mine and self._app_sold_unjournaled(key, opened, fills):
+            # Less held than the bot's and the owner's journaled units: an exit of the
+            # app's the journal never saw may have sold the bot's. Never the owner's.
+            mine = held - cap.keep
+        # Otherwise the owner sold some of his (another client's sells come out of the
+        # owner's units first): the bot's are still there.
+        mine = max(0.0, mine)
         return self.broker.round_qty(Instrument.from_key(key), round(mine, 8))
+
+    def _app_sold_unjournaled(self, key: str, opened: datetime, fills: list[Fill]) -> bool:
+        """A sell of the app's for this position since its last journaled fill: it may
+        have filled while the app was going down, before the journal saw it."""
+        last = max((f.ts.replace(tzinfo=f.ts.tzinfo or UTC) for f in fills), default=None)
+        start = opened if last is None else max(opened, last - FILL_TIME_SKEW)
+        start = start.replace(tzinfo=start.tzinfo or UTC)
+        for rec in self.db.list_orders(limit=200):
+            req = rec.request
+            created = rec.created_at.replace(tzinfo=rec.created_at.tzinfo or UTC)
+            if (
+                req.instrument.key == key
+                and req.side == Side.SELL
+                and not (req.trace_id or "").startswith(TAG_PREFIX)
+                and rec.status not in (OrderStatus.REJECTED, OrderStatus.BLOCKED)
+                and rec.status != OrderStatus.PENDING_APPROVAL
+                and created >= start
+            ):
+                return True
+        return False
 
     async def _sent_qty(
         self, key: str, meta: dict[str, Any], sales: tuple[datetime, float] | None
     ) -> float:
         """What this watchdog sold of the position: an order that is done counts what
         filled (an IOC sell may fill in part), one still working or unknown what it asked."""
-        rec = read_sales_record(self.db, key, position_marker(meta))
+        marker = position_marker(meta)
+        rec = read_sales_record(self.db, key, marker)
         if rec is None:
             return sales[1] if sales is not None else 0.0
         total = 0.0
+        finished = set(rec.get("done", []))
         for order_id, qty in rec.get("orders", {}).items():
+            if order_id in finished:
+                total += float(qty)
+                continue
             try:
                 status = await self.broker.order_status(order_id)
             except BrokerError:
                 status = None
-            done = status is not None and status.status not in OPEN_ORDER_STATUSES
-            total += status.filled_qty if done else float(qty)
+            if status is not None and status.status not in OPEN_ORDER_STATUSES:
+                # Done: keep what filled, for the app too (it cannot read this order).
+                note_watchdog_sale(
+                    self.db,
+                    key,
+                    marker,
+                    order_id,
+                    status.filled_qty,
+                    self._clock(),
+                    done=True,
+                )
+                total += status.filled_qty
+            else:
+                total += float(qty)
         return total
 
     def _forget_sold(self, key: str) -> None:
@@ -615,14 +666,20 @@ class CryptoWatchdog:
             log.warning("watchdog close %s failed: %s", close.instrument.key, exc)
             result.skipped.append(f"{close.instrument.key}: {exc}")
             return None
-        if placed.broker_order_id and placed.status not in (
-            OrderStatus.REJECTED,
-            OrderStatus.CANCELLED,
-        ):
+        done = placed.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED)
+        if placed.broker_order_id and not done:
             self._sold[close.instrument.key] = (marker, placed.broker_order_id)
             self._flat_seen.pop(close.instrument.key, None)
+        if placed.broker_order_id and (not done or placed.filled_qty > QTY_EPS):
+            # An IOC sell may come back cancelled with part of it filled: that part is sold.
             note_watchdog_sale(
-                self.db, close.instrument.key, marker, placed.broker_order_id, close.qty, now
+                self.db,
+                close.instrument.key,
+                marker,
+                placed.broker_order_id,
+                placed.filled_qty if done else close.qty,
+                now,
+                done=done,
             )
         self.db.audit(
             "watchdog_close",
@@ -631,6 +688,7 @@ class CryptoWatchdog:
                 "kind": close.kind,
                 "tag": tag,
                 "qty": close.qty,
+                "filled": placed.filled_qty,
                 "status": placed.status.value,
                 "marker": marker,  # which bot position (see trader.ownership.watchdog_sales)
             },

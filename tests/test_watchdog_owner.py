@@ -9,7 +9,15 @@ import pytest
 
 from tests.test_watchdog import NOW, Clock, FakeBroker, beat, crypto, make, q
 from trader.db import Database
-from trader.models import Fill, OrderStatus, Position, Side
+from trader.models import (
+    Fill,
+    OrderRecord,
+    OrderRequest,
+    OrderStatus,
+    OrderType,
+    Position,
+    Side,
+)
 from trader.watchdog import WATCHDOG_CLOSED_PREFIX, sold_by_watchdog
 
 BOT = 0.01
@@ -147,3 +155,80 @@ async def test_an_ioc_sale_filled_in_part_is_finished_but_never_into_the_owners(
         broker.orders.clear()
     assert [round(o.qty, 6) for o in broker.placed] == [BOT, 0.006]
     assert broker.positions_list[0].qty == pytest.approx(0.5)
+
+
+class _PartialIOC(FakeBroker):
+    """IBKR's final status reaches place_order first: the IOC sell comes back CANCELLED
+    with part of it filled (map_ib_status keeps CANCELLED when something filled)."""
+
+    def __init__(self, fill_ratio: float) -> None:
+        super().__init__()
+        self.fill_ratio = fill_ratio
+
+    async def place_order(self, req: OrderRequest) -> OrderRecord:
+        self.placed.append(req)
+        filled = round(req.qty * self.fill_ratio, 8)
+        pos = self.positions_list[0]
+        self.positions_list[0] = pos.model_copy(update={"qty": pos.qty - filled})
+        status = OrderStatus.CANCELLED if filled < req.qty - 1e-12 else OrderStatus.FILLED
+        rec = OrderRecord(request=req, status=status, broker_order_id=f"B{len(self.placed)}",
+                          filled_qty=filled)  # fmt: skip
+        self.records[rec.broker_order_id] = rec
+        self.fill_ratio = 1.0  # the next sell fills in full
+        return rec
+
+
+@pytest.mark.parametrize("journal_owner", [True, False])
+async def test_an_ioc_sale_cancelled_with_a_fill_counts_what_filled(
+    db: Database, journal_owner: bool
+) -> None:
+    clock = Clock()
+    broker = _PartialIOC(0.6)
+    setup(db, broker, owner=0.5, journal_owner=journal_owner)
+    beat(db, clock, age=60)
+    watchdog, _ = make(db, broker, clock)
+    await watchdog.tick()
+    await watchdog.tick()
+    assert [o.qty for o in broker.placed] == [pytest.approx(BOT)]
+    for _ in range(4):
+        clock.advance(seconds=30)
+        beat(db, clock, age=60)
+        await watchdog.tick()
+    assert [round(o.qty, 6) for o in broker.placed] == [BOT, 0.004]
+    assert broker.positions_list[0].qty == pytest.approx(0.5)
+
+
+@pytest.mark.parametrize("owner_sold", [0.5, 0.3])
+async def test_the_owner_selling_his_coins_in_the_outage_leaves_the_bots_guarded(
+    db: Database, owner_sold: float
+) -> None:
+    """The owner sells his journaled coins in IBKR Mobile once the app is down: another
+    client's sells come out of the owner's units first, so the bot's 0.01 is still there."""
+    clock = Clock()
+    broker = FakeBroker()
+    setup(db, broker, owner=0.5, journal_owner=True)
+    pos = broker.positions_list[0]
+    broker.positions_list[0] = pos.model_copy(update={"qty": pos.qty - owner_sold})
+    beat(db, clock, age=400)  # long outage: flatten
+    watchdog, _ = make(db, broker, clock)
+    await watchdog.tick()
+    assert [o.qty for o in broker.placed] == [pytest.approx(BOT)]
+
+
+async def test_an_app_exit_never_journaled_keeps_the_owners_coins(db: Database) -> None:
+    """The app's own close of the bot's 0.01 filled as it went down, before the journal saw
+    it: what is left is the owner's 0.5, never sold."""
+    clock = Clock()
+    broker = FakeBroker()
+    setup(db, broker, owner=0.5, journal_owner=True)
+    btc = broker.positions_list[0].instrument
+    req = OrderRequest(instrument=btc, side=Side.SELL, qty=BOT, order_type=OrderType.MARKET,
+                       is_exit=True, reason="stop", trace_id="ai-trader-77")  # fmt: skip
+    at = NOW - timedelta(minutes=5)
+    db.insert_order(OrderRecord(request=req, status=OrderStatus.FILLED, broker_order_id="77",
+                                filled_qty=BOT, created_at=at, updated_at=at))  # fmt: skip
+    broker.positions_list[0] = broker.positions_list[0].model_copy(update={"qty": 0.5})
+    beat(db, clock, age=400)
+    watchdog, _ = make(db, broker, clock)
+    await watchdog.tick()
+    assert broker.placed == []
