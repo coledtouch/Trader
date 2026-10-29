@@ -1812,6 +1812,10 @@ class Engine:
         log.warning("%s: %s -> %s; starting a new journal epoch", reason, _mask(old), _mask(new))
         self._epoch, self._epoch_reason, self._rebase_pending = now, reason, True
         self.db.set_kv("journal_account_since", now.isoformat())
+        # The equity curve restarts with the new account, whatever today's row holds (the
+        # first tick of a new day has no start equity to compare yet).
+        self.db.start_equity_history(now)
+        self._last_equity_at = None
         self._latest_quotes.clear()
         self._cycle_quote_scope.clear()
         self._cycle_quote_scope_at = None
@@ -2756,7 +2760,25 @@ class Engine:
             if any(f.commission <= 0 and now - _aware(f.ts) < COMMISSION_GRACE for f in trip.fills):
                 self._pending_trades.add(key)  # wait briefly for the commission report
                 return
+            if not self._bot_trip(trip, meta):
+                # The owner's own round trip in TWS or IBKR Mobile: account equity has its
+                # P&L, but it is no evidence of the bot and must not move its loss streak.
+                log.info("%s: a round trip the bot did not open; not journaled as its trade", key)
+                assert self._last_exit is not None
+                self._last_exit[key] = _aware(trip.exit_ts)
+                continue
             await self._journal_trade(key, trip, meta)
+
+    def _bot_trip(self, trip: _Trip, meta: dict[str, Any] | None) -> bool:
+        """Whether the bot opened this round trip: a buy is one of its journaled orders, or
+        its position metadata (written before every entry is sent) predates the first buy."""
+        buys = [f for f in trip.fills if f.side == Side.BUY]
+        if not buys:  # a sell matched to the metadata's entry (its fills are not journaled)
+            return meta is not None
+        if any(self.db.get_order_by_broker_id(f.broker_order_id) for f in buys):
+            return True
+        opened = meta.get("opened_at") if meta else None
+        return opened is not None and _aware(opened) <= _aware(buys[0].ts)
 
     async def _journal_trade(
         self, key: str, trip: _Trip, meta: dict[str, Any] | None
@@ -2966,6 +2988,11 @@ class Engine:
         groups: dict[str, list[tuple[SignalRecord, datetime]]] = {}
         for sig in self.db.unevaluated_signals(before=now, limit=500):
             ts = _aware(sig.ts)
+            if self._epoch is not None and ts < self._epoch:
+                # From the simulator or another account: this broker's bars are not the
+                # market it fired in. Closed without an outcome.
+                self.db.update_signal(sig.model_copy(update={"evaluated": True}))
+                continue
             if sig.instrument.asset_class == AssetClass.STOCK:
                 end = market_close_time(trading_day(ts))
             else:

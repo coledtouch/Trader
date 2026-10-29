@@ -772,8 +772,12 @@ def create_app(
         days: int = Query(30, ge=1),
         session: Session = Depends(require_session),
     ) -> Any:
+        db = state(request).db
         since = utcnow() - timedelta(days=min(days, 3650))
-        return _dump(state(request).db.setup_stats(since=since))
+        epoch = db.get_kv("journal_account_since")
+        if epoch:  # signals of the simulator or a previous account are not this evidence
+            since = max(since, datetime.fromisoformat(epoch))
+        return _dump(db.setup_stats(since=since))
 
     # ------------------------------------------------------------ settings
     @app.get("/api/performance")

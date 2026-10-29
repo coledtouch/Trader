@@ -544,6 +544,22 @@ async def test_quote_live_data_type_and_no_data() -> None:
     assert btc.price is None and btc.delayed
 
 
+async def test_a_live_crypto_line_under_a_delayed_feed_setting_is_not_delayed() -> None:
+    """Review finding: market data type 3 (the paper default) marked live crypto quotes
+    delayed, which stretched the age a frozen crypto quote may have from 30 s to 15.5 min,
+    so entries were priced from a line that had stopped ticking."""
+    from trader.risk import quote_block
+
+    broker, fake = await connected_broker(ib_market_data_type=3)
+    fake.ticker_values[crypto().conId] = {"bid": 99.9, "ask": 100.1, "last": 100.0}
+    btc = await broker.quote(BTC)
+    assert not btc.delayed
+    block = quote_block(btc, NOW + timedelta(minutes=10), monitor_seconds=15, max_spread_pct=1)
+    assert block is not None and "no update" in block.reason
+    fake.ticker_values[stock().conId] = {"bid": 99.9, "ask": 100.1, "last": 100.0}
+    assert (await broker.quote(AAPL)).delayed  # stock entries stay blocked on a delayed feed
+
+
 @pytest.mark.parametrize(
     ("halted", "expected"),
     [(math.nan, False), (-1.0, False), (0.0, False), (1.0, True), (2.0, True)],

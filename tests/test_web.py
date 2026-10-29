@@ -608,6 +608,10 @@ def test_signals_endpoints(env):
     assert stats["vwap_reclaim"]["signals"] == 2
     assert stats["vwap_reclaim"]["target_first_pct"] == 100.0
     assert stats["vwap_reclaim"]["enough_data"] is False
+    # Review finding: signals from the simulator or a previous account were in the stats.
+    env.db.set_kv("journal_account_since", (now - timedelta(seconds=30)).isoformat())
+    stats = {s["setup"]: s for s in env.client.get("/api/signals/stats?days=30").json()}
+    assert stats["vwap_reclaim"]["signals"] == 1 and "orb_breakout" not in stats
 
 
 # ---------------------------------------------------------------------- settings

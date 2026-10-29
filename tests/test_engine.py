@@ -2684,6 +2684,51 @@ async def test_signal_ledger_taken_skipped_and_evaluated(db, config) -> None:
     assert not sigs["PFE"].evaluated  # no bars yet: retried later
 
 
+async def test_a_signal_from_before_an_account_change_is_not_scored(db, config) -> None:
+    """Review finding: signals the simulator logged were scored on the next broker's real
+    bars after a switch to paper (+10R on a sim price), and stayed in the setup evidence."""
+    h = await harness(db, config)
+    await h.engine.run_cycle()
+    [sig] = db.list_signals()
+    h.engine._epoch = h.clock() + timedelta(minutes=10)  # the account changed after it
+    h.broker.bar_data["STK:F"] = minute_bars(NOW, [(12.0, 12.6, 11.9, 12.5)] * 40)
+    h.clock.t = datetime(2026, 10, 21, 20, 10, tzinfo=UTC)  # after the close
+    await h.engine.monitor_tick()
+    await h.engine._ledger_done()
+    [sig] = db.list_signals()
+    assert sig.evaluated and sig.first_hit is None and sig.r_close is None
+
+
+async def test_the_owners_own_round_trip_is_not_a_bot_trade(db, config) -> None:
+    """Review finding: a round trip the owner made in TWS (fills from another client) was
+    journaled as a bot trade: it entered expectancy and profit factor, counted as a loss of
+    the day and moved the loss streak that halves the bot's size."""
+    h = await harness(db, config)
+    await h.engine.monitor_tick()
+    t = Instrument(symbol="T")
+    h.broker.fills.append(
+        Fill(exec_id="X1", broker_order_id="perm:1", instrument=t, side=Side.BUY, qty=100,
+             price=20.0, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    h.clock.advance(minutes=5)
+    h.broker.fills.append(
+        Fill(exec_id="X2", broker_order_id="perm:2", instrument=t, side=Side.SELL, qty=100,
+             price=19.0, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    await h.engine.monitor_tick()
+    assert db.list_trades() == []
+    assert h.day().losses == 0 and h.day().loss_streak == 0
+    await enter_f(h)  # the bot's own trade is still journaled
+    h.broker.set_price("F", 10.6)
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    assert [tr.instrument.symbol for tr in db.list_trades()] == ["F"]
+
+
 async def test_signal_ledger_dedupes_repeated_setups(db, config) -> None:
     h = await harness(db, config)
     h.decider.decisions = [hold("F")]

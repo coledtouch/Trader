@@ -204,6 +204,24 @@ def test_patterns_are_judged_on_the_last_complete_bar(make, inst, setup):
     assert setup in setups(scan(with_forming, inst=inst, now=now))
 
 
+def test_a_pullback_or_reversal_broken_since_its_bar_closed_is_no_entry():
+    """Review finding: with patterns judged on the last complete bar, nothing re-checked the
+    live price for trend_pullback and rsi_reversion, so the rules maker bought a pullback
+    already 1 ATR under EMA21 and a reversal already below the turn bar's low."""
+    pullback = trend_pullback_bars()
+    snap = Scanner(BotSettings()).snapshot(CRYPTO, pullback)
+    broken = snap["ema21"] - snap["atr14"]
+    bars, now = _with_forming_bar(pullback)
+    quote = Quote(instrument=CRYPTO, bid=broken - 0.01, ask=broken + 0.01, last=broken, ts=now)
+    assert "trend_pullback" not in setups(scan(bars, inst=CRYPTO, now=now, quote=quote))
+
+    reversal = rsi_reversion_bars()
+    below = reversal[-1].low - 0.3
+    bars, now = _with_forming_bar(reversal)
+    quote = Quote(instrument=CRYPTO, bid=below - 0.01, ask=below + 0.01, last=below, ts=now)
+    assert "rsi_reversion" not in setups(scan(bars, inst=CRYPTO, now=now, quote=quote))
+
+
 # ----------------------------------------------------------------------------- filters
 def test_filters_min_price_volume_bars_spread_and_staleness():
     bars = orb_bars()

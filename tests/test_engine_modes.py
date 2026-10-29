@@ -406,6 +406,24 @@ async def test_account_change_starts_a_new_journal_epoch(db: Database, config: A
     assert h.broker.pos
 
 
+async def test_an_account_change_on_a_new_day_restarts_the_equity_curve(
+    db: Database, config: AppConfig
+) -> None:
+    """Review finding: switching accounts overnight (the first tick of the day has no start
+    equity yet) left the curve joining the old account's balance to the new one."""
+    h = await harness(db, config)
+    for _ in range(3):
+        await h.engine.monitor_tick()
+        h.clock.advance(minutes=5)
+    h.clock.t = datetime(2026, 10, 22, 14, 0, tzinfo=UTC)  # next morning, no day row yet
+    switch_account(h.broker, "DUX123456", cash=50_000.0)
+    await h.engine.monitor_tick()
+    h.clock.advance(minutes=5)
+    await h.engine.monitor_tick()
+    curve = db.list_equity()
+    assert curve and all(p["equity"] == pytest.approx(50_000.0) for p in curve)
+
+
 ACCESS = {"cf_access_team_domain": "team.cloudflareaccess.com", "cf_access_aud": "aud"}
 
 

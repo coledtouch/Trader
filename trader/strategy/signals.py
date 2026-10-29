@@ -393,7 +393,8 @@ class Scanner:
         e21 = f["ema21"]
         last, prev = bars[-1], bars[-2]
         touched = min(last.low, prev.low) <= e21 + 0.25 * atr
-        held = min(last.low, prev.low) >= e21 - 0.5 * atr and last.close > e21
+        # Held at the bar's close and still at the live price (the bar may be minutes old).
+        held = min(last.low, prev.low, price) >= e21 - 0.5 * atr and min(last.close, price) > e21
         if not (
             f["ema9"] > e21
             and ema9[-1] > ema9[-6]
@@ -419,7 +420,13 @@ class Scanner:
         f, atr, price = ctx.features, ctx.atr or 0.0, ctx.price
         oversold = min(v for v in rsi[-3:-1] if v is not None)
         at_band = bars[-1].low <= lower[-1] or bars[-2].low <= lower[-2]
-        if not (oversold < 30 and rsi[-1] > rsi[-2] and at_band and price >= f["ema21"] - 2 * atr):
+        if not (
+            oversold < 30
+            and rsi[-1] > rsi[-2]
+            and at_band
+            and price >= f["ema21"] - 2 * atr
+            and price >= bars[-1].low  # no new low since the turn bar closed
+        ):
             return None
         score = (
             0.35

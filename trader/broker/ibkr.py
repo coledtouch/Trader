@@ -789,10 +789,16 @@ class IBKRBroker(Broker):
         ticker = sub.ticker
         self._check_competing(instrument, ticker)
         ts = ticker.time if isinstance(ticker.time, datetime) else utcnow()
+        # What the line itself delivers. A delayed feed setting (3/4) still marks every stock
+        # quote delayed (stock entries stay blocked on it), but not crypto, which IBKR sends
+        # live under it: there the flag only stretched how old a frozen quote may be.
         delayed = (
-            self._config.ib_market_data_type in (3, 4)
-            or ticker.marketDataType in (3, 4)
+            ticker.marketDataType in (3, 4)
             or key in self._delayed_keys
+            or (
+                self._config.ib_market_data_type in (3, 4)
+                and instrument.asset_class == AssetClass.STOCK
+            )
         )
         return Quote(
             instrument=instrument,

@@ -169,9 +169,11 @@ with reward:risk >= 2 by default:
 - `orb_breakout` - price breaks the opening-range (first 15 min) high on rel volume > 1.5,
   above VWAP, EMA9 > EMA21. (Stocks only.)
 - `vwap_reclaim` - crosses back above VWAP after trading below, rising EMA9.
-- `trend_pullback` - EMA9 > EMA21 rising, pullback to EMA21 with bullish close.
+- `trend_pullback` - EMA9 > EMA21 rising, pullback to EMA21 with bullish close; the live
+  price must still hold EMA21.
 - `rsi_reversion` - RSI14 < 30 turning up, price at/below lower Bollinger band, not in a
-  steep downtrend (price within 2 ATR of EMA21). Smaller score.
+  steep downtrend (price within 2 ATR of EMA21), no new low since the turn bar. Smaller
+  score.
 - `volume_spike` - bar volume >= 3x the average of the previous 20 bars on a bullish bar
   (close > open), close above SMA20 (and SMA50 when available) and above the session open
   (stocks) or 24h open (crypto), positive 20-session/20-day trend when the history allows,
@@ -412,7 +414,8 @@ stocks `Stock(symbol, "SMART", "USD")`, crypto `Crypto(symbol, config.ib_crypto_
 (default "ZEROHASH"; the owner's account routes BTC via ZEROHASH, conid 541686651); qualify
 and cache. Bars via `reqHistoricalDataAsync` (useRTH False for crypto, True for
 stocks... choose sensibly), converted to UTC `Bar`s. Quotes via snapshot/streaming
-tickers with timeout; mark `delayed` when market data type is 3/4 (`data_delayed`), or
+tickers with timeout; mark `delayed` when the line reports market data type 3/4, for
+stocks also when the feed setting is 3/4 (`data_delayed`; crypto comes live under it), or
 per instrument after error 10167; 354 means no data for that instrument (7.5). Stock entries:
 bracket order (parent LMT/MKT, child STP at stop_loss, child LMT at take_profit,
 OCA, transmit flags correct; child TIF GTC so protection survives disconnects and the
@@ -649,7 +652,9 @@ for the open to settle; time stops; size small.
     `order_id`, `decision_id`; otherwise `skip_reason` (e.g. "AI: HOLD", "risk: spread
     0.8% > 0.3%", "LLM budget", "not top candidate"; "<label>: error" only when the maker
     failed or refused, not when it merely dropped an invalid decision; "same symbol traded
-    via X" only when that entry was taken). Evaluate in the monitor loop (or a
+    via X" only when that entry was taken). A signal from before the account epoch
+    (`journal_account_since`: the simulator or a previous account) is closed unscored, and
+    `/api/signals/stats` starts at the epoch. Evaluate in the monitor loop (or a
     slower ledger loop every ~5 min): for signals at least 60 min old (stocks: or after
     the close), fetch bars since the signal and fill `r_15m/r_30m/r_60m/r_close/mfe_r/
     mae_r/first_hit` (stop checked first when both are hit in one bar), then
@@ -1078,7 +1083,11 @@ Those sells are not rows in this process's order journal. `IBKRBroker.fills_sinc
 every execution on the account (another client's order id is stored as `perm:<permId>`),
 and `_sync_fills` / `replay_fills` match them to the bot's buys by instrument. The round
 trip, including P&L, is journaled when the app next syncs. The exit reason is inferred
-from the stop or target when this client has no order row for that perm id.
+from the stop or target when this client has no order row for that perm id. A round trip
+the bot did not open (no buy among its journaled orders and no `positions_meta` from
+before the first buy: the owner's own trading) is not journaled as a bot trade: account
+equity has its P&L, but it stays out of expectancy, profit factor, the day's wins/losses
+and the loss streak that halves the bot's size.
 
 ### 7.9 Economic reporting and paired research (2026-10-23)
 
