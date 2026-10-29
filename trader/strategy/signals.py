@@ -419,10 +419,29 @@ class Scanner:
         """Momentum ignition: a bullish bar on >= 3x the 20-bar average volume, closing above
         SMA20 and SMA50 (when there are 50 bars), with the price above the session open
         (stocks) or the 24h open (crypto) and a positive 20-day trend when the history
-        reaches that far. ATR % must be sane for the bar size. Stocks: not before 09:45."""
+        reaches that far. ATR % must be sane for the bar size. Stocks: not before 09:45.
+
+        Brokers return the newest bar while it is still forming, with only part of its
+        volume, so a spike shows there only once it already has 3x; the last complete bar
+        is checked as well, so a spike that finished between two cycles is found on the
+        next one (as the backtest finds it, on complete bars)."""
+        bars = ctx.bars
+        signal = self._spike_at(ctx, len(bars) - 1)
+        if (
+            signal is None
+            and len(bars) > 1
+            and bars[-1].ts + ctx.interval > now
+            and bars[-2].ts >= ctx.session[0].ts  # never yesterday's closing-auction bar
+        ):
+            signal = self._spike_at(ctx, len(bars) - 2)
+        return signal
+
+    def _spike_at(self, ctx: _Context, i: int) -> _Signal | None:
+        """volume_spike for bar i of ctx.bars (the newest or the last complete one)."""
         f, atr, price = ctx.features, ctx.atr or 0.0, ctx.price
-        last = ctx.bars[-1]
-        multiple, sma20, sma50 = f.get("volume_multiple"), f.get("sma20"), f.get("sma50")
+        last = ctx.bars[i]
+        multiple = self._volume_multiple(ctx.bars[: i + 1])
+        sma20, sma50 = f.get("sma20"), f.get("sma50")
         if multiple is None or multiple < SPIKE_MIN_MULTIPLE or sma20 is None:
             return None
         if ctx.is_stock and last.ts.astimezone(self.tz).time() < SPIKE_EARLIEST:
@@ -457,7 +476,7 @@ class Scanner:
             score,
             price - STOP_ATR["volume_spike"] * atr,
             f"volume {multiple:.1f}x the 20-bar average, above {averages} and the {where}",
-            {"session_open": session_open},
+            {"session_open": session_open, "volume_multiple": multiple},
         )
 
     @staticmethod

@@ -85,6 +85,7 @@ from trader.risk import (
     quote_block,
     sane_exit_price,
 )
+from trader.strategy.common import is_failure
 from trader.strategy.consensus import PREFIX as CONSENSUS_PREFIX
 from trader.strategy.consensus import label as maker_label
 from trader.strategy.decide import DecisionMaker, RuleBasedDecisionMaker
@@ -3159,7 +3160,10 @@ class Engine:
             instrument=cand.instrument,
             side=Side.BUY,
             qty=max(qty, EPS),
-            limit_price=entry,
+            # Sized at the ask (conservative), judged at the candidate's own price: the
+            # entry the rules send and a model's BUY is validated at. At the ask, a last
+            # trade on the bid cut reward:risk below the minimum on low-ATR names.
+            limit_price=cand.price or entry,
             stop_loss=cand.suggested_stop,
             take_profit=cand.suggested_target,
             setup=cand.setup,
@@ -3350,13 +3354,16 @@ class Engine:
         prefix = "LLM budget; " if why and why.startswith("LLM budget") else ""
         threshold = self.settings.llm_min_candidate_score
         bought = any(o.taken for o in outcomes.values())
+        # A batch that only dropped some invalid decisions did not fail: its other
+        # decisions were acted on.
+        failed = (batch.refused or bool(batch.vote_failures)) if batch.votes else is_failure(batch)
         for item in logged:
             cand = item.cand
             key = cand.instrument.key
             outcome = outcomes.get(key)
             if item.blocked is not None:
                 skip: str | None = item.blocked
-            elif outcome is not None and outcome.setup == cand.setup:
+            elif outcome is not None and outcome.setup in (cand.setup, None):
                 if outcome.taken:
                     self._update_signal(
                         item.signal_id,
@@ -3367,15 +3374,17 @@ class Engine:
                     )
                     continue
                 skip = outcome.skip_reason
-            elif outcome is not None:
+            elif outcome is not None and outcome.taken:
                 skip = f"same symbol traded via {outcome.setup}"
             elif key in holds:
                 note = holds[key]
                 # Consensus HOLDs say who stood in the way ("consensus: Grok said HOLD").
                 skip = note if consensus and note.startswith(CONSENSUS_PREFIX) else f"{label}: HOLD"
+            elif outcome is not None:
+                skip = f"same symbol: {outcome.setup} entry not sent ({outcome.skip_reason})"
             elif cand.score < threshold:
                 skip = f"score {cand.score:.2f} < {threshold:.2f}"
-            elif batch.refused or batch.error:
+            elif failed:
                 skip = f"{label}: {'refused' if batch.refused else 'error'}"
             elif not entries_ok:
                 skip = "consensus mode: no entries without both models"

@@ -256,6 +256,39 @@ def test_volume_spike_triggers_for_stocks():
     assert "6.0x" in cand.note
 
 
+def test_volume_spike_is_found_once_its_bar_has_completed():
+    """Review finding: brokers return the newest bar while it forms, with part of its
+    volume. A 6x spike seen two minutes in (40% of its volume, 2.4x) was missed, and on the
+    next cycle it was no longer the newest bar, so it was never seen at all."""
+    bars = spike_bars()
+    spike_bar = bars[-1]
+    partial = spike_bar.model_copy(update={"volume": spike_bar.volume * 0.4})
+    assert spike(scan([*bars[:-1], partial], now=after(bars, 2))) is None  # too early to tell
+    quiet = Bar(
+        ts=spike_bar.ts + timedelta(minutes=5),
+        open=spike_bar.close,
+        high=spike_bar.close + 0.02,
+        low=spike_bar.close - 0.02,
+        close=spike_bar.close,
+        volume=2_000,
+    )
+    cand = spike(scan([*bars, quiet], now=quiet.ts + timedelta(minutes=2)))  # next cycle
+    assert cand is not None
+    assert cand.features["volume_multiple"] == pytest.approx(6.0)
+    assert spike(scan([*bars, quiet], now=quiet.ts + timedelta(minutes=5))) is None  # now old
+
+
+def test_yesterdays_closing_bar_is_no_spike_at_the_open():
+    """Yesterday's 15:55 bar (closing-auction volume) is the last complete bar while
+    today's first bar forms; it must not count as a spike in today's session."""
+    prior = session(PRIOR_DAY, [20.0 + 0.01 * i for i in range(77)] + [20.9], 10_000)
+    prior[-1] = prior[-1].model_copy(update={"volume": 80_000})
+    first = session(TODAY, [21.0], [10_000])
+    now = first[0].ts + timedelta(minutes=2)
+    quote = Quote(instrument=STOCK, bid=21.19, ask=21.21, last=21.2, ts=now)  # above the open
+    assert spike(scan([*prior, *first], now=now, quote=quote)) is None
+
+
 def test_volume_spike_needs_three_times_the_volume():
     assert spike(scan(spike_bars(multiple=2.5))) is None
     assert spike(scan(spike_bars(multiple=3.0))) is not None

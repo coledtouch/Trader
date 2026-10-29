@@ -2376,6 +2376,85 @@ async def test_a_hold_on_one_setup_does_not_block_a_buy_on_another(db, config) -
     assert ledger["vwap_reclaim"][0] is True
 
 
+async def test_a_last_trade_on_the_bid_does_not_block_a_valid_setup(db, config) -> None:
+    """Review finding: the pre-decision filter judged reward:risk at the ask while the
+    candidate's stop and target are anchored on the last trade, so a last print on the bid
+    of a low-ATR $10 stock (2.0R at 10.04, 1.25R at 10.05) hid the setup from every maker,
+    though the order the rules send (LIMIT 10.04) passes."""
+    h = await harness(db, config, llm_enabled=False, risk={"max_order_notional_usd": 5000})
+    h.broker.cash = 50_000.0
+    h.scanner.candidates["STK:F"] = [cand(price=10.04, stop=10.01, target=10.10)]
+    h.broker.quotes["STK:F"] = {"bid": 10.04, "ask": 10.05, "last": 10.04, "halted": False}
+    batch = await h.engine.run_cycle()
+    assert batch is not None and len(batch.candidates) == 1
+    [entry] = [r for r in h.broker.placed if r.side == Side.BUY]
+    assert entry.limit_price == 10.04 and entry.stop_loss == 10.01
+
+
+class _DroppingMaker(FakeDecisionMaker):
+    """Acts on its decisions after dropping one invalid one, as convert_decisions does."""
+
+    def __init__(self, name: str = "claude") -> None:
+        super().__init__(name)
+
+    async def decide(self, ctx: DecisionContext) -> DecisionBatch:
+        batch = await super().decide(ctx)
+        error = "dropped 1 invalid decision(s): CLOSE T (no open position to close)"
+        if self.name != "consensus":
+            return batch.model_copy(update={"error": error})
+        votes = {"claude": list(batch.decisions), "grok": list(batch.decisions)}
+        return batch.model_copy(
+            update={
+                "error": f"Claude: {error}",
+                "votes": votes,
+                "vote_costs": {"claude": 0.0, "grok": 0.0},
+                "vote_failures": {},
+            }
+        )
+
+
+@pytest.mark.parametrize("name", ["claude", "consensus"])
+async def test_a_dropped_decision_is_not_logged_as_an_ai_error(db, config, name) -> None:
+    """Review finding: one invalid decision (a CLOSE of a symbol not held) made the ledger
+    blame "AI: error" for every candidate the model did not mention, though its BUY went
+    out."""
+    h = await harness(db, config)
+    h.scanner.candidates["STK:T"] = [cand("T", score=0.7)]
+    h.broker.set_price("T", 10.0)
+    maker = _DroppingMaker(name)
+    maker.decisions = [buy("F")]
+    h.engine._decider = maker
+    await h.engine.run_cycle()
+    ledger = {s.instrument.symbol: (s.taken, s.skip_reason) for s in db.list_signals()}
+    assert ledger["F"][0] is True
+    assert ledger["T"] == (False, "not top candidate")
+
+
+async def test_a_blocked_buy_does_not_mark_the_symbols_other_setup_as_traded(db, config) -> None:
+    """Review finding: the ledger said "same symbol traded via vwap_reclaim" for F's other
+    setup when that BUY was blocked and nothing was traded, hiding the AI's HOLD."""
+    h = await harness(db, config)
+    h.scanner.candidates["STK:F"] = [
+        cand(setup="vwap_reclaim", score=0.8),
+        cand(setup="orb_breakout", score=0.7),
+    ]
+    h.decider.decisions = [
+        hold("F").model_copy(update={"setup": "orb_breakout"}),
+        buy("F", setup="vwap_reclaim", limit_price=10.3),  # outside the 1% collar
+    ]
+    await h.engine.run_cycle()
+    assert not [r for r in h.broker.placed if r.side == Side.BUY]
+    ledger = {s.setup: s.skip_reason for s in db.list_signals()}
+    assert (ledger["vwap_reclaim"] or "").startswith("risk:")
+    assert ledger["orb_breakout"] == "AI: HOLD"
+    h2 = await harness(Database(":memory:"), config)  # the blocked BUY alone
+    h2.scanner.candidates["STK:F"] = h.scanner.candidates["STK:F"]
+    h2.decider.decisions = [buy("F", setup="vwap_reclaim", limit_price=10.3)]
+    await h2.engine.run_cycle()
+    other = {s.setup: s.skip_reason or "" for s in h2.db.list_signals()}["orb_breakout"]
+    assert other.startswith("same symbol: vwap_reclaim entry not sent (risk:")
+
+
 async def test_a_stock_held_overnight_is_not_worth_an_llm_call_until_the_open(db, config) -> None:
     """Review finding: a bot-opened stock held overnight (crypto on, no flatten) made every
     5-minute crypto-hours cycle call the models with nothing to decide, spending the next

@@ -225,9 +225,10 @@ def _captured_vote(frame: ReplayFrame, name: str) -> tuple[DecisionBatch | None,
     failures = getattr(batch, "vote_failures", {})
     cost = frame.vote_costs.get(name, costs.get(name))
     failure = failures.get(name)
-    if batch.error or batch.refused:
-        if not failures:
-            failure = "original consensus failed; individual failure attribution unavailable"
+    # A capture with per-model bills lists every failed side in vote_failures; its merged
+    # error may only say a side dropped an invalid decision, which is no failure.
+    if (batch.error or batch.refused) and not failures and not (costs or frame.vote_costs):
+        failure = "original consensus failed; individual failure attribution unavailable"
     return DecisionBatch(
         ts=frame.ts,
         maker=name,

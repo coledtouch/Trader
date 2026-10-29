@@ -176,6 +176,8 @@ with reward:risk >= 2 by default:
   (close > open), close above SMA20 (and SMA50 when available) and above the session open
   (stocks) or 24h open (crypto), positive 20-session/20-day trend when the history allows,
   ATR% within 0.3-8% (5-minute bars, scaled for other sizes); stocks only from 09:45 NY.
+  Brokers return the newest bar while it forms (part of its volume), so the last complete
+  bar is checked too: a spike that finished between two cycles is found on the next one.
   Stop 1.5 ATR, target >= 2R.
 Filters: price >= `risk.min_price`, avg volume >= `min_avg_volume` (stocks), enough bars.
 Crypto uses the same setups minus ORB, with a rolling 24h "session" for VWAP.
@@ -334,9 +336,10 @@ loop continues; exponential backoff on broker errors; never crash the app):
   tradable now (stocks closed and crypto disabled). Build universe (settings + optional
   scanner movers), fetch bars + quote per instrument (concurrency-limited, per-symbol
   errors tolerated), run Scanner and journal every emitted candidate (including
-  unaffordable and disabled setups). Size the scanner's proposed ask/stop/target at
+  unaffordable and disabled setups). Size the scanner's proposed stop at the ask with
   `size_fraction=1`, reserving working-buy notional and fees, and run the full risk check
-  on the refreshed account/cache. Pending approvals, settling trades, in-flight metadata
+  on the refreshed account/cache with the candidate's own price as the limit (the entry
+  the rules send and a model BUY is validated at: reward:risk, collar). Pending approvals, settling trades, in-flight metadata
   and unconfirmed halts also exclude entry proposals. Only eligible candidates enter
   `DecisionContext`. Call the LLM only if there is an eligible
   candidate scoring >= `llm_min_candidate_score` or an open position the engine opened
@@ -639,7 +642,9 @@ for the open to settle; time stops; size small.
   - **Signal ledger**: every scanner candidate that passes the scanner's own filters is
     written with `insert_signal` (taken False). When it becomes an order, set `taken=True`,
     `order_id`, `decision_id`; otherwise `skip_reason` (e.g. "AI: HOLD", "risk: spread
-    0.8% > 0.3%", "LLM budget", "not top candidate"). Evaluate in the monitor loop (or a
+    0.8% > 0.3%", "LLM budget", "not top candidate"; "<label>: error" only when the maker
+    failed or refused, not when it merely dropped an invalid decision; "same symbol traded
+    via X" only when that entry was taken). Evaluate in the monitor loop (or a
     slower ledger loop every ~5 min): for signals at least 60 min old (stocks: or after
     the close), fetch bars since the signal and fill `r_15m/r_30m/r_60m/r_close/mfe_r/
     mae_r/first_hit` (stop checked first when both are hit in one bar), then
@@ -1108,6 +1113,9 @@ from the stop or target when this client has no order row for that perm id.
   Each frame's `bars` is empty; scanner-snapshot replay consumes the original candidates
   and features directly and cannot rescan historical bars. The CSV route performs rescans.
   `DecisionBatch.vote_costs` and `vote_failures` preserve available per-model economics.
+  A capture with per-model costs lists every failed side in `vote_failures`; only an
+  older capture without that metadata treats a merged error as both sides failing (a
+  side that merely dropped an invalid decision did not fail).
 - `research.replay_experiment` uses independent in-memory portfolios, the production
   `Engine`, scanner/risk/exits and production consensus logic. It connects to no broker,
   calls no model API and invents no historical votes. Missing required model votes or

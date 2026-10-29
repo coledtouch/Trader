@@ -271,6 +271,27 @@ async def test_captured_consensus_metadata_preserves_exact_bills_and_individual_
     assert report.arms["consensus"].model_cost_usd == pytest.approx(0.03)
 
 
+async def test_a_side_that_only_dropped_a_decision_is_not_replayed_as_failed():
+    """Review finding: a consensus BUY that went out while Claude also wrote one invalid
+    decision was replayed as a failure of both models, so every arm skipped the trade."""
+    batch = DecisionBatch(
+        ts=NOW,
+        maker="consensus",
+        cost_usd=0.03,
+        error="Claude: dropped 1 invalid decision(s): CLOSE T (no open position to close)",
+        votes={"claude": vote().decisions, "grok": vote().decisions},
+        vote_costs={"claude": 0.01, "grok": 0.02},
+        vote_failures={},
+    )
+    report = await replay_experiment(
+        [frame(candidates=[candidate()], batch=batch), frame(1, price=19.9, decision=False)],
+        settings(),
+        slippage_bps=0,
+    )
+    for arm in ("claude", "grok", "consensus"):
+        assert len(report.arms[arm].fills) == 1, arm
+
+
 @pytest.mark.parametrize("cost", [-0.1, float("nan"), float("inf")])
 def test_invalid_model_cost_cannot_become_fictitious_profit(cost):
     with pytest.raises(ValueError, match="costs must be finite and nonnegative"):
