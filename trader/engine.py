@@ -1685,17 +1685,25 @@ class Engine:
                 self._halt_streak = None
                 log.warning("account equity %r is not usable; halts not evaluated", account.equity)
                 self._set_error("monitor:halts", "account equity not available")
-            # Also in shadow mode: these only exit or protect positions the engine opened.
-            await self._step("exits", self._manage_positions(now, positions, quotes, metas))
-            # Only a pass that actually checked stops refreshes the heartbeat. A broker
-            # failure leaves it stale so the crypto watchdog can sell on its own connection.
-            if "monitor:exits" not in self._errors:
-                write_heartbeat(self.db, now)
-            await self._step("flatten", self._flatten_before_close(now, positions, metas))
-            await self._step(
-                "re-protect",
-                self._reprotect(now, positions, open_orders, metas, close_seq, armed),
-            )
+            if self._fills_journaled_at is None:
+                # What filled while the app was down is not journaled yet: a metadata row
+                # may describe a bot position that closed meanwhile, and shares under its
+                # symbol may be the owner's. Broker stops keep protecting the bot's stocks;
+                # the stale heartbeat lets the crypto watchdog act. Re-protect stays armed.
+                self._set_error("monitor:exits", "fills since the (re)connect not journaled yet")
+            else:
+                # Also in shadow mode: these only exit or protect positions the engine opened.
+                await self._step("exits", self._manage_positions(now, positions, quotes, metas))
+                # Only a pass that actually checked stops refreshes the heartbeat. A broker
+                # failure leaves it stale so the crypto watchdog can sell on its own
+                # connection.
+                if "monitor:exits" not in self._errors:
+                    write_heartbeat(self.db, now)
+                await self._step("flatten", self._flatten_before_close(now, positions, metas))
+                await self._step(
+                    "re-protect",
+                    self._reprotect(now, positions, open_orders, metas, close_seq, armed),
+                )
             await self._step("journal", self._sync_journal(now, positions, open_orders))
             # Scoring the ledger requests history (up to 45 s a request): in a task of its
             # own, so stop checks, halts and the heartbeat never wait for it.
@@ -2760,11 +2768,41 @@ class Engine:
         return self._bot_exit.get(key)
 
     def _meta_used(self, key: str, meta: dict[str, Any] | None) -> bool:
-        """The bot's trade for this metadata's position is already journaled (its exit is
-        after the metadata was written): it no longer describes anything held."""
+        """The position this metadata describes is finished and journaled: a bot trade's
+        exit is after the metadata was written and the bot's own entry is not still
+        filling. It then no longer describes anything held."""
         opened = meta.get("opened_at") if meta else None
         exit_ts = self._bot_exit_for(key)
-        return opened is not None and exit_ts is not None and exit_ts >= _aware(opened)
+        if opened is None or exit_ts is None:
+            return False
+        opened = _aware(opened)
+        if exit_ts < opened:
+            return False
+        if exit_ts == opened and not any(
+            tr.instrument.key == key
+            and _aware(tr.exit_ts) == exit_ts
+            and _aware(tr.entry_ts) >= opened
+            for tr in self.db.list_trades(since=exit_ts, limit=1000)
+        ):
+            return False  # the previous trade's exit, re-entered at the same instant
+        return not self._bot_entry_live(key, exit_ts)
+
+    def _bot_entry_live(self, key: str, exit_ts: datetime) -> bool:
+        """The bot's entry for `key` is still working, or one of its own buys filled after
+        the journaled exit (a partly filled entry whose filled part was sold by its
+        bracket): the position is not finished."""
+        if any(
+            o.request.instrument.key == key and o.request.side == Side.BUY and not o.request.is_exit
+            for o in self.db.list_orders(limit=200, statuses=OPEN_ORDER_STATUSES)
+        ):
+            return True
+        return any(
+            f.instrument.key == key
+            and f.side == Side.BUY
+            and _aware(f.ts) > exit_ts
+            and self.db.get_order_by_broker_id(f.broker_order_id) is not None
+            for f in self.db.list_fills(since=exit_ts, limit=FILL_QUERY_LIMIT)
+        )
 
     async def _reconstruct(self, key: str, now: datetime) -> None:
         """Journal every completed round trip for `key` since its last journaled exit."""

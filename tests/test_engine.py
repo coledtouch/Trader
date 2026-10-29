@@ -2829,6 +2829,159 @@ async def test_a_close_of_the_owners_position_does_not_label_the_bots_next_trade
     assert trade.exit_reason == "stop-loss"
 
 
+def _part(b: FakeBroker, oid: str, qty: float, price: float) -> None:
+    """Fill `qty` of order `oid` at `price`: a partial execution, as IBKR reports one."""
+    rec = b.orders[oid]
+    req = rec.request
+    key = req.instrument.key
+    b.fills.append(
+        Fill(exec_id=f"E{next(b._execs)}", broker_order_id=oid, instrument=req.instrument,
+             side=req.side, qty=qty, price=price, commission=b.fee, ts=b.clock())
+    )  # fmt: skip
+    held, avg = b.pos.get(key, [0.0, 0.0])
+    if req.side == Side.BUY:
+        b.pos[key] = [held + qty, (held * avg + qty * price) / (held + qty)]
+        b.cash -= qty * price + b.fee
+    else:
+        b.cash += qty * price - b.fee
+        if held - qty <= 1e-9:
+            del b.pos[key]
+        else:
+            b.pos[key] = [held - qty, avg]
+    rec.filled_qty += qty
+    rec.avg_fill_price = price
+    rec.commission += b.fee
+    done = rec.filled_qty >= req.qty - 1e-9
+    rec.status = OrderStatus.FILLED if done else OrderStatus.PARTIALLY_FILLED
+
+
+async def _resting_entry(h: H) -> tuple[str, float]:
+    """The bot's F entry, resting unfilled; its broker id and quantity."""
+    match = h.broker._match
+    h.broker._match = lambda key: None
+    await h.engine.run_cycle()
+    h.broker._match = match
+    h.decider.decisions = []
+    [entry] = [oid for oid, k in h.broker.kind.items() if k == "entry"]
+    return entry, h.broker.orders[entry].request.qty
+
+
+async def test_a_partly_filled_entry_keeps_managing_the_rest_after_its_first_part_exits(
+    db, config
+) -> None:
+    """Review finding (regression): 7 shares of a 24-share entry filled and its bracket
+    target sold them; the bot's trade was journaled, so its metadata counted as used. When
+    the rest of the entry filled, the bot cancelled its own stop and target, deleted the
+    metadata and never managed those shares again (no stop, no flatten)."""
+    h = await harness(db, config)
+    b = h.broker
+    entry, total = await _resting_entry(h)
+    _part(b, entry, 7, 10.01)
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    h.clock.advance(minutes=3)
+    _part(b, f"{entry}-TP", 7, 10.5)
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    assert len(db.list_trades()) == 1
+    h.clock.advance(minutes=20)
+    _part(b, entry, total - 7, 10.01)
+    for _ in range(3):
+        h.clock.advance(minutes=1)
+        await h.engine.monitor_tick()
+    assert db.get_position_meta("STK:F") is not None
+    assert b.orders[f"{entry}-SL"].status in OPEN_ORDER_STATUSES
+    b.set_price("F", 9.0)  # through the stop
+    for _ in range(3):
+        h.clock.advance(minutes=1)
+        await h.engine.monitor_tick()
+    assert "STK:F" not in b.pos
+
+
+async def test_an_owner_round_trip_while_the_bots_entry_rests_keeps_its_metadata(
+    db, config
+) -> None:
+    """Review finding (regression): the owner's quick round trip in F while the bot's limit
+    entry rested counted as the bot's trade, so the metadata was used up before the bot's
+    entry filled, and the bot's whole position went unmanaged."""
+    f = Instrument(symbol="F")
+    h = await harness(db, config)
+    b = h.broker
+    entry, _ = await _resting_entry(h)
+    limit = b.orders[entry].request.limit_price
+    h.clock.advance(minutes=1)
+    b.fills.append(
+        Fill(exec_id="X1", broker_order_id="perm:1", instrument=f, side=Side.BUY, qty=10,
+             price=10.05, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    h.clock.advance(minutes=1)
+    b.fills.append(
+        Fill(exec_id="X2", broker_order_id="perm:2", instrument=f, side=Side.SELL, qty=10,
+             price=10.10, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    b.set_price("F", limit - 0.01)  # the bot's entry fills
+    for _ in range(3):
+        h.clock.advance(minutes=1)
+        await h.engine.monitor_tick()
+    assert db.get_position_meta("STK:F") is not None
+    assert b.orders[f"{entry}-SL"].status in OPEN_ORDER_STATUSES
+
+
+async def test_a_reentry_at_the_instant_of_the_exit_keeps_its_metadata(db, config) -> None:
+    """Review finding (regression): a stop filled and the same cycle bought F again at the
+    same clock time (research replay does so every time); the new position's metadata was
+    judged used by the old trade, so its bracket was cancelled and it was never exited."""
+    h = await harness(db, config)
+    b = h.broker
+    await h.engine.run_cycle()
+    h.clock.advance(minutes=5)
+    b.set_price("F", 9.75)  # the bracket stop fills
+    b.set_price("F", 10.0)
+    await h.engine.run_cycle()  # same instant: journals the exit, then buys F again
+    assert len(db.list_trades()) == 1 and "STK:F" in b.pos
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    assert db.get_position_meta("STK:F") is not None
+    assert b.working("STK:F", "stop")
+
+
+async def test_no_position_is_managed_before_the_fills_of_a_new_connection_are_journaled(
+    db, config
+) -> None:
+    """Review finding: when the first journal read after a restart failed, the tick still
+    managed positions from metadata of a bot position that had closed while the app was
+    down, and re-placed a stop that sold the owner's shares bought since."""
+    f = Instrument(symbol="F")
+    h = await harness(db, config)
+    await enter_f(h)
+    h.decider.decisions = []
+    h.clock.advance(minutes=5)
+    h.broker.set_price("F", 9.7)  # the bracket stop fills while the app is down
+    h.clock.advance(minutes=20)
+    h.broker.fills.append(
+        Fill(exec_id="X1", broker_order_id="perm:1", instrument=f, side=Side.BUY, qty=50,
+             price=9.7, commission=1.0, ts=h.clock())
+    )  # fmt: skip
+    h.broker.pos["STK:F"] = [50.0, 9.7]
+    h.broker.cash -= 485.0
+    h.broker._connected = False
+    h.broker.fail.add("fills_since")  # the executions request times out after the restart
+    for _ in range(3):
+        h.clock.advance(minutes=1)
+        await h.engine.monitor_tick()
+        assert h.broker.pos["STK:F"][0] == 50.0
+    assert "monitor:exits" in h.engine._errors  # the heartbeat stays stale meanwhile
+    h.broker.fail.discard("fills_since")
+    for _ in range(2):
+        h.clock.advance(minutes=1)
+        await h.engine.monitor_tick()
+    assert h.broker.pos["STK:F"][0] == 50.0
+    assert db.get_position_meta("STK:F") is None
+    assert "monitor:exits" not in h.engine._errors
+
+
 async def test_signal_ledger_dedupes_repeated_setups(db, config) -> None:
     h = await harness(db, config)
     h.decider.decisions = [hold("F")]

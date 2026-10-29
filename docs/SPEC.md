@@ -1095,11 +1095,15 @@ the bot did not open (no buy among its journaled orders and no `positions_meta` 
 before the first buy: the owner's own trading) is not journaled as a bot trade: account
 equity has its P&L, but it stays out of expectancy, profit factor, the day's wins/losses
 and the loss streak that halves the bot's size. Once the bot's trade for a `positions_meta`
-row is journaled (its exit after the row was written), the row no longer describes
-anything held: later trips are judged without it, and the row is deleted even while shares
-are held under the symbol (the owner's buy since), which the engine then never manages.
-The first monitor tick of a connection journals the fills from while the app was down
-before it manages positions, so it never acts on such a row.
+row is journaled (its exit after the row was written, or at the same instant by a trade
+that began then) and the bot's own entry is finished (no app BUY for the symbol working,
+none of its buys filled after that exit: a partly filled entry whose first part was sold
+keeps its row), the row no longer describes anything held: later trips are judged
+without it, and the row is deleted even while shares are held under the symbol (the
+owner's buy since), which the engine then never manages. The first monitor tick of a
+connection journals the fills from while the app was down before it manages positions;
+until a journal read of the connection has succeeded, no exits, flatten or re-protect run
+(broker stops still protect stocks; the stale heartbeat lets the crypto watchdog act).
 
 ### 7.9 Economic reporting and paired research (2026-10-23)
 
