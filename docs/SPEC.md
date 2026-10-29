@@ -932,7 +932,9 @@ Contracts changed by the confirmed review findings (each has a regression test).
   that has had no usable quote for `UNCHECKED_STOP_GRACE` (10 min) counts as a failed
   exits check, so the heartbeat stays stale and the crypto watchdog's stale-heartbeat rules
   apply. A shorter gap (the owner's IBKR Mobile taking the data, error 10197) keeps the
-  heartbeat: the watchdog shares the gateway and could only flatten blind.
+  heartbeat: the watchdog shares the gateway and could only flatten blind. A tick without
+  a quote keeps a pending stop breach (the next good tick confirms it), and a quote older
+  than the entry freshness bound (a line frozen by a data farm break) counts as none.
 - **Entry levels** (ENG-9): an entry is blocked when its stop is at or above the current
   bid (the price fell through it since the decision, or while it waited for approval).
   An entry the broker accepted whose bracket stop it refused alerts "Unprotected X" and
@@ -1105,15 +1107,17 @@ equity has its P&L, but it stays out of expectancy, profit factor, the day's win
 and the loss streak that halves the bot's size. Once the bot's trade for a `positions_meta`
 row is journaled (its exit after the row was written, or at the same instant by a trade
 that began then) and the bot's own entry is finished (no app BUY for the symbol working in
-the broker's open orders of the latest tick, none of its buys filled after that exit: a
-partly filled entry whose first part was sold keeps its row), the row no longer describes anything held: later trips are judged
+the broker's open orders of the latest tick, kept until that tick's fills are journaled,
+none of its buys filled after that exit: a partly filled entry whose first part was sold
+keeps its row), the row no longer describes anything held: later trips are judged
 without it, and the row is deleted even while shares are held under the symbol (the
 owner's buy since), which the engine then never manages. The first monitor tick of a
 connection journals the fills from while the app was down before it manages positions;
 until a journal read of the connection has succeeded, no exits, flatten, re-protect or
 decision cycle run (broker stops still protect stocks; the stale heartbeat lets the crypto
 watchdog act). An AI CLOSE is refused for a symbol whose row is used or sold by the
-watchdog, as for one without a row.
+watchdog, as for one without a row, and an approved CLOSE is cancelled for the same reason
+(the bot's position closed while the approval waited).
 
 ### 7.9 Economic reporting and paired research (2026-10-23)
 

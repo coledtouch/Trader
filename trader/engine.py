@@ -79,6 +79,7 @@ from trader.models import (
 )
 from trader.notify import Notifier
 from trader.risk import (
+    DELAYED_QUOTE_GRACE,
     HALT_DAILY_LOSS,
     STALE_QUOTE_INTERVALS,
     RiskManager,
@@ -1289,6 +1290,22 @@ class Engine:
             self._pending(order_id)
             if order.is_exit:
                 key = order.instrument.key
+                if self._fills_journaled_at is None:  # the order stays pending
+                    raise BrokerError("fills since the reconnect not journaled yet: try again")
+                meta = self.db.get_position_meta(key)
+                if (
+                    meta is None
+                    or sold_by_watchdog(self.db, key, meta)
+                    or self._meta_used(key, meta)
+                ):
+                    # The bot's position closed while the approval waited: what is held
+                    # under the symbol now is not the bot's (the owner's buy since).
+                    self.db.update_order(
+                        order_id,
+                        status=OrderStatus.CANCELLED,
+                        message="cancelled: the bot's position already closed",
+                    )
+                    return self._get_order(order_id)
                 # The monitor's exits do not take the entry lock: check and stamp with no
                 # await in between, before the broker call (as Close and the AI close do).
                 if self._close_in_flight(key, self._now()):
@@ -1622,7 +1639,13 @@ class Engine:
             raw_positions = await self.broker.positions()
             open_orders = await self.broker.open_orders()
             # Which app entries are working, from the broker (journal rows may be stale here).
-            self._entry_buys = self._working_buys(open_orders)
+            fresh = self._working_buys(open_orders)
+            if self._fills_journaled_at is None or self._entry_buys is None:
+                self._entry_buys = fresh  # first tick of a connection: fills journaled below
+            else:
+                # An entry that finished filling since the last read has its fills journaled
+                # only later this tick: it counts as working until they are.
+                self._entry_buys = fresh | self._entry_buys
             if self._fills_journaled_at is None:
                 # First tick on this connection: journal what filled while the app was down
                 # before managing anything, so a bot position that closed meanwhile is not
@@ -2275,13 +2298,23 @@ class Engine:
         for pos in positions:
             key = pos.instrument.key
             meta = metas.get(key)
-            mark = sane_exit_price(quotes.get(key))  # None: no quote, or an implausible one
+            quote = quotes.get(key)
+            mark = sane_exit_price(quote)  # None: no quote, or an implausible one
             if pos.qty <= 0 or meta is None or self._closing_now(key, now):
                 continue
             if pos.instrument.asset_class == AssetClass.STOCK and not stocks_open:
                 continue  # stock orders cannot execute now; broker stops still protect
+            engine_only = not self.broker.supports_native_stops(pos.instrument)
+            if mark is not None and quote is not None and engine_only:
+                max_age = timedelta(seconds=STALE_QUOTE_INTERVALS * self.settings.monitor_seconds)
+                if quote.delayed:
+                    max_age += DELAYED_QUOTE_GRACE
+                if _aware(now) - _aware(quote.ts) > max_age:
+                    mark = None  # a line that stopped ticking (data farm break) checks nothing
             if mark is None:
-                if not self.broker.supports_native_stops(pos.instrument):
+                if engine_only:
+                    if key in self._breaches:
+                        breached.add(key)  # a missing quote is no recovery: keep the breach
                     # Nothing else enforces this position's stop (crypto). A short gap (the
                     # owner's IBKR Mobile taking the data, 10197) keeps the heartbeat: the
                     # watchdog shares the gateway and could only flatten blind. A lasting
@@ -2597,6 +2630,7 @@ class Engine:
         await self._sync_orders(now)
         await self._cancel_stale_entries(now)  # cancelling only reduces risk (shadow too)
         await self._sync_fills(now)
+        self._entry_buys = self._working_buys(open_orders)  # the journal caught up
         await self._cleanup_meta(now, positions, open_orders)
 
     async def _sync_orders(self, now: datetime) -> None:

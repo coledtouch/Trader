@@ -3052,6 +3052,96 @@ async def test_no_decision_is_made_before_the_fills_of_a_new_connection_are_jour
     assert h.broker.pos["STK:F"][0] == 50.0
 
 
+async def test_an_approved_close_after_the_bots_position_closed_sells_nothing(db, config) -> None:
+    """Review finding: an AI CLOSE waited for approval; meanwhile the bot's stop filled and
+    the owner bought F. Approving the still-listed card market-sold the owner's shares."""
+    h = await harness(db, config)
+    await enter_f(h)
+    h.engine.settings.autopilot = False
+    h.decider.decisions = [
+        AIDecision(action=TradeAction.CLOSE, symbol="F", asset_class=AssetClass.STOCK,
+                   conviction=0.9, rationale="breaking down")
+    ]  # fmt: skip
+    h.clock.advance(minutes=5)
+    await h.engine.run_cycle()
+    [pending] = h.orders(OrderStatus.PENDING_APPROVAL)
+    h.decider.decisions = []
+    h.broker.set_price("F", 9.7)  # the bot's bracket stop fills
+    for _ in range(3):
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    _owner_buys(h, "F", 50, 9.7)
+    h.clock.advance(minutes=1)
+    rec = await h.engine.approve_order(pending.id)
+    assert rec.status == OrderStatus.CANCELLED and "already closed" in (rec.message or "")
+    assert h.broker.pos["STK:F"][0] == 50.0
+
+
+async def test_the_rest_of_a_partly_filled_entry_is_managed_on_the_tick_it_fills(
+    db, config
+) -> None:
+    """Review finding (regression): the broker's open orders were read before the tick
+    journaled the fills, so the tick on which the rest of a partly filled entry finished
+    filling treated the bot's metadata as used: no exits or flatten for those shares then."""
+    h = await harness(db, config)
+    b = h.broker
+    entry, total = await _resting_entry(h)
+    _part(b, entry, 7, 10.01)
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    h.clock.advance(minutes=3)
+    _part(b, f"{entry}-TP", 7, 10.5)
+    h.clock.advance(minutes=1)
+    await h.engine.monitor_tick()
+    _part(b, entry, total - 7, 10.01)  # the rest fills between two ticks
+    h.clock.advance(seconds=15)
+    await h.engine.monitor_tick()
+    [pos] = [p for p in h.engine._positions if p.instrument.key == "STK:F"]
+    assert pos.stop_loss is not None and pos.setup is not None  # managed as the bot's
+
+
+async def test_a_crypto_stop_hit_between_quote_gaps_is_still_executed(db, config) -> None:
+    """Review finding: with the quote coming and going (the owner opening IBKR Mobile again
+    and again in a sell-off), each tick without a quote dropped the pending breach and each
+    good tick restarted the grace, so a stop already hit was never executed."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 15, 0, tzinfo=UTC))
+    quote = h.broker.quote
+    flicker = {"n": 0}
+
+    async def every_other(inst):
+        flicker["n"] += 1
+        if inst.key == "CRYPTO:BTC" and flicker["n"] % 2 == 0:
+            raise BrokerError("no market data for BTC (error 10197)")
+        return await quote(inst)
+
+    h.broker.quote = every_other
+    h.broker.set_price("BTC", 58000.0, asset_class=AssetClass.CRYPTO, spread=10.0)  # stop 59000
+    for _ in range(12):
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    assert "CRYPTO:BTC" not in h.broker.pos
+
+
+async def test_a_frozen_crypto_quote_does_not_count_as_checking_the_stop(db, config) -> None:
+    """Review finding: a data farm break left the BTC line holding its last bid; the stop
+    was "checked" against that frozen price for as long as it lasted, the heartbeat stayed
+    fresh, and the watchdog never took over."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 15, 0, tzinfo=UTC))
+    quote = h.broker.quote
+    frozen = await quote(_BTC)
+
+    async def stuck(inst):
+        return frozen if inst.key == "CRYPTO:BTC" else await quote(inst)
+
+    h.broker.quote = stuck
+    h.broker.set_price("BTC", 50000.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    for _ in range(48):  # twelve minutes
+        h.clock.advance(seconds=15)
+        await h.engine.monitor_tick()
+    assert read_heartbeat(db) < h.clock() - timedelta(minutes=1)  # stale: the watchdog acts
+    assert "no usable quote" in h.engine._errors["monitor:exits"][1]
+
+
 _BTC = Instrument(symbol="BTC", asset_class=AssetClass.CRYPTO)
 
 
