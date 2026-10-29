@@ -22,6 +22,7 @@ crashing, and it does not survive the gateway being down.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import logging
 import signal
 from collections.abc import Awaitable, Callable, Iterable
@@ -51,6 +52,7 @@ from trader.notify import Notifier
 from trader.ownership import (
     FILL_TIME_SKEW,
     WATCHDOG_TAG_PREFIX,
+    app_entry_unjournaled,
     app_sold_unjournaled,
     bought_since,
     entry_qty,
@@ -73,6 +75,7 @@ log = logging.getLogger(__name__)
 
 HEARTBEAT_KEY = "engine_heartbeat"
 KILL_REASON = "kill switch"
+UNKNOWN_PART_TITLE = "Crypto watchdog: the bot's part unknown"
 TAG_PREFIX = WATCHDOG_TAG_PREFIX
 APP_TAG_PREFIX = "ai-trader-"  # every order the app or this watchdog sends (order_trace_id)
 # kv: a bot position this watchdog sold flat (value: position_marker of its meta). The app
@@ -316,6 +319,9 @@ class CryptoWatchdog:
         started = started_at if started_at is not None else clock()
         self._started_at = started if started.tzinfo else started.replace(tzinfo=UTC)
         self._below_stop: dict[str, int] = {}
+        # This poll: bot positions where part of the bot's entry may have filled unseen
+        # while the owner sold some of his (whose coins are left is unknown).
+        self._unsure: set[str] = set()
         self._attempt_at: dict[str, datetime] = {}
         # Bot positions this process sold (key -> position_marker and the broker id of its
         # last accepted sell), until seen flat; and how many polls in a row saw them flat.
@@ -382,10 +388,16 @@ class CryptoWatchdog:
             self._below_stop.clear()
 
         closes: list[Close] = []
+        unknown: list[str] = []  # symbols to sell whose bot part is unknown
+        self._unsure.clear()
         for pos in managed:
             key = pos.instrument.key
-            own = await self._own_qty(key, metas[key], pos.qty)
+            own = await self._own_qty(key, metas[key], pos.qty, open_orders)
             if own is not None and own <= QTY_EPS:
+                if key in self._unsure:
+                    kind, _ = self._why(pos, metas[key], marks.get(key), unhealthy, flatten, killed)
+                    if kind is not None:
+                        unknown.append(pos.instrument.symbol)
                 result.skipped.append(f"{key}: nothing held is the bot's (the owner's coins)")
                 continue
             mine = pos.qty if own is None else min(pos.qty, own)
@@ -397,6 +409,8 @@ class CryptoWatchdog:
             kind, reason = self._why(pos, metas[key], marks.get(key), unhealthy, flatten, killed)
             if kind is None:
                 continue
+            if key in self._unsure:
+                unknown.append(pos.instrument.symbol)
             if self._in_retry_window(key, now):
                 result.skipped.append(f"{key}: close already sent, waiting to retry")
                 continue
@@ -418,7 +432,16 @@ class CryptoWatchdog:
                 result.skipped.append(f"not sending: {why}")
         finally:
             await self._alert(
-                age, unhealthy, flatten, killed, closes, bool(managed), allowed, why, result
+                age,
+                unhealthy,
+                flatten,
+                killed,
+                closes,
+                bool(managed),
+                allowed,
+                why,
+                result,
+                unknown=unknown,
             )
         return result
 
@@ -459,13 +482,17 @@ class CryptoWatchdog:
             self._forget_sold(key)
             log.info("%s: sold flat by the watchdog; a later buy is not the bot's", key)
 
-    async def _own_qty(self, key: str, meta: dict[str, Any], held: float) -> float | None:
+    async def _own_qty(
+        self, key: str, meta: dict[str, Any], held: float, open_orders: list[OrderRecord]
+    ) -> float | None:
         """Most this process may still sell of a bot position, or None (all of it, as
         before). With the owner's coins next to the bot's: the bot's part from the journal
         the app kept until it stopped (another client's sells after this process's first
-        sale are left out: they may be its own), less what this process sent to sell of
-        it, and never into the owner's journaled coins while an exit of the app's may have
-        sold the bot's unseen."""
+        sale are left out: they may be its own), plus what the broker reports its entry
+        filled since, less what this process sent to sell of it, and never into the
+        owner's journaled coins while an exit of the app's may have sold the bot's unseen.
+        Part of the entry whose fill is unknown, with less held than both sides' units,
+        marks the key unsure (the owner is told)."""
         opened = meta.get("opened_at")
         if not isinstance(opened, datetime):
             return None
@@ -496,7 +523,16 @@ class CryptoWatchdog:
             # What the journal shows of this process's sales (the app's estimate of an
             # earlier day's) is out of the split already.
             sent = unreported_sales(sent, fills, cut)
+        # The broker's word on the bot's entry beyond the journal (it filled while the app
+        # was down): the bot's, even when the owner sold some of his meanwhile (less held
+        # than both sides' journaled units would otherwise hide it).
+        late, unknown = app_entry_unjournaled(self.db, key, opened, fills, open_orders)
+        late = min(split.unseen, late)
+        if late > QTY_EPS:
+            split = dataclasses.replace(split, bot=split.bot + late, unseen=split.unseen - late)
         split = less_sold(split, sent)
+        if min(unknown, split.unseen) > QTY_EPS and held < split.bot + split.owner - QTY_EPS:
+            self._unsure.add(key)  # its entry may have filled unseen: whose coins is unknown
         cap = sell_cap(held, limit, split, evidence=True)
         if cap is None:
             return None
@@ -708,9 +744,23 @@ class CryptoWatchdog:
         allowed: bool,
         why: str,
         result: TickResult,
+        *,
+        unknown: Iterable[str] = (),
     ) -> None:
         wanted: list[tuple[str, str, str]] = []
         symbols = ", ".join(close.instrument.symbol for close in closes) or "none"
+        unsure = ", ".join(dict.fromkeys(unknown))
+        if unsure:
+            wanted.append(
+                (
+                    UNKNOWN_PART_TITLE,
+                    f"{unsure}: the bot's entry may have filled while the app was down, and "
+                    "less is held than the bot's and your journaled coins (you sold some). "
+                    "Whose coins are left is unknown: the watchdog sells only what is surely "
+                    "the bot's. Check the position in IBKR.",
+                    "urgent",
+                )
+            )
         if killed and closes:
             wanted.append(
                 (

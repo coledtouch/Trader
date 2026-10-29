@@ -1162,7 +1162,11 @@ fills are the journal and the broker's executions (the journal alone is a tick b
 sale and an equal owner buy since then would net out); when the executions read fails and
 the journal does not explain the position, nothing is sold until it can (undecided, not
 "none of it is the bot's": re-protect looks again next tick, Close reports a broker error to
-retry, an approval stays pending, the shadow-mode halt flatten reports a failed flatten).
+retry, an approval stays pending, the shadow-mode halt flatten reports a failed flatten,
+and an engine exit (stop, backup stop, target, time stop, flatten before the close) sells
+nothing and alerts once a stretch, "Close X FAILED": a stock keeps its broker stop and is
+tried after CLOSE_RETRY; crypto is tried every tick and the failed check lets the heartbeat
+go stale, so the watchdog takes over).
 A stop re-placed next to a bracket target still working (IBKR refused the bracket's stop)
 would sit outside the target's OCA group: the target is cancelled first, the stop goes in
 once it is gone, and the engine's own exit rules take the profit. Sales of the crypto
@@ -1181,8 +1185,13 @@ known units together gets one alert ("shares of unknown owner": urgent for crypt
 
 The crypto watchdog, with the app down, sells at most the bot's part from the journal the
 app kept (another client's sells after its own first sale are left out: they may be its
-own; a sale the app already journaled at an estimate is not taken off twice), less what it
-already sold of the position. More held than the bot can still hold once its known (done)
+own; a sale the app already journaled at an estimate is not taken off twice), plus what
+IBKR says the bot's entry filled beyond the journal (an entry still working there, by its
+tag; or what the app saw filled of one it saw done), less what it already sold of the
+position. Part of the entry the app last saw working that IBKR no longer lists (it filled,
+lapsed or was cancelled while the app was down), with less held than the bot's and the
+owner's units, is unknown: the watchdog sells only what is surely the bot's and alerts
+(urgent, "the bot's part unknown"). More held than the bot can still hold once its known (done)
 sales are off is the owner buying since: then it sells only the bot's part too. It never
 sells into the owner's journaled units when an exit of the app's may have sold the bot's
 unseen (`ownership.app_sold_unjournaled`, over every app sell since the bot's entry: one
@@ -1218,7 +1227,9 @@ earlier day IBKR no longer reports (the owner's units next to the bot's) is jour
 estimate of what the watchdog saw filled (done orders only, never an order of unknown fill;
 the stop, `unreported-exit`, dated at the latest sale it covers, so a later outage's sale
 gets its own; with an alert), so the bot's trade closes
-and its metadata is released; without the owner's units, everything held is the bot's,
+and its metadata is released; a flat sale of the watchdog's (`WATCHDOG_CLOSED`) is
+estimated from the bot's own lot since its entry, never an owner lot the journal still
+shows open; without the owner's units, everything held is the bot's,
 still unsold, and only the flat-position path (`_close_unreported_exit`) estimates. A
 watchdog sale IBKR does report closes it from the executions. The first fills sync after
 a start rebuilds the journal of every position with metadata, so a bot trip still waiting

@@ -84,6 +84,7 @@ from trader.ownership import (
     UNREPORTED_EXIT,
     WATCHDOG_SALES_PREFIX,
     Cap,
+    Split,
     app_sold_unjournaled,
     bought_since,
     entry_qty,
@@ -2448,6 +2449,19 @@ class Engine:
         owner's shares next to the bot's, only the bot's own are sold."""
         seq = self._mark_closing(inst.key, reason, now)
         cap = await self._bot_cap(inst)
+        if cap is not None and cap.unread:
+            # Undecided, not "none of it is the bot's": nothing is sold until the
+            # executions are read, and the owner is told. Crypto (no stop at the broker)
+            # is tried again next tick, and the failure lets the heartbeat go stale so the
+            # watchdog takes over; a stock keeps its broker stop, tried after CLOSE_RETRY.
+            if self.broker.supports_native_stops(inst):
+                self._note_close(inst.key, None, seq)
+            else:
+                self._unmark_closing(inst.key, seq)
+            await self._note_undecided_exit(inst, reason, now)
+            raise _ExitUndecided(
+                f"{reason}: the broker's executions could not be read; nothing sold yet"
+            )
         if cap is not None and cap.qty <= EPS:
             # Nothing of it is the bot's (it sold its part, the rest is the owner's):
             # like a close that found nothing to sell; looked at again after CLOSE_RETRY.
@@ -2485,6 +2499,24 @@ class Engine:
             + "The bot retries; check IBKR.",
             priority="high" if restored else "urgent",
             tags=["warning"] if restored else ["rotating_light"],
+            on_result=lambda sent: self._close_alert_result(inst.key, now, sent),
+        )
+
+    async def _note_undecided_exit(self, inst: Instrument, reason: str, now: datetime) -> None:
+        """An exit the bot could not size (the executions not read): one alert a stretch."""
+        last = self._close_failed_at.get(inst.key)
+        if last is not None and now - last < CLOSE_FAILED_ALERT_EVERY:
+            return
+        crypto = not self.broker.supports_native_stops(inst)
+        self._close_failed_at[inst.key] = now  # cleared if not delivered: the next retry alerts
+        await self._notify(
+            f"Close {inst.symbol} FAILED",
+            f"{reason}: the broker's executions could not be read, so the bot cannot tell "
+            f"its {inst.symbol} from yours and sold nothing. "
+            + ("The crypto watchdog takes over. " if crypto else "")
+            + "The bot retries; check IBKR.",
+            priority="urgent" if crypto else "high",
+            tags=["rotating_light"] if crypto else ["warning"],
             on_result=lambda sent: self._close_alert_result(inst.key, now, sent),
         )
 
@@ -2659,6 +2691,9 @@ class Engine:
                     breached,
                     broker_target=key in targets,
                 )
+            except _ExitUndecided as exc:
+                if engine_only:  # nothing else enforces its stop: the watchdog takes over
+                    failures.append(f"{key}: {exc}")
             except BrokerError as exc:
                 failures.append(f"{key}: {exc}")
         # A breach must be seen on consecutive ticks; anything not seen this tick restarts.
@@ -2749,8 +2784,8 @@ class Engine:
             if not self._confirmed(key, kind, breached if breached is not None else set(), now):
                 log.info("%s: %s; confirming on the next tick", key, reason)
                 return
-            self._breaches.pop(key, None)
             await self._engine_close(pos.instrument, reason, now)
+            self._breaches.pop(key, None)  # undecided (raised): the breach stands
             return
 
         new_stop: float | None = None
@@ -3208,6 +3243,25 @@ class Engine:
             for f in self.db.list_fills(since=exit_ts, limit=FILL_QUERY_LIMIT)
         )
 
+    def _bot_split(self, key: str, meta: dict[str, Any] | None, fills: list[Fill]) -> Split:
+        """split_fills of a window of `key`'s fills for the bot position `meta` (None: no
+        position): its entry's quantity and send time, and the crypto watchdog's sales of
+        it bounding the window in which another client's sells come out of the bot's."""
+        if meta is None:
+            return split_fills(fills)
+        opened = meta.get("opened_at")
+        marker = position_marker(meta)
+        sales = watchdog_sales(self.db, key, marker, opened)
+        end = watchdog_sales_end(self.db, key, marker)
+        return split_fills(
+            fills,
+            bot_first_from=sales[0] - FILL_TIME_SKEW if sales is not None else None,
+            bot_first_qty=sales[1] if sales is not None else None,
+            bot_first_until=end + FILL_TIME_SKEW if end is not None else None,
+            entry=entry_qty(self._extra(key), meta),
+            entry_sent=opened,
+        )
+
     async def _reconstruct(self, key: str, now: datetime) -> None:
         """Journal every completed round trip of the bot for `key` since its last journaled
         exit. Only the bot's own lots make its trips (trader/ownership.split_fills): shares
@@ -3246,22 +3300,7 @@ class Engine:
         fallback = None
         if meta and meta.get("entry_price"):
             fallback = (float(meta["entry_price"]), meta.get("opened_at") or now)
-        bot_first = entry = budget = until = None
-        if meta is not None:
-            sales = watchdog_sales(self.db, key, position_marker(meta), meta.get("opened_at"))
-            bot_first = sales[0] - FILL_TIME_SKEW if sales is not None else None
-            budget = sales[1] if sales is not None else None
-            end = watchdog_sales_end(self.db, key, position_marker(meta))
-            until = end + FILL_TIME_SKEW if end is not None else None
-            entry = entry_qty(self._extra(key), meta)
-        split = split_fills(
-            fills,
-            bot_first_from=bot_first,
-            bot_first_qty=budget,
-            bot_first_until=until,
-            entry=entry,
-            entry_sent=opened,
-        )
+        split = self._bot_split(key, meta, fills)
         trips, open_qty = replay_fills(split.bot_fills, fallback)
         self._open_qty[key] = open_qty
         self._pending_trades.discard(key)
@@ -3416,13 +3455,21 @@ class Engine:
             return False
         qty = self._open_qty.get(key, 0.0)
         if watchdog_sold:  # the bot's lot is what was open when the watchdog sold
+            # Its own lot, from its entry on (as _reconstruct): an owner lot the journal
+            # still shows open (his sale on a day IBKR no longer reports) is not part of it.
             epoch = self._epoch
-            _, qty = replay_fills(
-                sorted(
-                    (f for f in fills if epoch is None or _aware(f.ts) >= epoch),
-                    key=lambda f: (f.ts, f.exec_id),
-                )
+            opened = meta.get("opened_at")
+            start = _aware(opened) - FILL_TIME_SKEW if opened is not None else None
+            window = sorted(
+                (
+                    f
+                    for f in fills
+                    if (epoch is None or _aware(f.ts) >= epoch)
+                    and (start is None or _aware(f.ts) >= start)
+                ),
+                key=lambda f: (f.ts, f.exec_id),
             )
+            _, qty = replay_fills(self._bot_split(key, meta, window).bot_fills)
             if qty <= EPS:
                 return True  # nothing of the bot's was open before the sale
         price = meta.get("stop_loss") or meta.get("entry_price") or last.price
@@ -4489,6 +4536,10 @@ class Engine:
             if rec.request.trace_id:
                 req = req.model_copy(update={"trace_id": rec.request.trace_id})
             self._journal_order(rec.model_copy(update={"request": req}), now)
+
+
+class _ExitUndecided(BrokerError):
+    """An engine exit not sent: the broker's executions could not be read to size it."""
 
 
 _ACCEPTED = frozenset({OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED})

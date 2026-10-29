@@ -21,7 +21,15 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from trader.db import Database
-from trader.models import OPEN_ORDER_STATUSES, Fill, OrderStatus, Side, exec_revision
+from trader.models import (
+    OPEN_ORDER_STATUSES,
+    Fill,
+    OrderRecord,
+    OrderStatus,
+    Side,
+    exec_revision,
+    order_trace_id,
+)
 
 # IBKRBroker.fills_since: an execution of another API client (the owner's TWS or IBKR
 # Mobile, or the crypto watchdog's own client id). This app's own executions (entries,
@@ -435,6 +443,55 @@ def unreported_sales(
         and (end is None or _aware(f.ts) <= end)
     )
     return max(0.0, sold - seen)
+
+
+def app_entry_unjournaled(
+    db: Database,
+    key: str,
+    opened: datetime,
+    fills: Iterable[Fill],
+    working: Iterable[OrderRecord],
+) -> tuple[float, float]:
+    """What the bot's entry for this position filled beyond the journal's fills of it, as
+    (sure, unknown). Sure: what the broker reports filled of an entry still working (by
+    its tag), or what the app saw filled of one it saw done. Unknown: the rest of an entry
+    the app last saw working that the broker no longer lists (it filled, lapsed or was
+    cancelled while the app was down)."""
+    journaled: dict[str, float] = {}
+    for f in fills:
+        if f.side == Side.BUY and not is_other_client(f):
+            journaled[f.broker_order_id] = journaled.get(f.broker_order_id, 0.0) + f.qty
+    listed: dict[str, float] = {}
+    for order in working:
+        req = order.request
+        if (
+            order.status in OPEN_ORDER_STATUSES
+            and req.side == Side.BUY
+            and req.instrument.key == key
+            and req.trace_id
+        ):
+            listed[req.trace_id] = listed.get(req.trace_id, 0.0) + order.filled_qty
+    sure = unknown = 0.0
+    for rec in db.list_orders_since(_aware(opened) - FILL_TIME_SKEW):
+        req = rec.request
+        if (
+            req.instrument.key != key
+            or req.side != Side.BUY
+            or req.is_exit
+            or not rec.broker_order_id
+            or (req.trace_id or "").startswith(WATCHDOG_TAG_PREFIX)
+        ):
+            continue
+        seen = journaled.get(rec.broker_order_id, 0.0)
+        tag = order_trace_id(rec.id, req.trace_id)
+        if tag in listed:
+            filled = listed[tag]
+        else:
+            filled = rec.filled_qty
+            if rec.status in OPEN_ORDER_STATUSES:
+                unknown += max(0.0, req.qty - max(seen, filled))
+        sure += max(0.0, filled - seen)
+    return sure, unknown
 
 
 def app_sold_unjournaled(db: Database, key: str, opened: datetime, fills: Iterable[Fill]) -> bool:

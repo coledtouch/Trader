@@ -491,3 +491,180 @@ async def test_the_bots_quick_previous_trip_is_none_of_its_new_entry(
         clock.advance(seconds=10)
         tw.beat(db, clock, age=400)
     assert [o.qty for o in broker.placed] == [pytest.approx(0.01)]
+
+
+# ----------------------------------------------------------------------------- review 43
+async def test_an_undecided_crypto_stop_alerts_and_hands_over_to_the_watchdog(db, config) -> None:
+    """The owner bought BTC next to the bot's, and IBKR's executions keep timing out: the
+    stop cannot be sized. That is no 'none of it is the bot's': the owner is told once, the
+    heartbeat goes stale so the watchdog (which sells only the bot's part) takes over, and
+    the bot sells its own once the read recovers."""
+    from trader.watchdog import read_heartbeat
+
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 15, 0, tzinfo=UTC))
+    mine = h.broker.pos[KEY][0]
+    owner_buys(h, _BTC, 0.004, 60000.0)
+    every_fill = h.broker.fills_since
+    failing = True
+
+    async def flaky(since):
+        if failing:
+            raise BrokerError("IBKR executions timed out after 10s")
+        return await every_fill(since)
+
+    h.broker.fills_since = flaky
+    h.broker.set_price("BTC", 58500.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    before = list(h.notes.titles())
+    await ticks(h, 40, seconds=15)
+    new = [t for t in h.notes.titles() if t not in before]
+    assert bot_sells(h, KEY) == []
+    assert new.count("Close BTC FAILED") == 1  # one alert a stretch
+    assert h.clock() - read_heartbeat(db) > timedelta(seconds=45)
+    failing = False
+    await ticks(h, 3, seconds=15)
+    assert bot_sells(h, KEY) == [pytest.approx(mine)]
+    assert h.broker.pos[KEY][0] == pytest.approx(0.004)
+
+
+async def test_an_undecided_stock_flatten_alerts(db, config) -> None:
+    """Flatten before the close with the executions read failing and the journal not
+    explaining the position: nothing is sold, and the owner is told."""
+    h = await _f_with_owner(db, config)
+    owner_buys(h, F, 5, 10.0)
+
+    async def failing(since):
+        raise BrokerError("IBKR executions timed out after 10s")
+
+    h.broker.fills_since = failing
+    before = list(h.notes.titles())
+    h.clock.t = datetime(2026, 10, 21, 19, 50, tzinfo=UTC)
+    await ticks(h, 40, seconds=15)
+    new = [t for t in h.notes.titles() if t not in before]
+    assert bot_sells(h, "STK:F") == []
+    assert "Close F FAILED" in new
+
+
+@pytest.mark.parametrize("stale", [0.0, 0.003, 0.5])
+async def test_a_watchdog_flat_sale_estimate_is_the_bots_lot_only(db, config, stale: float) -> None:
+    """The owner's BTC bought on the 20th and sold on a day IBKR no longer reports stays
+    open in the journal. The watchdog sold the bot's later position flat on Wednesday: the
+    estimate the app journals on Thursday is the bot's lot, never his stale one too."""
+    from trader.watchdog import WATCHDOG_CLOSED_PREFIX
+
+    db.set_kv("broker_account", "FAKE")
+    db.set_kv("journal_account_since", datetime(2026, 10, 1, tzinfo=UTC).isoformat())
+    if stale:
+        db.insert_fill(
+            Fill(exec_id="OWN1", broker_order_id="perm:900", instrument=_BTC, side=Side.BUY,
+                 qty=stale, price=50000.0, commission=1.0,
+                 ts=datetime(2026, 10, 20, 15, 0, tzinfo=UTC))
+        )  # fmt: skip
+    h = await _hold_btc(db, config, datetime(2026, 10, 28, 22, 0, tzinfo=UTC))
+    marker = position_marker(db.get_position_meta(KEY))
+    h.clock.advance(seconds=600)
+    qty = h.broker.pos.pop(KEY)[0]
+    h.broker.cash += qty * 59000.0
+    note_watchdog_sale(db, KEY, marker, "WD1", qty, h.clock(), done=True)
+    record = {"instrument": KEY, "qty": qty, "filled": qty, "status": "Filled", "marker": marker}
+    db.audit("watchdog_close", record, actor="watchdog")
+    db.set_kv(WATCHDOG_CLOSED_PREFIX + KEY, marker)
+    h.engine = _restart_next_morning(h, config)
+    await ticks(h, 70, seconds=15)
+    assert db.get_position_meta(KEY) is None
+    [trade] = db.list_trades()
+    assert trade.qty == pytest.approx(qty)
+
+
+_ENTRY_TRACE = "ai-trader-0123456789abcdef"
+
+
+def _entry_outage(db: Database, broker: FakeBroker, *, journaled: float, held: float,
+                  working_filled: float | None) -> None:  # fmt: skip
+    """The bot's BTC entry of 0.01 (its journal row as the engine writes it), `journaled`
+    of it in the journal; the owner's 0.5 journaled; `held` at the broker now, the bid
+    below the bot's stop. `working_filled`: the entry still works there with that fill."""
+    from tests.test_watchdog import crypto, q
+    from trader.models import Position
+
+    btc = crypto()
+    opened = NOW - timedelta(hours=1)
+    db.set_position_meta(btc.key, stop_loss=95.0, take_profit=110.0, entry_price=100.0,
+                         initial_risk=5.0 * BOT, opened_at=opened)  # fmt: skip
+    db.set_kv("position_extra:" + btc.key, json.dumps({"unit_risk": 5.0, "qty": BOT}))
+    req = OrderRequest(instrument=btc, side=Side.BUY, qty=BOT, order_type=OrderType.LIMIT,
+                       limit_price=100.0, stop_loss=95.0, take_profit=110.0,
+                       trace_id=_ENTRY_TRACE)  # fmt: skip
+    status = OrderStatus.PARTIALLY_FILLED if journaled else OrderStatus.SUBMITTED
+    db.insert_order(OrderRecord(request=req, status=status, broker_order_id="12",
+                                filled_qty=journaled, created_at=opened))  # fmt: skip
+    if journaled:
+        at = opened + timedelta(seconds=5)
+        db.insert_fill(Fill(exec_id="E1", broker_order_id="12", instrument=btc, side=Side.BUY,
+                            qty=journaled, price=100.0, ts=at))  # fmt: skip
+    db.insert_fill(Fill(exec_id="X1", broker_order_id="perm:5", instrument=btc, side=Side.BUY,
+                        qty=0.5, price=99.0, ts=opened + timedelta(minutes=2)))  # fmt: skip
+    broker.positions_list.append(Position(instrument=btc, qty=round(held, 8), avg_cost=99.0))
+    if working_filled is not None:
+        broker.orders.append(
+            OrderRecord(
+                request=req,
+                status=OrderStatus.PARTIALLY_FILLED if working_filled else OrderStatus.SUBMITTED,
+                broker_order_id="perm:777",
+                filled_qty=working_filled,
+            )
+        )
+    broker.quotes[btc.key] = q(btc, 90.0, 90.0)
+
+
+async def _watchdog_outage(db: Database, broker: FakeBroker) -> tuple[list[float], list[str]]:
+    clock = Clock()
+    beat(db, clock, age=60)
+    watchdog, notes = make(db, broker, clock)
+    for _ in range(3):
+        await watchdog.tick()
+        for rec in [o for o in broker.orders if o.request.side == Side.SELL]:
+            rec.status, rec.filled_qty = OrderStatus.FILLED, rec.request.qty
+            pos = broker.positions_list[0]
+            broker.positions_list[0] = pos.model_copy(update={"qty": pos.qty - rec.request.qty})
+            broker.orders.remove(rec)
+        clock.advance(seconds=10)
+        beat(db, clock, age=60)
+    return [round(o.qty, 8) for o in broker.placed], notes.sent
+
+
+@pytest.mark.parametrize("journaled", [0.0, 0.004])
+async def test_the_watchdog_sells_what_the_broker_says_the_entry_filled(
+    db: Database, journaled: float
+) -> None:
+    """The bot's entry still works at IBKR and filled 0.007 by now, more than the journal
+    shows; the owner sold 0.2 of his journaled 0.5 meanwhile. The stop sells the bot's
+    0.007, and none of the owner's."""
+    broker = FakeBroker()
+    _entry_outage(db, broker, journaled=journaled, held=0.007 + 0.3, working_filled=0.007)
+    placed, sent = await _watchdog_outage(db, broker)
+    assert placed == [0.007]
+    assert "Crypto watchdog: the bot's part unknown" not in sent
+
+
+async def test_a_resting_entry_unfilled_is_none_of_the_bots_coins(db: Database) -> None:
+    """The entry still rests with only its journaled 0.004 filled; the owner sold 0.194 of
+    his: selling more than 0.004 would sell his coins."""
+    broker = FakeBroker()
+    _entry_outage(db, broker, journaled=0.004, held=BOT + 0.3, working_filled=0.004)
+    placed, sent = await _watchdog_outage(db, broker)
+    assert placed == [0.004]
+    assert "Crypto watchdog: the bot's part unknown" not in sent
+
+
+@pytest.mark.parametrize("journaled", [0.0, 0.004])
+async def test_an_entry_gone_in_the_outage_with_an_owner_sale_alerts(
+    db: Database, journaled: float
+) -> None:
+    """The entry the app last saw working is gone at IBKR (filled, or lapsed), and less is
+    held than the bot's and the owner's journaled coins: whose coins are left is unknown.
+    The watchdog sells only what is surely the bot's, and the owner is told (urgent)."""
+    broker = FakeBroker()
+    _entry_outage(db, broker, journaled=journaled, held=BOT + 0.3, working_filled=None)
+    placed, sent = await _watchdog_outage(db, broker)
+    assert placed == ([journaled] if journaled else [])
+    assert "Crypto watchdog: the bot's part unknown" in sent
