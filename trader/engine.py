@@ -78,6 +78,14 @@ from trader.models import (
     utcnow,
 )
 from trader.notify import Notifier
+from trader.ownership import (
+    FILL_TIME_SKEW,
+    bot_holding,
+    entry_qty,
+    merge_fills,
+    sell_cap,
+    watchdog_sales,
+)
 from trader.risk import (
     DELAYED_QUOTE_GRACE,
     HALT_DAILY_LOSS,
@@ -99,7 +107,12 @@ from trader.timeutil import (
     trading_day,
     trading_day_start,
 )
-from trader.watchdog import WATCHDOG_CLOSED_PREFIX, sold_by_watchdog, write_heartbeat
+from trader.watchdog import (
+    WATCHDOG_CLOSED_PREFIX,
+    position_marker,
+    sold_by_watchdog,
+    write_heartbeat,
+)
 
 log = logging.getLogger(__name__)
 
@@ -467,6 +480,7 @@ class Engine:
         self._skip_logged: set[tuple[str, str]] = set()
         # instrument -> when the broker first read flat while the fills journal did not
         self._mismatch_logged: dict[str, datetime] = {}
+        self._owner_noted: set[tuple[str, str]] = set()  # (key, position marker) alerted
         self._ledger_retry: dict[str, datetime] = {}  # instrument -> no bar requests until
         self._fallback_logged: str | None = None
         self._last_ledger_at: datetime | None = None
@@ -1132,7 +1146,21 @@ class Engine:
             seq = self._mark_closing(key, reason, self._now())
             self._cancel_pending(f"cancelled: {reason}", key=key)
             try:
-                rec = await self.broker.close_position(held.instrument, reason=reason)
+                meta = self.db.get_position_meta(key)
+                bot_position = (
+                    meta is not None
+                    and not self._meta_used(key, meta)
+                    and not sold_by_watchdog(self.db, key, meta)
+                )
+                # A position the bot opened, with shares the owner bought next to it: Close
+                # sells the bot's own. One the bot did not open is the owner's: all of it.
+                cap = await self._bot_cap(held.instrument, held.qty) if bot_position else None
+                if cap is not None and cap <= EPS:
+                    raise ValueError(
+                        f"none of the {held.qty:g} {inst.symbol} held is the bot's: you bought "
+                        "it in TWS or IBKR Mobile, sell it there"
+                    )
+                rec = await self.broker.close_position(held.instrument, reason=reason, max_qty=cap)
             except BaseException:
                 self._unmark_closing(key, seq)  # the monitor manages it again
                 raise
@@ -1156,7 +1184,7 @@ class Engine:
             raise BrokerError(f"the broker refused to close {refused}")
         # The owner overrode the bot: no new entry in this symbol for the rest of the day.
         self.db.set_kv(OWNER_CLOSED_PREFIX + key, trading_day(now))
-        log.warning("%s: %s at market (%g)", key, reason, held.qty)
+        log.warning("%s: %s at market (%g)", key, reason, rec.request.qty)
         await self._notify(
             f"Closing {inst.symbol}",
             f"Sold at market: {reason}. No new {inst.symbol} entries today.",
@@ -1315,8 +1343,18 @@ class Engine:
                     return self._get_order(order_id)
                 seq = self._mark_closing(key, order.reason, self._now())
                 try:
+                    held_qty = sum(p.qty for p in positions if p.instrument.key == key)
+                    cap = await self._bot_cap(order.instrument, held_qty)
+                    if cap is not None and cap <= EPS:
+                        self._unmark_closing(key, seq)
+                        self.db.update_order(
+                            order_id,
+                            status=OrderStatus.CANCELLED,
+                            message="nothing held is the bot's (the owner's shares)",
+                        )
+                        return self._get_order(order_id)
                     placed = await self.broker.close_position(
-                        order.instrument, order.reason, trace_id=order.trace_id
+                        order.instrument, order.reason, trace_id=order.trace_id, max_qty=cap
                     )
                 except BrokerError:
                     # Nothing was sold (a broker error comes before the sell goes out): the
@@ -2085,7 +2123,13 @@ class Engine:
                     seq = self._mark_closing(key, reason, now)
                     # One failure must not leave the other positions unsold (as flatten_all).
                     try:
-                        rec = await self.broker.close_position(pos.instrument, reason=reason)
+                        cap = await self._bot_cap(pos.instrument, pos.qty)
+                        if cap is not None and cap <= EPS:
+                            self._note_close(key, None, seq)  # only the owner's shares
+                            continue
+                        rec = await self.broker.close_position(
+                            pos.instrument, reason=reason, max_qty=cap
+                        )
                     except BrokerError as exc:  # close_position put the stop back
                         failed.append(f"{pos.instrument.symbol}: {exc}")
                         continue
@@ -2148,11 +2192,92 @@ class Engine:
         if rec is None or rec.status == OrderStatus.REJECTED:
             self._close_refused.add(key)
 
-    async def _engine_close(self, inst: Instrument, reason: str, now: datetime) -> None:
-        """Close a position for a protective reason (never waits for approval)."""
+    async def _bot_cap(self, inst: Instrument, held: float) -> float | None:
+        """The most of `held` a bot exit may sell: None when nothing says the owner bought
+        the symbol since the bot's entry was sent (everything held is the bot's: sell it
+        all, as always), else the bot's own quantity from its fills (0: none of it). The
+        journal is read first; only when it does not explain the position as the bot's are
+        the broker's executions read too (an owner's buy, or a bot sale, since the last
+        journal sync). See trader/ownership.py."""
+        key = inst.key
+        meta = self.db.get_position_meta(key)
+        opened = meta.get("opened_at") if meta else None
+        if meta is None or opened is None:
+            return None
+        since = _aware(opened) - FILL_TIME_SKEW
+        sold = sold_by_watchdog(self.db, key, meta) or (
+            watchdog_sales(self.db, key, position_marker(meta), opened) is not None
+        )
+        journal = [
+            f
+            for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+            if f.instrument.key == key
+        ]
+        holding = bot_holding(journal, since, watchdog_sold=sold)
+        limit = entry_qty(self._extra(key), meta)
+        if holding.owner_bought <= EPS and held <= holding.bot + EPS:
+            return None  # the journal explains everything held as the bot's
+        try:
+            fresh = [f for f in await self.broker.fills_since(since) if f.instrument.key == key]
+        except BrokerError as exc:
+            log.warning(
+                "%s: executions not read (%s); the journal decides the bot's part", key, exc
+            )
+            fresh = []
+        holding = bot_holding(merge_fills(journal, fresh), since, watchdog_sold=sold)
+        cap = sell_cap(held, limit, holding)
+        if cap is None:
+            return None
+        cap = self.broker.round_qty(
+            inst, round(cap, 6), allow_fractional=self.settings.allow_fractional_stocks
+        )
+        if cap < held - EPS:
+            self._note_owner_shares(inst, meta, held, cap)
+        return cap
+
+    def _note_owner_shares(
+        self, inst: Instrument, meta: dict[str, Any], held: float, mine: float
+    ) -> None:
+        """Tell the owner once per bot position that its exits leave the owner's shares."""
+        mark = (inst.key, position_marker(meta))
+        if mark in self._owner_noted:
+            return
+        self._owner_noted.add(mark)
+        log.warning(
+            "%s: %g held, %g of it the bot's; its exits sell only that", inst.key, held, mine
+        )
+        self.db.audit(
+            "owner_shares", {"instrument": inst.key, "held": held, "bot": mine}, actor="engine"
+        )
+        self._spawn_notify(
+            f"{inst.symbol}: your shares stay",
+            f"IBKR holds {held:g} {inst.symbol}, {mine:g} of it the bot's. You bought the rest "
+            "in TWS or IBKR Mobile: the bot's stops, exits and Close sell only its own "
+            f"{mine:g}. Manage the rest yourself in IBKR.",
+        )
+
+    def _spawn_notify(self, title: str, message: str) -> None:
+        task = asyncio.ensure_future(
+            self._notify(title, message, priority="high", tags=["warning"])
+        )
+        self._alert_tasks.add(task)
+        task.add_done_callback(self._alert_tasks.discard)
+
+    async def _engine_close(
+        self, inst: Instrument, reason: str, now: datetime, held: float | None = None
+    ) -> None:
+        """Close a position for a protective reason (never waits for approval). With the
+        owner's shares next to the bot's (`held`), only the bot's own are sold."""
         seq = self._mark_closing(inst.key, reason, now)
+        cap = await self._bot_cap(inst, held) if held is not None else None
+        if cap is not None and cap <= EPS:
+            # Nothing of it is the bot's (it sold its part, the rest is the owner's):
+            # like a close that found nothing to sell; looked at again after CLOSE_RETRY.
+            self._note_close(inst.key, None, seq)
+            log.info("%s: %s, but none of the %g held is the bot's", inst.key, reason, held)
+            return
         log.warning("closing %s: %s", inst.key, reason)
-        rec = await self.broker.close_position(inst, reason=reason)
+        rec = await self.broker.close_position(inst, reason=reason, max_qty=cap)
         self._note_close(inst.key, rec, seq)
         if rec is not None:
             self._journal_order(rec, now)
@@ -2428,7 +2553,7 @@ class Engine:
                 log.info("%s: %s; confirming on the next tick", key, reason)
                 return
             self._breaches.pop(key, None)
-            await self._engine_close(pos.instrument, reason, now)
+            await self._engine_close(pos.instrument, reason, now, pos.qty)
             return
 
         new_stop: float | None = None
@@ -2507,7 +2632,7 @@ class Engine:
                 and not self._closing_now(key, now)
             ):
                 try:
-                    await self._engine_close(pos.instrument, "flatten before close", now)
+                    await self._engine_close(pos.instrument, "flatten before close", now, pos.qty)
                 except BrokerError as exc:
                     failures.append(f"{key}: {exc}")
         if failures:
@@ -2583,7 +2708,9 @@ class Engine:
                         (p.qty for p in await self.broker.positions() if p.instrument.key == key),
                         0.0,
                     )
-                    qty = round(held - self._queued_exits(orders).get(key, 0.0), 8)
+                    cap = await self._bot_cap(pos.instrument, held) if held > EPS else None
+                    mine = held if cap is None else min(held, cap)  # never the owner's shares
+                    qty = round(mine - self._queued_exits(orders).get(key, 0.0), 8)
                     if qty <= EPS or key in self._native_stops(orders):
                         continue
                     if key in self._working_buys(orders):
@@ -3844,7 +3971,12 @@ class Engine:
             decision_id=order.decision_id,
             setup=order.setup,
         )
-        extra = {"initial_stop": stop, "unit_risk": entry - stop, "best_price": entry}
+        extra = {
+            "initial_stop": stop,
+            "unit_risk": entry - stop,
+            "best_price": entry,
+            "qty": order.qty,  # the most the bot holds of it (see _bot_cap)
+        }
         atr = self._market.get(key, {}).get("atr14")
         if atr and atr > 0:
             extra["atr"] = atr  # the trailing stop's distance, if no cycle runs later
@@ -3981,9 +4113,15 @@ class Engine:
             if self._closing_now(inst.key, self._now()):
                 return
             seq = self._mark_closing(inst.key, req.reason, self._now())
-            rec = await self.broker.close_position(inst, reason=req.reason)
+            cap = await self._bot_cap(inst, pos.qty)
+            if cap is not None and cap <= EPS:
+                self._note_close(inst.key, None, seq)  # only the owner's shares are held
+                log.info("CLOSE %s: none of it is the bot's", inst.key)
+                return
+            rec = await self.broker.close_position(inst, reason=req.reason, max_qty=cap)
             self._note_close(inst.key, rec, seq)
         if rec is not None:
+            req = req.model_copy(update={"qty": rec.request.qty})
             if rec.request.trace_id:
                 req = req.model_copy(update={"trace_id": rec.request.trace_id})
             self._journal_order(rec.model_copy(update={"request": req}), now)

@@ -48,6 +48,14 @@ from trader.models import (
     Side,
 )
 from trader.notify import Notifier
+from trader.ownership import (
+    FILL_TIME_SKEW,
+    bot_holding,
+    entry_qty,
+    read_extra,
+    sell_cap,
+    watchdog_sales,
+)
 from trader.risk import sane_exit_price
 from trader.timeutil import trading_day
 
@@ -366,7 +374,12 @@ class CryptoWatchdog:
         closes: list[Close] = []
         for pos in managed:
             key = pos.instrument.key
-            uncovered = pos.qty - _working_sell_qty(open_orders, key)
+            own = self._own_qty(key, metas[key], pos.qty)
+            if own is not None and own <= QTY_EPS:
+                result.skipped.append(f"{key}: nothing held is the bot's (the owner's coins)")
+                continue
+            mine = pos.qty if own is None else min(pos.qty, own)
+            uncovered = mine - _working_sell_qty(open_orders, key)
             if uncovered <= QTY_EPS:
                 self._attempt_at.pop(key, None)
                 result.skipped.append(f"{key}: a sell is already working")
@@ -435,6 +448,25 @@ class CryptoWatchdog:
             self.db.set_kv(WATCHDOG_CLOSED_PREFIX + key, marker)
             self._forget_sold(key)
             log.info("%s: sold flat by the watchdog; a later buy is not the bot's", key)
+
+    def _own_qty(self, key: str, meta: dict[str, Any], held: float) -> float | None:
+        """Most this process may still sell of a bot position, or None (all of it, as
+        before). When the owner bought the coin too (a buy of another client in the journal
+        the app kept until it stopped, or more held than the bot's entry bought): the bot's
+        own part from that journal, less what this watchdog already sent to sell of it (not
+        in the journal while the app is down; counted twice when it is: errs low)."""
+        opened = meta.get("opened_at")
+        if not isinstance(opened, datetime):
+            return None
+        since = opened - FILL_TIME_SKEW
+        fills = [f for f in self.db.list_fills(since=since, limit=5000) if f.instrument.key == key]
+        sent = watchdog_sales(self.db, key, position_marker(meta), opened)
+        limit = entry_qty(read_extra(self.db, key), meta)
+        cap = sell_cap(held, limit, bot_holding(fills, since, watchdog_sold=sent is not None))
+        if cap is None:
+            return None
+        cap = max(0.0, cap - (sent or 0.0))
+        return self.broker.round_qty(Instrument.from_key(key), round(cap, 6))
 
     def _forget_sold(self, key: str) -> None:
         self._sold.pop(key, None)
@@ -564,6 +596,7 @@ class CryptoWatchdog:
                 "tag": tag,
                 "qty": close.qty,
                 "status": placed.status.value,
+                "marker": marker,  # which bot position (see trader.ownership.watchdog_sales)
             },
             actor="watchdog",
         )

@@ -1119,6 +1119,25 @@ watchdog act). An AI CLOSE is refused for a symbol whose row is used or sold by 
 watchdog, as for one without a row, and an approved CLOSE is cancelled for the same reason
 (the bot's position closed while the approval waited).
 
+**The owner's shares next to the bot's** (2026-10-29, `trader/ownership.py`): IBKR reports
+one position per symbol, so when the owner buys a symbol the bot holds, the bot's own
+quantity comes from the fills since its entry was sent (`opened_at` less 5 s of clock skew):
+this app's own executions (its entry, bracket children, closes, re-placed stops, estimates)
+are the bot's; another client's (`perm:`) buys are the owner's, and another client's sells
+come out of the owner's buys first (out of the bot's first once the crypto watchdog sold the
+position). The entry's quantity (`position_extra.qty`) bounds it: the bot never adds to a
+position. Every bot exit sells at most that quantity when there is evidence the owner bought
+(an owner buy since the entry, or more held than the entry bought): the engine's stops,
+targets, time stop and backup stop, the flatten before the close, AI and approved closes, the
+dashboard Close of a bot position, re-placed stops (sized to the bot's part) and the crypto
+watchdog (less what it already sent to sell). Without such evidence nothing changes: the
+exit sells the whole position, as before. The journal is read first; only when it does not
+explain the position as the bot's are the broker's executions read too. A cap of 0 sells
+nothing (Close refuses: "sell it in IBKR"). The owner is told once per bot position. KILL
+and the daily-loss flatten (`flatten_all`) still close everything (owner decision of
+2026-10-23). Open follow-up: after a capped exit the metadata stays until the owner sells,
+and that trip is journaled as one bot trade.
+
 ### 7.9 Economic reporting and paired research (2026-10-23)
 
 - `BotSettings.enabled_setups` is a validated list of the five scanner setup names,

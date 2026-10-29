@@ -191,8 +191,10 @@ class Broker(ABC):
         *,
         restore_stop: float | None = None,
         trace_id: str | None = None,
+        max_qty: float | None = None,
     ) -> OrderRecord | None:
-        """Cancel working orders for the instrument, then market-sell the whole long position.
+        """Cancel working orders for the instrument, then market-sell the whole long position,
+        or at most `max_qty` of it (the bot's own shares next to ones the owner bought).
 
         If the broker rejects that sell, the protective stop that was cancelled (or
         `restore_stop`, for callers that cancelled it already) is re-placed when the broker
@@ -201,7 +203,7 @@ class Broker(ABC):
         (its sell, or the stop it put back), never a half-finished close."""
         async with self.close_lock(instrument):
             return await self._close_position(
-                instrument, reason, restore_stop=restore_stop, trace_id=trace_id
+                instrument, reason, restore_stop=restore_stop, trace_id=trace_id, max_qty=max_qty
             )
 
     def close_lock(self, instrument: Instrument) -> asyncio.Lock:
@@ -218,15 +220,19 @@ class Broker(ABC):
         *,
         restore_stop: float | None,
         trace_id: str | None,
+        max_qty: float | None = None,
     ) -> OrderRecord | None:
+        if max_qty is not None and max_qty <= 0:
+            return None  # nothing to sell: never cancel the stop of a held position
         positions = {p.instrument.key: p for p in await self.positions()}
         pos = positions.get(instrument.key)
         stops = [] if restore_stop is None else [restore_stop]
         cancelled: set[str] = set()
+        held = pos.qty if pos is not None and pos.qty > 0 else 0.0
         req = OrderRequest(
             instrument=instrument,
             side=Side.SELL,
-            qty=pos.qty if pos is not None and pos.qty > 0 else 1.0,
+            qty=(min(held, max_qty) if max_qty is not None else held) or 1.0,
             order_type=OrderType.MARKET,
             is_exit=True,
             reason=reason or "close position",
