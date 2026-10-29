@@ -473,7 +473,7 @@ def app_entry_unjournaled(
     (sure, unknown). Sure: what the broker reports filled of an entry still working (by
     its tag), or what the app saw filled of one it saw done. Unknown: the rest of an entry
     the app last saw working that the broker no longer lists (it filled, lapsed or was
-    cancelled while the app was down)."""
+    cancelled while the app was down), or that the engine forgot before it was done."""
     journaled: dict[str, float] = {}
     for f in fills:
         if f.side == Side.BUY and not is_other_client(f):
@@ -509,7 +509,8 @@ def app_entry_unjournaled(
             filled = listed[tag]
         else:
             filled = rec.filled_qty
-            if rec.status in OPEN_ORDER_STATUSES:
+            if rec.status in OPEN_ORDER_STATUSES or rec.message == ORDER_FORGOTTEN:
+                # Last seen working, or forgotten by the engine before it was done.
                 unknown += max(0.0, req.qty - max(seen, filled))
         sure += max(0.0, filled - seen)
     return sure, unknown

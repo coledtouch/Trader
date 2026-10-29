@@ -934,3 +934,174 @@ async def test_an_entry_gone_in_the_outage_with_an_owner_buy_alerts(
     placed, sent = await _watchdog_outage(db, broker)
     assert placed == ([journaled] if journaled else [])
     assert "Crypto watchdog: the bot's part unknown" in sent
+
+
+# ----------------------------------------------------------------------------- review 46
+async def _paper(db, config, now: datetime):
+    from trader.models import Mode
+
+    return await harness(db, config, mode=Mode.PAPER, exits={"time_stop_minutes": 0}, now=now)
+
+
+async def test_a_target_part_fill_never_hides_an_unreported_owner_buy(db, config) -> None:
+    """Wednesday: the bot's 24 F; the owner buys 3 while the app is down. Thursday the
+    target fills 4 of the bot's: a Close a minute later sells the bot's 20, not his 3."""
+    from tests.test_engine import _part
+
+    h = await _paper(db, config, datetime(2026, 10, 28, 15, 0, tzinfo=UTC))
+    await enter_f(h)
+    [entry] = [oid for oid, k in h.broker.kind.items() if k == "entry"]
+    await ticks(h, 2)
+    h.clock.t = datetime(2026, 10, 28, 19, 45, tzinfo=UTC)
+    owner_buys(h, F, 3, 10.4)
+    h.engine = _restart_next_morning(h, config)
+    await ticks(h, 2)
+    _part(h.broker, f"{entry}-TP", 4, 10.5)
+    await ticks(h, 1)
+    rec = await h.engine.close_position("STK:F")
+    assert rec.request.qty == 20
+    assert h.broker.pos["STK:F"][0] == 3
+
+
+async def test_the_flatten_right_after_a_part_fill_keeps_the_owners_shares(db, config) -> None:
+    from tests.test_engine import _part
+
+    h = await _paper(db, config, datetime(2026, 10, 28, 15, 0, tzinfo=UTC))
+    await enter_f(h)
+    [entry] = [oid for oid, k in h.broker.kind.items() if k == "entry"]
+    await ticks(h, 1)
+    _part(h.broker, f"{entry}-TP", 14, 10.5)
+    await ticks(h, 2)
+    h.clock.t = datetime(2026, 10, 28, 19, 45, tzinfo=UTC)
+    owner_buys(h, F, 5, 10.4)
+    h.engine = _restart_next_morning(h, config)
+    await ticks(h, 2)
+    h.clock.t = datetime(2026, 10, 29, 19, 49, tzinfo=UTC)
+    await h.engine.monitor_tick()
+    _part(h.broker, f"{entry}-TP", 6, 10.5)
+    h.clock.t = datetime(2026, 10, 29, 19, 50, 30, tzinfo=UTC)
+    await h.engine.monitor_tick()
+    assert h.broker.pos["STK:F"][0] == 5
+    assert bot_sells(h, "STK:F") == [4]  # the flatten: the bot's rest only
+
+
+async def test_an_unseen_owner_buy_a_minute_after_a_partial_exit_waits(db, config) -> None:
+    """Same day: the target sold 14 of 24, the owner buys 5 a minute later, and the
+    executions read fails: Close sells nothing until it can tell."""
+    from tests.test_engine import _part
+
+    h = await _paper(db, config, datetime(2026, 10, 21, 15, 0, tzinfo=UTC))
+    await enter_f(h)
+    [entry] = [oid for oid, k in h.broker.kind.items() if k == "entry"]
+    await ticks(h, 1)
+    _part(h.broker, f"{entry}-TP", 14, 10.5)
+    await ticks(h, 1)
+    owner_buys(h, F, 5, 10.4)
+    h.broker.fills_since = _executions_fail
+    with pytest.raises(BrokerError):
+        await h.engine.close_position("STK:F")
+    assert h.broker.pos["STK:F"][0] == 15
+
+
+async def test_a_crypto_close_retried_after_a_part_fill_keeps_the_owners_coins(db, config) -> None:
+    """The owner bought BTC on Wednesday evening, app down. Thursday the bot's stop sells
+    with an IOC that fills 40%; its retry a minute later sells the bot's rest, not his."""
+    h = await _hold_btc(db, config, datetime(2026, 10, 28, 19, 0, tzinfo=UTC))
+    bot = h.broker.pos[KEY][0]
+    h.clock.t = datetime(2026, 10, 28, 23, 0, tzinfo=UTC)
+    his = round(bot * 0.3, 8)
+    owner_buys(h, _BTC, his, 60000.0)
+    real = h.broker.place_order
+    first: list[float] = []
+
+    async def place(req: OrderRequest) -> OrderRecord:
+        if not first and req.side == Side.SELL and req.stop_loss is None:
+            first.append(req.qty)
+            rec = await real(req.model_copy(update={"qty": round(req.qty * 0.4, 8)}))
+            order = h.broker.orders[rec.broker_order_id]
+            order.request, order.status = req, OrderStatus.CANCELLED  # IOC: part, rest gone
+            return order.model_copy()
+        return await real(req)
+
+    h.broker.place_order = place
+    h.engine = _restart_next_morning(h, config)
+    await ticks(h, 16, seconds=15)
+    assert first
+    assert his - 1e-9 <= h.broker.pos[KEY][0] <= his + 1e-6  # his, and rounding dust
+
+
+async def _partly_filled_entry_then_outage(db, config, *, owner: float = 0.0,
+                                           rest: bool = True, forgotten: bool = False,
+                                           time_stop: bool = False):  # fmt: skip
+    """Wednesday: the bot's entry of 24 F fills 7, its target sells those 7 (journaled)
+    and the entry keeps working. The app goes down; the rest (17) fills that afternoon
+    (or lapses). Thursday IBKR reports only Thursday's executions (and with `forgotten`,
+    no longer knows the completed entry)."""
+    from tests.test_engine import _part, _resting_entry
+    from trader.models import Mode
+
+    exits = {} if time_stop else {"time_stop_minutes": 0}
+    h = await harness(db, config, now=datetime(2026, 10, 28, 14, 0, tzinfo=UTC), mode=Mode.PAPER,
+                      exits=exits)  # fmt: skip
+    entry, total = await _resting_entry(h)
+    _part(h.broker, entry, 7, 10.01)
+    await ticks(h, 2, seconds=15)
+    if owner:
+        owner_buys(h, F, owner, 10.2)
+        await ticks(h, 2, seconds=15)
+    _part(h.broker, f"{entry}-TP", 7, 10.5)
+    stop = h.broker.orders[f"{entry}-SL"]  # the OCA group shrinks the sibling stop
+    stop.request = stop.request.model_copy(update={"qty": stop.request.qty - 7})
+    await ticks(h, 2, seconds=15)
+    assert [t.qty for t in db.list_trades()] == [7]
+    h.clock.t = datetime(2026, 10, 28, 17, 0, tzinfo=UTC)
+    if rest:
+        _part(h.broker, entry, total - 7, 10.01)
+    else:
+        for oid in (entry, f"{entry}-SL", f"{entry}-TP"):
+            h.broker.orders[oid].status = OrderStatus.CANCELLED
+    if forgotten:
+        known = h.broker.order_status
+
+        async def order_status(oid):
+            return None if oid == entry else await known(oid)
+
+        h.broker.order_status = order_status
+    h.engine = _restart_next_morning(h, config)
+    await ticks(h, 3, seconds=15)
+    return h
+
+
+async def test_the_unreported_rest_of_a_partly_filled_entry_keeps_its_stop(db, config) -> None:
+    h = await _partly_filled_entry_then_outage(db, config)
+    assert h.broker.pos["STK:F"][0] == 17
+    assert db.get_position_meta("STK:F") is not None
+    assert h.broker.working("STK:F", "stop")
+    h.broker.set_price("F", 9.0)
+    await ticks(h, 20, seconds=15)
+    assert "STK:F" not in h.broker.pos
+    assert sorted(t.qty for t in db.list_trades()) == [7, 17]
+    await ticks(h, 80, seconds=15)
+    assert db.get_position_meta("STK:F") is None
+
+
+async def test_the_unreported_rest_next_to_the_owners_shares_is_still_the_bots(db, config) -> None:
+    h = await _partly_filled_entry_then_outage(db, config, owner=10, time_stop=True)
+    await ticks(h, 80, seconds=15)
+    assert h.broker.pos["STK:F"][0] == 10
+    assert sorted(t.qty for t in db.list_trades()) == [7, 17]
+    assert db.get_position_meta("STK:F") is None
+
+
+async def test_an_entry_the_broker_forgot_keeps_its_unreported_rest(db, config) -> None:
+    h = await _partly_filled_entry_then_outage(db, config, forgotten=True)
+    await ticks(h, 80, seconds=15)  # past a day since the entry's journal row
+    assert db.get_position_meta("STK:F") is not None
+    assert h.broker.working("STK:F", "stop")
+
+
+async def test_a_lapsed_rest_leaves_the_owners_shares_alone(db, config) -> None:
+    h = await _partly_filled_entry_then_outage(db, config, owner=50, rest=False, forgotten=True)
+    assert h.broker.pos["STK:F"][0] == 50
+    await ticks(h, 80, seconds=15)
+    assert h.broker.pos["STK:F"][0] == 50

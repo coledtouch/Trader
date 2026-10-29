@@ -87,6 +87,7 @@ from trader.ownership import (
     WATCHDOG_SALES_PREFIX,
     Cap,
     Split,
+    app_entry_unjournaled,
     app_sold_unjournaled,
     bought_since,
     entry_qty,
@@ -2297,7 +2298,7 @@ class Engine:
             entry_sent=opened,
         )
         base = split
-        bought = False
+        bought = lagging = False
         if sales is not None and bot_first is not None:
             # More held than the bot can still hold once the watchdog's sales known to
             # have filled are off: the owner bought since (even where IBKR no longer
@@ -2327,6 +2328,22 @@ class Engine:
                 and now - _aware(f.ts) < 2 * FILL_TIME_SKEW
             )
             bought = bought_since(held - recent, limit, base)
+            # More held than the bot can still hold only while those sales count: the read
+            # may lag them (pure bot), or the owner bought where no fill shows it (the
+            # retry right after a partial exit). Either way the bot holds at most its own
+            # units: sell no more, keeping the owner's known ones (the broker sizes again
+            # on a fresh read after the cancels, so a lagging read still sells them all).
+            lagging = not bought and bought_since(held, limit, base)
+        if lagging and limit is not None:
+            if not read:
+                self._reprotect_pending = True  # undecided, not "none of it": look again
+                return Cap(qty=0.0, keep=held, unread=True)
+            mine = self.broker.round_qty(
+                inst,
+                round(max(0.0, min(split.bot + split.unseen, limit)), 8),
+                allow_fractional=self.settings.allow_fractional_stocks,
+            )
+            return Cap(qty=mine, keep=max(0.0, split.owner))
         cap = sell_cap(held, limit, split, evidence=bought)
         if cap is None:
             return None
@@ -3250,13 +3267,42 @@ class Engine:
             for o in self.db.list_orders(limit=200, statuses=OPEN_ORDER_STATUSES)
         ):
             return True
-        return any(
+        if any(
             f.instrument.key == key
             and f.side == Side.BUY
             and _aware(f.ts) > exit_ts
             and self.db.get_order_by_broker_id(f.broker_order_id) is not None
             for f in self.db.list_fills(since=exit_ts, limit=FILL_QUERY_LIMIT)
+        ):
+            return True
+        return self._entry_unseen_held(key)
+
+    def _entry_unseen_held(self, key: str) -> bool:
+        """Part of the bot's entry for `key` filled beyond the journal's fills of it (the
+        rest of a partly filled entry filled while the app was down, on a day IBKR no
+        longer reports), or may have (an entry the app last saw working that IBKR no
+        longer lists), and the bot's journaled trades do not cover what it bought: those
+        units are still the bot's, so its position is not finished."""
+        meta = self.db.get_position_meta(key)
+        opened = meta.get("opened_at") if meta else None
+        if opened is None:
+            return False
+        since = _aware(opened) - FILL_TIME_SKEW
+        fills = [
+            f
+            for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+            if f.instrument.key == key and _aware(f.ts) >= since
+        ]
+        sure, unknown = app_entry_unjournaled(self.db, key, _aware(opened), fills, [])
+        if sure + unknown <= EPS:
+            return False
+        bought = sum(f.qty for f in fills if f.side == Side.BUY and not is_other_client(f))
+        journaled = sum(
+            trade.qty
+            for trade in self.db.list_trades(since=since, limit=1000)
+            if trade.instrument.key == key and _aware(trade.entry_ts) >= since
         )
+        return journaled < bought + sure + unknown - EPS
 
     def _bot_split(self, key: str, meta: dict[str, Any] | None, fills: list[Fill]) -> Split:
         """split_fills of a window of `key`'s fills for the bot position `meta` (None: no

@@ -1147,7 +1147,9 @@ fills show, and the owner is alerted).
 Evidence the owner bought is an owner buy in the window, more held than the entry asked
 for, or more held than the bot can still hold after its own sales (a partial exit leaves
 room under the entry's quantity; a sale of the app's of the last two minutes may not be in
-the position read yet and is not counted) or once the crypto watchdog's sales known to have
+the position read yet: when only those sales make room for what is held, the read may lag
+them or the owner bought where no fill shows it, and the exit sells at most the bot's own
+units, keeping the owner's known ones; undecided while the executions are unread) or once the crypto watchdog's sales known to have
 filled are off (with the executions unread, also its sales still working, at what they
 asked: its IOC is done only on its next poll, and until then the rest held may be the
 owner's). Without it nothing changes: every exit sells the whole position, as before. With it,
@@ -1227,7 +1229,11 @@ never adds to a position), so nothing bought before it, the owner's included, is
 it, and an owner sale the journal never saw cannot leave phantom units. Otherwise it starts
 at the bot's last journaled exit, as before; when that exit is a trip of this same
 position (a partly filled entry whose first part exited), it replays from the entry and
-skips the trip already journaled. Another client's sell beyond both sides' units
+skips the trip already journaled. Part of the bot's entry the journal never saw fill (its
+rest filled while the app was down, on a day IBKR no longer reports; an entry the app last
+saw working that IBKR no longer lists, or the engine forgot) keeps the metadata while the
+bot's journaled trades do not cover it: its units are still the bot's, and its stop and
+target are not cancelled as leftovers. Another client's sell beyond both sides' units
 (and the unseen part of the bot's entry) sold what was held before the window: it is
 nobody's there, never paired with the metadata's entry. A capped watchdog sale on an
 earlier day IBKR no longer reports (the owner's units next to the bot's) is journaled at an
