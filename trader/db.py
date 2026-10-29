@@ -424,10 +424,13 @@ class Database:
 
     def list_audit(self, limit: int | None = 50, action: str | None = None) -> list[dict[str, Any]]:
         """Newest first; `action` keeps only that kind of row, `limit` None keeps all."""
-        rows = self._all(
-            "SELECT * FROM audit WHERE (? IS NULL OR action = ?) ORDER BY id DESC LIMIT ?",
-            (action, action, -1 if limit is None else limit),
-        )
+        cap = -1 if limit is None else limit
+        if action is None:
+            rows = self._all("SELECT * FROM audit ORDER BY id DESC LIMIT ?", (cap,))
+        else:  # idx_audit_action
+            rows = self._all(
+                "SELECT * FROM audit WHERE action = ? ORDER BY id DESC LIMIT ?", (action, cap)
+            )
         return [
             {
                 "id": r["id"],

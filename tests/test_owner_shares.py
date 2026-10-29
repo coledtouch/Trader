@@ -649,8 +649,8 @@ def _watchdog_sells(
              side=Side.SELL, qty=sold, price=58900.0, commission=1.0, ts=h.clock())
     )  # fmt: skip
     marker = position_marker(meta)
-    if filled is None and record:
-        note_watchdog_sale(h.db, "CRYPTO:BTC", marker, "77", qty, h.clock())
+    if filled is None and record:  # as the watchdog keeps it once its sell is done
+        note_watchdog_sale(h.db, "CRYPTO:BTC", marker, "77", qty, h.clock(), done=True)
     h.db.audit("watchdog_close", {"instrument": "CRYPTO:BTC", "kind": "stop", "qty": qty,
                "filled": sold, "status": "submitted" if filled is None else "cancelled",
                "marker": marker}, actor="watchdog")  # fmt: skip

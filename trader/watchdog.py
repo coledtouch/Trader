@@ -37,7 +37,6 @@ from trader.models import (
     OPEN_ORDER_STATUSES,
     AssetClass,
     DayStats,
-    Fill,
     Instrument,
     Mode,
     OrderRecord,
@@ -51,6 +50,8 @@ from trader.models import (
 from trader.notify import Notifier
 from trader.ownership import (
     FILL_TIME_SKEW,
+    WATCHDOG_TAG_PREFIX,
+    app_sold_unjournaled,
     entry_qty,
     is_other_client,
     less_sold,
@@ -60,6 +61,8 @@ from trader.ownership import (
     read_sales_record,
     sell_cap,
     split_fills,
+    unreported_sales,
+    watchdog_filled,
     watchdog_sales,
 )
 from trader.risk import sane_exit_price
@@ -69,7 +72,7 @@ log = logging.getLogger(__name__)
 
 HEARTBEAT_KEY = "engine_heartbeat"
 KILL_REASON = "kill switch"
-TAG_PREFIX = "ai-trader-wd-"
+TAG_PREFIX = WATCHDOG_TAG_PREFIX
 APP_TAG_PREFIX = "ai-trader-"  # every order the app or this watchdog sends (order_trace_id)
 # kv: a bot position this watchdog sold flat (value: position_marker of its meta). The app
 # forgets the meta only once it runs again; until then a buy of the symbol is not the bot's.
@@ -460,12 +463,15 @@ class CryptoWatchdog:
         before). With the owner's coins next to the bot's: the bot's part from the journal
         the app kept until it stopped (another client's sells after this process's first
         sale are left out: they may be its own), less what this process sent to sell of
-        it, and never into the owner's journaled coins."""
+        it, and never into the owner's journaled coins while an exit of the app's may have
+        sold the bot's unseen."""
         opened = meta.get("opened_at")
         if not isinstance(opened, datetime):
             return None
         since = opened - FILL_TIME_SKEW
-        sales = watchdog_sales(self.db, key, position_marker(meta), opened)
+        marker = position_marker(meta)
+        sent = await self._sent_qty(key, meta)  # also keeps what done orders filled
+        sales = watchdog_sales(self.db, key, marker, opened)
         cut = sales[0] - FILL_TIME_SKEW if sales is not None else None
         fills = [
             f
@@ -479,16 +485,25 @@ class CryptoWatchdog:
             )
         ]
         limit = entry_qty(read_extra(self.db, key), meta)
-        split = split_fills(fills, entry=limit)
-        if not owner_evidence(held, limit, split):
+        split = split_fills(fills, entry=limit, entry_sent=opened)
+        # More held than the bot can still hold once its known sales are off: bought since.
+        filled = watchdog_filled(self.db, key, marker)
+        after = less_sold(split, filled[1]) if filled is not None else split
+        bought_since = limit is not None and held > after.bot + after.unseen + after.owner + (
+            max(1e-9, 1e-6 * limit)
+        )
+        if not owner_evidence(held, limit, split) and not bought_since:
             return None
-        # What this process sold of it is in no journaled fill (the app is down).
-        split = less_sold(split, await self._sent_qty(key, meta, sales))
-        cap = sell_cap(held, limit, split)
+        if cut is not None:
+            # What the journal shows of this process's sales (the app's estimate of an
+            # earlier day's) is out of the split already.
+            sent = unreported_sales(sent, fills, cut)
+        split = less_sold(split, sent)
+        cap = sell_cap(held, limit, split, evidence=True)
         if cap is None:
             return None
         mine = min(cap.qty, held)
-        if held - cap.keep < mine and self._app_sold_unjournaled(key, opened, fills):
+        if held - cap.keep < mine and app_sold_unjournaled(self.db, key, opened, fills):
             # Less held than the bot's and the owner's journaled units: an exit of the
             # app's the journal never saw may have sold the bot's. Never the owner's.
             mine = held - cap.keep
@@ -497,34 +512,14 @@ class CryptoWatchdog:
         mine = max(0.0, mine)
         return self.broker.round_qty(Instrument.from_key(key), round(mine, 8))
 
-    def _app_sold_unjournaled(self, key: str, opened: datetime, fills: list[Fill]) -> bool:
-        """A sell of the app's for this position since its last journaled fill: it may
-        have filled while the app was going down, before the journal saw it."""
-        last = max((f.ts.replace(tzinfo=f.ts.tzinfo or UTC) for f in fills), default=None)
-        start = opened if last is None else max(opened, last - FILL_TIME_SKEW)
-        start = start.replace(tzinfo=start.tzinfo or UTC)
-        for rec in self.db.list_orders(limit=200):
-            req = rec.request
-            created = rec.created_at.replace(tzinfo=rec.created_at.tzinfo or UTC)
-            if (
-                req.instrument.key == key
-                and req.side == Side.SELL
-                and not (req.trace_id or "").startswith(TAG_PREFIX)
-                and rec.status not in (OrderStatus.REJECTED, OrderStatus.BLOCKED)
-                and rec.status != OrderStatus.PENDING_APPROVAL
-                and created >= start
-            ):
-                return True
-        return False
-
-    async def _sent_qty(
-        self, key: str, meta: dict[str, Any], sales: tuple[datetime, float] | None
-    ) -> float:
+    async def _sent_qty(self, key: str, meta: dict[str, Any]) -> float:
         """What this watchdog sold of the position: an order that is done counts what
-        filled (an IOC sell may fill in part), one still working or unknown what it asked."""
+        filled (an IOC sell may fill in part), one still working or unknown what it asked.
+        Without a record (an older watchdog) its audit rows count."""
         marker = position_marker(meta)
         rec = read_sales_record(self.db, key, marker)
         if rec is None:
+            sales = watchdog_sales(self.db, key, marker, meta.get("opened_at"))
             return sales[1] if sales is not None else 0.0
         total = 0.0
         finished = set(rec.get("done", []))

@@ -83,12 +83,15 @@ from trader.ownership import (
     UNREPORTED_EXIT,
     WATCHDOG_SALES_PREFIX,
     Cap,
+    app_sold_unjournaled,
     entry_qty,
     less_sold,
     merge_fills,
+    owner_evidence,
     sell_cap,
     split_fills,
     unreported_sales,
+    watchdog_filled,
     watchdog_sales,
 )
 from trader.risk import (
@@ -2265,7 +2268,7 @@ class Engine:
             fresh, read = [], False
         fills = merge_fills(journal, fresh)
         limit = entry_qty(self._extra(key), meta)
-        split = split_fills(fills, bot_first_from=bot_first, entry=limit)
+        split = split_fills(fills, bot_first_from=bot_first, entry=limit, entry_sent=opened)
         if sales is not None and bot_first is not None:
             # The watchdog's sales no fill shows (an earlier day IBKR no longer reports)
             # came out of the bot's units all the same.
@@ -2285,17 +2288,70 @@ class Engine:
                 split.owner,
             )
             return Cap(qty=0.0, keep=held)
+        owner = cap.keep
+        short = split.bot + split.owner - held
+        if short > max(EPS, 1e-6 * held) and owner > EPS:
+            # Less held than the bot's and the owner's units: a sale on a day IBKR no
+            # longer reports. Another client's sells come out of the owner's units first,
+            # so unless one of the bot's own may have sold unseen, it was his.
+            if await self._bot_sold_unseen(inst, opened, fills, split.bot):
+                self._note_unknown_sale(inst, meta, held, split.bot, owner)
+            else:
+                owner = max(0.0, owner - short)
         mine = self.broker.round_qty(
-            inst, round(cap.qty, 8), allow_fractional=self.settings.allow_fractional_stocks
+            inst,
+            round(min(cap.qty, max(0.0, held - owner)), 8),
+            allow_fractional=self.settings.allow_fractional_stocks,
         )
         # Everything held now that is not the bot's stays: a sale of the bot's (its bracket
         # child) or a second close landing before this one's sell only shrinks it.
-        cap = Cap(qty=mine, keep=max(cap.keep, held - mine))
+        cap = Cap(qty=mine, keep=max(owner, held - mine))
         if mine < held - EPS:
             self._note_owner_shares(inst, meta, held, mine)
         if held - (split.bot + split.owner) > max(EPS, mine - split.bot, 1e-6 * held):
             self._note_unexplained(inst, meta, held, split.bot, split.owner)
         return cap
+
+    async def _bot_sold_unseen(
+        self, inst: Instrument, opened: datetime, fills: list[Fill], bot: float
+    ) -> bool:
+        """Whether a sell of the bot's may have filled where the fills do not show it: an
+        exit of the app's the journal may not have (trader/ownership.app_sold_unjournaled),
+        or, for a stock, its bracket stop no longer working for all its shares (a bracket
+        child has no journal row of its own)."""
+        if app_sold_unjournaled(self.db, inst.key, _aware(opened), fills):
+            return True
+        if inst.asset_class == AssetClass.CRYPTO:
+            return False  # no bracket at IBKR: every sell of the bot's is journaled
+        working = sum(
+            o.request.qty - o.filled_qty
+            for o in await self.broker.open_orders()
+            if o.request.instrument.key == inst.key
+            and o.request.side == Side.SELL
+            and o.request.stop_loss is not None
+            and o.status in OPEN_ORDER_STATUSES
+            and self.broker.can_cancel(o)
+        )
+        return working < bot - max(EPS, 1e-6 * bot)
+
+    def _note_unknown_sale(
+        self, inst: Instrument, meta: dict[str, Any], held: float, bot: float, owner: float
+    ) -> None:
+        """Less held than the bot's and the owner's units, sold where IBKR no longer
+        reports, and maybe by the bot: its exits keep off the owner's units. Once per
+        position."""
+        mark = (inst.key + ":unknown_sale", position_marker(meta))
+        if mark in self._owner_noted:
+            return
+        self._owner_noted.add(mark)
+        self._spawn_notify(
+            f"{inst.symbol}: whose sale?",
+            f"IBKR holds {held:g} {inst.symbol}; the fills show {bot:g} of the bot's and "
+            f"{owner:g} of yours, and {bot + owner - held:g} was sold where IBKR no longer "
+            "reports it. The bot cannot tell whose it was, so it sells only what is surely "
+            f"its own: check {inst.symbol} in IBKR.",
+            priority="urgent" if inst.asset_class == AssetClass.CRYPTO else "high",
+        )
 
     def _note_unexplained(
         self, inst: Instrument, meta: dict[str, Any], held: float, bot: float, owner: float
@@ -3111,7 +3167,7 @@ class Engine:
             sales = watchdog_sales(self.db, key, position_marker(meta), meta.get("opened_at"))
             bot_first = sales[0] - FILL_TIME_SKEW if sales is not None else None
             entry = entry_qty(self._extra(key), meta)
-        split = split_fills(fills, bot_first_from=bot_first, entry=entry)
+        split = split_fills(fills, bot_first_from=bot_first, entry=entry, entry_sent=opened)
         trips, open_qty = replay_fills(split.bot_fills, fallback)
         self._open_qty[key] = open_qty
         self._pending_trades.discard(key)
@@ -3316,21 +3372,26 @@ class Engine:
                 return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
         return None
 
-    async def _journal_watchdog_sale(self, key: str, meta: dict[str, Any], now: datetime) -> bool:
+    async def _journal_watchdog_sale(
+        self, key: str, meta: dict[str, Any], now: datetime, held: float
+    ) -> bool:
         """The crypto watchdog sold the bot's part of a position the owner also holds (so it
-        never marked it sold flat), on an earlier day IBKR no longer reports: journal that
-        sale at an estimate, as _close_unreported_exit does for a flat position, so the
-        bot's trade closes and its metadata is released. True when it is."""
+        never marked it sold flat), on an earlier day IBKR no longer reports: journal what
+        it saw filled at an estimate, as _close_unreported_exit does for a flat position,
+        so the bot's trade closes and its metadata is released. True when it is. Without
+        the owner's units next to it, everything held is the bot's, still unsold."""
         opened = meta.get("opened_at")
         if opened is None or Instrument.from_key(key).asset_class != AssetClass.CRYPTO:
             return False
-        sales = watchdog_sales(self.db, key, position_marker(meta), opened)
-        if sales is None:
+        marker = position_marker(meta)
+        filled = watchdog_filled(self.db, key, marker)  # what it saw done: never a guess
+        sales = watchdog_sales(self.db, key, marker, opened)
+        if filled is None or sales is None:
             return False
-        first, sold = sales
+        first, sold = filled
         if first >= trading_day_start(trading_day(now)):
             return False  # today's executions still report it
-        bot_first = first - FILL_TIME_SKEW
+        bot_first = sales[0] - FILL_TIME_SKEW
         fills = [
             f
             for f in self.db.list_fills(
@@ -3338,9 +3399,10 @@ class Engine:
             )
             if f.instrument.key == key
         ]
-        split = split_fills(
-            fills, bot_first_from=bot_first, entry=entry_qty(self._extra(key), meta)
-        )
+        limit = entry_qty(self._extra(key), meta)
+        split = split_fills(fills, bot_first_from=bot_first, entry=limit, entry_sent=opened)
+        if not owner_evidence(held, limit, split):
+            return False
         qty = round(min(unreported_sales(sold, fills, bot_first), split.bot + split.unseen), 8)
         price = meta.get("stop_loss") or meta.get("entry_price")
         if qty <= EPS or not price:
@@ -3382,6 +3444,7 @@ class Engine:
         """Forget engine metadata once a position is flat at the broker AND in the fills
         journal, and cancel exit orders it left behind (e.g. a re-placed stop)."""
         held = {p.instrument.key for p in positions if p.qty > 0}
+        held_qty = {p.instrument.key: p.qty for p in positions if p.qty > 0}
         buying = self._working_buys(open_orders)
         for key, meta in self.db.all_position_meta().items():
             # Sold by the crypto watchdog while the app was down, or the bot's trade for it
@@ -3394,7 +3457,7 @@ class Engine:
                 key in held
                 and not released
                 and key not in buying
-                and await self._journal_watchdog_sale(key, meta, now)
+                and await self._journal_watchdog_sale(key, meta, now, held_qty.get(key, 0.0))
             ):
                 closed = released = True
             if (key in held and not released) or key in buying or key in self._pending_trades:

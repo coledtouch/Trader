@@ -21,7 +21,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from trader.db import Database
-from trader.models import Fill, Side, exec_revision
+from trader.models import OPEN_ORDER_STATUSES, Fill, OrderStatus, Side, exec_revision
 
 # IBKRBroker.fills_since: an execution of another API client (the owner's TWS or IBKR
 # Mobile, or the crypto watchdog's own client id). This app's own executions (entries,
@@ -31,6 +31,7 @@ OTHER_CLIENT_PREFIX = "perm:"
 # IBKR's: a bot entry that fills at once can carry a time before its metadata's opened_at.
 FILL_TIME_SKEW = timedelta(seconds=60)
 EXTRA_PREFIX = "position_extra:"  # the engine's per-position kv (same key as engine.py)
+WATCHDOG_TAG_PREFIX = "ai-trader-wd-"  # trace ids of the crypto watchdog's own orders
 # kv: {"marker", "first", "orders": {broker order id: qty}}, the crypto watchdog's sells of
 # one bot position (an IOC sell may fill in part: the watchdog reads what each one filled).
 WATCHDOG_SALES_PREFIX = "watchdog_sales:"
@@ -81,6 +82,7 @@ def split_fills(
     *,
     bot_first_from: datetime | None = None,
     entry: float | None = None,
+    entry_sent: datetime | None = None,
 ) -> Split:
     """Who holds what of one instrument after `fills` (the window from the bot's entry, less
     FILL_TIME_SKEW), in time order. The bot's buys are this app's own executions (the bot
@@ -94,7 +96,10 @@ def split_fills(
 
     `entry` (the bot's entry quantity): the part of it no buy here shows may have filled
     unseen (on a day IBKR no longer reports). A sell of the bot's beyond its seen units
-    comes out of that part before the owner's (`Split.unseen` is what is left of it)."""
+    comes out of that part before the owner's (`Split.unseen` is what is left of it); so
+    does another client's beyond the owner's and the bot's seen units, unless it came
+    before the entry was sent (`entry_sent`) and any buy of the bot's: the symbol was flat
+    then, so it sold nothing of the bot's."""
     bot = owner = owner_bought = bot_bought = 0.0
     ordered = sorted(fills, key=lambda f: (_aware(f.ts), f.exec_id))
     seen = sum(f.qty for f in ordered if f.side == Side.BUY and not is_other_client(f))
@@ -102,6 +107,7 @@ def split_fills(
     out: list[Fill] = []
     flat_at: datetime | None = None
     start = _aware(bot_first_from) if bot_first_from is not None else None
+    sent_at = _aware(entry_sent) if entry_sent is not None else None
     for f in ordered:
         q = f.qty
         if q <= EPS:
@@ -129,7 +135,8 @@ def split_fills(
             owner -= o
             a = min(q - o, bot)
             bot -= a
-            u = min(q - o - a, unseen)
+            early = sent_at is not None and bot_bought <= EPS and _aware(f.ts) < sent_at
+            u = 0.0 if early else min(q - o - a, unseen)
             unseen -= u
             # Beyond those, units held from before the window were sold: nobody's here.
             on_bot = a + u
@@ -190,7 +197,9 @@ def owner_evidence(held: float, limit: float | None, split: Split) -> bool:
     return split.owner_bought > EPS or (limit is not None and held > limit + _tol(limit))
 
 
-def sell_cap(held: float, limit: float | None, split: Split) -> Cap | None:
+def sell_cap(
+    held: float, limit: float | None, split: Split, *, evidence: bool = False
+) -> Cap | None:
     """How much of `held` a bot exit may sell. None: nothing says the owner bought since
     the bot's entry was sent, so everything held is the bot's (sell it all, as before).
 
@@ -198,8 +207,8 @@ def sell_cap(held: float, limit: float | None, split: Split) -> Cap | None:
     reports, or while the app was down; `split` from split_fills(..., entry=limit)): units
     no fill explains count as the bot's when they fit in that part, so its own position
     keeps its exits. More than that, and whose they are is unknown: the bot sells only
-    what its fills show."""
-    if not owner_evidence(held, limit, split):
+    what its fills show. `evidence`: the caller found evidence of its own."""
+    if not evidence and not owner_evidence(held, limit, split):
         return None
     mine = split.bot
     if limit is not None:
@@ -233,29 +242,61 @@ def note_watchdog_sale(
     done: bool = False,
 ) -> None:
     """Record a sell of the watchdog's for this bot position: what it asked for while the
-    order works, what filled once it is `done` (then never read from the broker again)."""
+    order works, what filled once it is `done` (then never read from the broker again),
+    and when it was sent (`at`)."""
     rec = read_sales_record(db, key, marker) or {
         "marker": marker,
         "first": _aware(at).isoformat(),
         "orders": {},
     }
+    sent = rec.setdefault("at", {})
+    if order_id not in rec["orders"]:
+        sent[order_id] = _aware(at).isoformat()
     rec["orders"][order_id] = qty
     if done:
         rec["done"] = sorted({*rec.get("done", []), order_id})
     db.set_kv(WATCHDOG_SALES_PREFIX + key, json.dumps(rec))
 
 
+def _record_sales(rec: dict[str, Any], *, done_only: bool) -> tuple[datetime, float] | None:
+    """(first send, quantity) of the record's sells that may have sold something: a done
+    order by what filled (none: not a sale), one still working by what it asked (unless
+    `done_only`)."""
+    finished = set(rec.get("done", []))
+    sent = rec.get("at", {})
+    first: datetime | None = None
+    total = 0.0
+    for order_id, qty in rec.get("orders", {}).items():
+        q = float(qty)
+        if order_id in finished:
+            if q <= EPS:
+                continue  # it sold nothing
+        elif done_only:
+            continue
+        stamp = _aware(datetime.fromisoformat(sent.get(order_id, rec["first"])))
+        first = stamp if first is None or stamp < first else first
+        total += q
+    return None if first is None else (first, total)
+
+
+def watchdog_filled(db: Database, key: str, marker: str) -> tuple[datetime, float] | None:
+    """(first send, quantity) of what the watchdog's sells for this bot position are known
+    to have filled (orders it saw done). None without a record."""
+    rec = read_sales_record(db, key, marker)
+    return None if rec is None else _record_sales(rec, done_only=True)
+
+
 def watchdog_sales(
     db: Database, key: str, marker: str, opened: datetime | None
 ) -> tuple[datetime, float] | None:
-    """When the crypto watchdog first sent a sell for this bot position, and how much it
-    sold in all (what filled of an order that is done, what it asked of one still
-    working). The kv record first; audit rows of a watchdog from before the record existed
-    otherwise (by marker, or for rows without one, from the position's opened_at on)."""
+    """When the crypto watchdog first sent a sell for this bot position that may have sold
+    something, and how much it sold in all (what filled of an order that is done, what it
+    asked of one still working; a done order that filled nothing is no sale). The kv
+    record first; audit rows of a watchdog from before the record existed otherwise (by
+    marker, or for rows without one, from the position's opened_at on)."""
     rec = read_sales_record(db, key, marker)
     if rec is not None:
-        first = _aware(datetime.fromisoformat(rec["first"]))
-        return first, float(sum(float(q) for q in rec.get("orders", {}).values()))
+        return _record_sales(rec, done_only=False)
     first: datetime | None = None
     total = 0.0
     for row in db.list_audit(limit=None, action="watchdog_close"):
@@ -292,3 +333,37 @@ def unreported_sales(sold: float, fills: Iterable[Fill], first: datetime) -> flo
         and _aware(f.ts) >= start
     )
     return max(0.0, sold - seen)
+
+
+def app_sold_unjournaled(db: Database, key: str, opened: datetime, fills: Iterable[Fill]) -> bool:
+    """A sell of the app's for this bot position the journal may not show yet: sent since
+    its last journaled fill, or sent before it but still working or filled beyond what the
+    journal shows of it (an approved close carries its proposal's time). Rows never sent
+    (a rejected, expired or cancelled approval) sold nothing. The crypto watchdog's own
+    sells are not the app's."""
+    own = [f for f in fills if not is_other_client(f)]
+    journaled: dict[str, float] = {}
+    for f in own:
+        journaled[f.broker_order_id] = journaled.get(f.broker_order_id, 0.0) + f.qty
+    since = _aware(opened) - FILL_TIME_SKEW
+    last = max((_aware(f.ts) for f in fills), default=None)
+    start = since if last is None else max(since, last - FILL_TIME_SKEW)
+    for rec in db.list_orders(limit=200):
+        req = rec.request
+        if (
+            req.instrument.key != key
+            or req.side != Side.SELL
+            or (req.trace_id or "").startswith(WATCHDOG_TAG_PREFIX)
+            or not rec.broker_order_id
+            or rec.status == OrderStatus.REJECTED
+        ):
+            continue
+        created = _aware(rec.created_at)
+        if created >= start:
+            return True
+        if created >= since and (
+            rec.status in OPEN_ORDER_STATUSES
+            or rec.filled_qty > journaled.get(rec.broker_order_id, 0.0) + EPS
+        ):
+            return True
+    return False
