@@ -11,6 +11,7 @@ import pytest
 
 from tests.test_engine import (
     _BTC,
+    NOW,
     _part,
     _restart_next_morning,
     _resting_entry,
@@ -27,13 +28,14 @@ from trader.models import (
     OPEN_ORDER_STATUSES,
     AIDecision,
     AssetClass,
+    Fill,
     Mode,
     OrderRecord,
     OrderStatus,
     Side,
     TradeAction,
 )
-from trader.ownership import EXTRA_PREFIX, REST_SETTLED
+from trader.ownership import EXTRA_PREFIX, REST_SETTLED, split_fills
 from trader.timeutil import trading_day, trading_day_start
 from trader.watchdog import CryptoWatchdog, sold_by_watchdog
 
@@ -506,3 +508,111 @@ async def test_an_owner_buy_a_lagging_read_hides_is_never_sold_with_the_executio
     rec = await h.engine.close_position("STK:F")
     assert rec.request.qty == 24
     assert h.broker.pos["STK:F"][0] == 50
+
+
+# ------------------------------------------------- from the round 48 fuzz triage
+async def test_his_sale_and_the_bots_stop_are_never_one_trade_larger_than_its_entry(
+    db, config
+) -> None:
+    """Wednesday the bot's 24 F fill after the app went down and the owner buys 30 that
+    afternoon (Thursday's executions show neither). Thursday he sells his 30 as the app
+    comes back and the bot's stop sells its 24 half a minute later: two orders, so the
+    journal has one bot trade of 24, never one of 48."""
+    h = await harness(db, config, now=datetime(2026, 10, 28, 14, 0, tzinfo=UTC), mode=Mode.PAPER,
+                      exits={"time_stop_minutes": 0})  # fmt: skip
+    entry, total = await _resting_entry(h)
+    assert total == 24
+    await ticks(h, 2, seconds=15)
+    h.clock.t = datetime(2026, 10, 28, 17, 0, tzinfo=UTC)
+    _part(h.broker, entry, total, 10.01)
+    h.clock.t = datetime(2026, 10, 28, 19, 45, tzinfo=UTC)
+    owner_buys(h, F, 30, 10.4)
+    h.engine = _restart_next_morning(h, config)
+    owner_sells(h, F, 30, 9.9)
+    await ticks(h, 2, seconds=15)
+    h.broker.set_price("F", 9.7)
+    await ticks(h, 20, seconds=15)
+    assert "STK:F" not in h.broker.pos
+    assert [t.qty for t in db.list_trades()] == [24]
+
+
+def _btc(exec_id: str, side: Side, qty: float, minute: int, broker_order_id: str) -> Fill:
+    return Fill(exec_id=exec_id, broker_order_id=broker_order_id, instrument=_BTC, side=side,
+                qty=qty, price=60000.0, commission=2.0,
+                ts=NOW + timedelta(minutes=minute))  # fmt: skip
+
+
+def test_a_sale_in_the_watchdogs_window_never_credits_the_bot_over_its_entry() -> None:
+    """The bot's entry of 0.5 BTC filled 0.3 where the app sees it (the rest on a day IBKR no
+    longer reports); the crypto watchdog sells, and another client's sale of 0.8 inside its
+    window also takes 0.3 the owner held from before the window. The bot's journal gets its
+    whole entry, 0.5, as sold, never the 0.8."""
+    s = split_fills(
+        [_btc("E1", Side.BUY, 0.3, 1, "41"), _btc("W1", Side.SELL, 0.8, 5, "perm:77")],
+        bot_first_from=NOW + timedelta(minutes=4),
+        entry=0.5,
+        entry_sent=NOW,
+    )
+    sells = [f for f in s.bot_fills if f.side == Side.SELL]
+    assert [f.qty for f in sells] == [pytest.approx(0.5)]
+    assert sells[0].commission == pytest.approx(2.0 * 0.5 / 0.8)
+    assert (s.bot, s.unseen, s.owner) == (0, 0, 0)
+
+
+async def test_an_unreported_target_sale_never_lets_close_sell_his_shares(db, config) -> None:
+    """Wednesday, the app down from the bot's entry on: the entry fills 24 F, its target
+    sells 14 of them and the owner buys 24; he sells 12 just after midnight (the only fill
+    Thursday's executions show). Thursday the target sells the bot's last 10 and he buys 10
+    more: all 22 held are his, and Close sells none of them."""
+    h = await harness(db, config, now=datetime(2026, 10, 28, 15, 0, tzinfo=UTC), mode=Mode.PAPER,
+                      exits={"time_stop_minutes": 0})  # fmt: skip
+    entry, total = await _resting_entry(h)
+    assert total == 24
+    h.clock.t = datetime(2026, 10, 28, 17, 0, tzinfo=UTC)
+    _part(h.broker, entry, 24, 10.01)
+    _part(h.broker, f"{entry}-TP", 14, 10.5)
+    stop = h.broker.orders[f"{entry}-SL"]  # the OCA group shrinks the sibling stop
+    stop.request = stop.request.model_copy(update={"qty": 10})
+    h.clock.t = datetime(2026, 10, 28, 19, 45, tzinfo=UTC)
+    owner_buys(h, F, 24, 10.4)
+    h.clock.t = datetime(2026, 10, 29, 4, 6, tzinfo=UTC)
+    owner_sells(h, F, 12, 10.3)
+    h.engine = _restart_next_morning(h, config)
+    await ticks(h, 3, seconds=15)
+    h.clock.advance(minutes=1)
+    _part(h.broker, f"{entry}-TP", 10, 10.5)
+    stop.status = OrderStatus.CANCELLED  # OCA: the target filled, the stop is cancelled
+    owner_buys(h, F, 10, 10.5)
+    await ticks(h, 4, seconds=15)
+    assert h.broker.pos["STK:F"][0] == 22
+    with pytest.raises(ValueError, match="none of the 22 F held is the bot's"):
+        await h.engine.close_position("STK:F")
+    assert h.broker.pos["STK:F"][0] == 22
+    assert bot_sells(h, "STK:F") == []
+
+
+async def test_his_sale_seen_first_after_a_restart_is_never_a_bot_trade(db, config) -> None:
+    """Wednesday the bot's resting entry of 24 F fills with the app down and the owner buys
+    3 that evening; no fill shows either. Thursday he sells his 3 just as the app comes
+    back: no bot trade is journaled at his sale, and the bot's stop later sells its 24 as
+    one trade of 24."""
+    h = await harness(db, config, now=datetime(2026, 10, 28, 14, 0, tzinfo=UTC),
+                      mode=Mode.PAPER, exits={"time_stop_minutes": 0})  # fmt: skip
+    entry, total = await _resting_entry(h)
+    assert total == 24
+    await ticks(h, 2, seconds=15)
+    h.clock.t = datetime(2026, 10, 28, 17, 0, tzinfo=UTC)
+    _part(h.broker, entry, total, 10.01)
+    h.clock.t = datetime(2026, 10, 28, 19, 0, tzinfo=UTC)
+    owner_buys(h, F, 3, 10.0)
+    h.engine = _restart_next_morning(h, config)
+    owner_sells(h, F, 3, 10.1)
+    await ticks(h, 1, seconds=15)
+    assert db.list_trades() == []
+    await ticks(h, 8, seconds=15)
+    assert db.list_trades() == []
+    assert h.broker.pos["STK:F"][0] == 24
+    h.broker.set_price("F", 9.5)
+    await ticks(h, 10, seconds=15)
+    assert "STK:F" not in h.broker.pos
+    assert [t.qty for t in db.list_trades()] == [24]
