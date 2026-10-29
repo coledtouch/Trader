@@ -1164,6 +1164,8 @@ class Engine:
                 # A position the bot opened, with shares the owner bought next to it: Close
                 # sells the bot's own. One the bot did not open is the owner's: all of it.
                 cap = await self._bot_cap(held.instrument) if bot_position else None
+                if cap is not None and cap.unread:
+                    raise BrokerError("the broker's executions could not be read: try again")
                 if cap is not None and cap.qty <= EPS:
                     raise ValueError(
                         f"none of the {held.qty:g} {inst.symbol} held is the bot's: you bought "
@@ -1360,6 +1362,8 @@ class Engine:
                 seq = self._mark_closing(key, order.reason, self._now())
                 try:
                     cap = await self._bot_cap(order.instrument)
+                    if cap is not None and cap.unread:  # the approval stays pending
+                        raise BrokerError("the broker's executions could not be read: try again")
                     if cap is not None and cap.qty <= EPS:
                         self._unmark_closing(key, seq)
                         self.db.update_order(
@@ -2270,7 +2274,13 @@ class Engine:
             fresh, read = [], False
         fills = merge_fills(journal, fresh)
         limit = entry_qty(self._extra(key), meta)
-        split = split_fills(fills, bot_first_from=bot_first, entry=limit, entry_sent=opened)
+        split = split_fills(
+            fills,
+            bot_first_from=bot_first,
+            bot_first_qty=sales[1] if sales is not None else None,
+            entry=limit,
+            entry_sent=opened,
+        )
         bought = False
         if sales is not None and bot_first is not None:
             # More held than the bot can still hold once the watchdog's sales known to
@@ -2297,7 +2307,8 @@ class Engine:
                 split.bot,
                 split.owner,
             )
-            return Cap(qty=0.0, keep=held)
+            self._reprotect_pending = True  # undecided, not "none of it": look again
+            return Cap(qty=0.0, keep=held, unread=True)
         owner = cap.keep
         short = split.bot + split.owner - held
         if short > max(EPS, 1e-6 * held) and owner > EPS:
@@ -2307,7 +2318,17 @@ class Engine:
             if await self._bot_sold_unseen(inst, opened, fills, split.bot):
                 self._note_unknown_sale(inst, meta, held, split.bot, owner)
             else:
-                owner = max(0.0, owner - short)
+                # Only units he held before today were in it (today's executions still
+                # report a sale): what he bought since was not sold.
+                today = trading_day_start(trading_day(self._now()))
+                before = split_fills(
+                    [f for f in fills if _aware(f.ts) < today],
+                    bot_first_from=bot_first,
+                    bot_first_qty=sales[1] if sales is not None else None,
+                    entry=limit,
+                    entry_sent=opened,
+                )
+                owner = max(0.0, owner - min(short, before.owner))
         mine = self.broker.round_qty(
             inst,
             round(min(cap.qty, max(0.0, held - owner)), 8),
@@ -3178,12 +3199,15 @@ class Engine:
         fallback = None
         if meta and meta.get("entry_price"):
             fallback = (float(meta["entry_price"]), meta.get("opened_at") or now)
-        bot_first = entry = None
+        bot_first = entry = budget = None
         if meta is not None:
             sales = watchdog_sales(self.db, key, position_marker(meta), meta.get("opened_at"))
             bot_first = sales[0] - FILL_TIME_SKEW if sales is not None else None
+            budget = sales[1] if sales is not None else None
             entry = entry_qty(self._extra(key), meta)
-        split = split_fills(fills, bot_first_from=bot_first, entry=entry, entry_sent=opened)
+        split = split_fills(
+            fills, bot_first_from=bot_first, bot_first_qty=budget, entry=entry, entry_sent=opened
+        )
         trips, open_qty = replay_fills(split.bot_fills, fallback)
         self._open_qty[key] = open_qty
         self._pending_trades.discard(key)
@@ -3424,7 +3448,9 @@ class Engine:
             if f.instrument.key == key
         ]
         limit = entry_qty(self._extra(key), meta)
-        split = split_fills(fills, bot_first_from=bot_first, entry=limit, entry_sent=opened)
+        split = split_fills(
+            fills, bot_first_from=bot_first, bot_first_qty=sales[1], entry=limit, entry_sent=opened
+        )
         unseen_sold = unreported_sales(sold, fills, bot_first)
         if not owner_evidence(held, limit, split) and not bought_since(
             held, limit, less_sold(split, unseen_sold)

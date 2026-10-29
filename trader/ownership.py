@@ -56,6 +56,7 @@ class Split:
 class Cap:
     qty: float  # most the bot may sell
     keep: float  # the owner's known units: never sell below held - keep
+    unread: bool = False  # qty 0 only because the broker's executions could not be read
 
 
 def _aware(ts: datetime) -> datetime:
@@ -81,6 +82,7 @@ def split_fills(
     fills: Iterable[Fill],
     *,
     bot_first_from: datetime | None = None,
+    bot_first_qty: float | None = None,
     entry: float | None = None,
     entry_sent: datetime | None = None,
 ) -> Split:
@@ -90,9 +92,11 @@ def split_fills(
     owner's. This app's own sell comes out of the bot's units first. Another client's sell
     comes out of the owner's first (the owner's round trip leaves the bot's shares alone),
     except from `bot_first_from` on: the crypto watchdog sold this position then, and its
-    sells are not told apart from the owner's. Another client's sell beyond both sides'
-    units sold what was held before the window: nobody's here. Errs low on the bot's side,
-    never high.
+    sells are not told apart from the owner's. At most `bot_first_qty` (what the watchdog
+    may have sold in all; None: no bound) of them is taken that way: beyond it, another
+    client's sells cannot be the watchdog's and come out of the owner's units first.
+    Another client's sell beyond both sides' units sold what was held before the window:
+    nobody's here. Errs low on the bot's side, never high.
 
     `entry` (the bot's entry quantity): the part of it no buy here shows may have filled
     unseen (on a day IBKR no longer reports). A sell of the bot's beyond its seen units
@@ -107,6 +111,7 @@ def split_fills(
     out: list[Fill] = []
     flat_at: datetime | None = None
     start = _aware(bot_first_from) if bot_first_from is not None else None
+    budget = None if bot_first_qty is None else max(0.0, bot_first_qty) + _tol(bot_first_qty)
     sent_at = _aware(entry_sent) if entry_sent is not None else None
     for f in ordered:
         q = f.qty
@@ -128,23 +133,31 @@ def split_fills(
             # bot's previous trip, or units held from before the window).
             owner -= min(q, owner)
             on_bot = 0.0
-        elif not other or (start is not None and _aware(f.ts) >= start):
-            a = min(q, bot)
-            bot -= a
-            u = min(q - a, unseen)
-            unseen -= u
-            b = min(q - a - u, owner)
-            owner -= b
-            on_bot = q - b
         else:
-            o = min(q, owner)
-            owner -= o
-            a = min(q - o, bot)
+            lead = 0.0  # the part sold out of the bot's units first
+            if not other:
+                lead = q
+            elif start is not None and _aware(f.ts) >= start:
+                lead = q if budget is None else min(q, budget)
+                if budget is not None:
+                    budget -= lead
+            a = min(lead, bot)
             bot -= a
-            u = min(q - o - a, unseen)
+            u = min(lead - a, unseen)
             unseen -= u
-            # Beyond those, units held from before the window were sold: nobody's here.
-            on_bot = a + u
+            b = min(lead - a - u, owner)
+            owner -= b
+            on_bot = lead - b
+            rest = q - lead  # another client's: out of the owner's units first
+            if rest > EPS:
+                o = min(rest, owner)
+                owner -= o
+                a = min(rest - o, bot)
+                bot -= a
+                u = min(rest - o - a, unseen)
+                unseen -= u
+                # Beyond those, units held from before the window were sold: nobody's here.
+                on_bot += a + u
         if on_bot > EPS:
             out.append(
                 f
@@ -188,7 +201,7 @@ def entry_qty(extra: Mapping[str, Any], meta: Mapping[str, Any]) -> float | None
         return float(qty)
     risk, unit = meta.get("initial_risk"), extra.get("unit_risk")
     if isinstance(risk, int | float) and isinstance(unit, int | float) and risk > 0 and unit > 0:
-        return round(risk / unit, 6)
+        return round(risk / unit, 10)  # as fine as a crypto quantity, without float noise
     return None
 
 
@@ -365,18 +378,16 @@ def unreported_sales(sold: float, fills: Iterable[Fill], first: datetime) -> flo
 
 
 def app_sold_unjournaled(db: Database, key: str, opened: datetime, fills: Iterable[Fill]) -> bool:
-    """A sell of the app's for this bot position the journal may not show yet: sent since
-    its last journaled fill, or sent before it but still working or filled beyond what the
-    journal shows of it (an approved close carries its proposal's time). Rows never sent
-    (a rejected, expired or cancelled approval) sold nothing. The crypto watchdog's own
-    sells are not the app's."""
+    """A sell of the app's for this bot position the journal may not show yet: one still
+    working (its fills may come), or one that filled beyond what the journal shows of it.
+    A done sell whose fills the journal shows sold nothing unseen; rows never sent (a
+    rejected, expired or cancelled approval) sold nothing. The crypto watchdog's own sells
+    are not the app's."""
     own = [f for f in fills if not is_other_client(f)]
     journaled: dict[str, float] = {}
     for f in own:
         journaled[f.broker_order_id] = journaled.get(f.broker_order_id, 0.0) + f.qty
     since = _aware(opened) - FILL_TIME_SKEW
-    last = max((_aware(f.ts) for f in fills), default=None)
-    start = since if last is None else max(since, last - FILL_TIME_SKEW)
     for rec in db.list_orders(limit=200):
         req = rec.request
         if (
@@ -387,10 +398,7 @@ def app_sold_unjournaled(db: Database, key: str, opened: datetime, fills: Iterab
             or rec.status == OrderStatus.REJECTED
         ):
             continue
-        created = _aware(rec.created_at)
-        if created >= start:
-            return True
-        if created >= since and (
+        if _aware(rec.created_at) >= since and (
             rec.status in OPEN_ORDER_STATUSES
             or rec.filled_qty > journaled.get(rec.broker_order_id, 0.0) + EPS
         ):

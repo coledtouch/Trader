@@ -1127,8 +1127,10 @@ them in time order: this app's own executions (its entry, bracket children, clos
 re-placed stops) are the bot's buys, and its sells come out of the bot's units first;
 another client's (`perm:`) buys are the owner's, and another client's sells come out of the
 owner's units first (out of the bot's first from the crypto watchdog's first sale of the
-position on: its sells are not told apart from the owner's). The entry's quantity
-(`position_extra.qty`, older rows: planned risk over risk per unit) bounds the bot's part:
+position on: its sells are not told apart from the owner's; at most what the watchdog may
+have sold in all, beyond which another client's sells are the owner's again). The entry's quantity
+(`position_extra.qty`, older rows: planned risk over risk per unit, to 10 decimals so an
+8-decimal crypto quantity is not read as more than the entry) bounds the bot's part:
 the bot never adds to a position. Part of the entry may be in no fill (it filled on a day
 IBKR no longer reports): a sell of the bot's beyond its seen units comes out of that unseen
 part before the owner's (so does another client's beyond the owner's and the bot's seen
@@ -1154,11 +1156,14 @@ sized again after its cancels, sold less than the bot's part or nothing (the own
 between) is not left in flight: the next tick re-protects and re-sizes the bot's units. The
 fills are the journal and the broker's executions (the journal alone is a tick behind: a bot
 sale and an equal owner buy since then would net out); when the executions read fails and
-the journal does not explain the position, nothing is sold until it can. Sales of the crypto
+the journal does not explain the position, nothing is sold until it can (undecided, not
+"none of it is the bot's": re-protect looks again next tick, Close reports a broker error to
+retry, an approval stays pending). Sales of the crypto
 watchdog's that no fill shows (an earlier day IBKR no longer reports) come out of the bot's
 units. Less held than the bot's and the owner's units (a sale on a day IBKR no longer
 reports) is the owner selling his, since another client's sells come out of his units
-first, unless one of the bot's own may have sold unseen (an app sell the journal may not
+first (only units he held before today: today's executions would show a sale of what he
+bought since), unless one of the bot's own may have sold unseen (an app sell the journal may not
 show: `ownership.app_sold_unjournaled`; for a stock, its bracket stop no longer working for
 all its shares): then the bot sells only what is surely its own and the owner is alerted
 once ("whose sale?"). A sell that would come out at 0 is a cap of 0 (nothing cancelled).
@@ -1172,9 +1177,9 @@ own; a sale the app already journaled at an estimate is not taken off twice), le
 already sold of the position. More held than the bot can still hold once its known (done)
 sales are off is the owner buying since: then it sells only the bot's part too. It never
 sells into the owner's journaled units when an exit of the app's may have sold the bot's
-unseen (`ownership.app_sold_unjournaled`: an app sell sent since the last journaled fill, or
-sent before it but still working or filled beyond what the journal shows; rows never sent,
-such as a rejected or expired approval, do not count); otherwise less held than both is the
+unseen (`ownership.app_sold_unjournaled`: an app sell still working or filled beyond what
+the journal shows of it; a done sell the journal fully shows, and rows never sent, such as
+a rejected or expired approval, do not count); otherwise less held than both is the
 owner selling his (another client's sells come out of his units first) and the bot's units
 are still sold. It records each sell that was accepted or filled anything in kv
 `watchdog_sales:<key>` (`{"marker", "first", "orders": {order id: qty}, "at": {order id:
