@@ -79,8 +79,10 @@ from trader.models import (
 )
 from trader.notify import Notifier
 from trader.ownership import (
+    APPROVAL_TTL,
     FILL_TIME_SKEW,
     ORDER_FORGOTTEN,
+    SENT_PREFIX,
     UNREPORTED_EXIT,
     WATCHDOG_SALES_PREFIX,
     Cap,
@@ -92,6 +94,7 @@ from trader.ownership import (
     merge_fills,
     owner_evidence,
     sell_cap,
+    sent_at,
     split_fills,
     unreported_sales,
     watchdog_filled,
@@ -142,7 +145,6 @@ def _app_order_trace(trace: str | None) -> str | None:
     return trace
 
 
-APPROVAL_TTL = timedelta(minutes=10)
 ENTRY_ORDER_TTL = timedelta(minutes=10)  # unfilled entry orders are cancelled after this
 EQUITY_POINT_EVERY = timedelta(minutes=5)
 # A balance change after the account has been flat (no position, no working order, no fill)
@@ -197,7 +199,6 @@ EXTRA_PREFIX = "position_extra:"
 BASELINE_PREFIX = "halt_baseline:"
 ACCOUNT_KEY = "broker_account"  # kv: the broker account id the journal belongs to
 HALT_SEEN_PREFIX = "halt_seen:"  # kv: when an instrument was last seen halted (cooldown)
-SENT_PREFIX = "order_sent:"  # kv: when an approved order was actually sent (order id)
 OWNER_CLOSED_PREFIX = "owner_closed:"  # kv: trading day the owner closed this instrument
 # Engine-side stops/targets/time stops and the daily halts fire only when the breach is
 # seen on this many consecutive monitor ticks (one bad tick never sells or flattens).
@@ -2298,8 +2299,11 @@ class Engine:
         if sales is not None and bot_first is not None:
             # More held than the bot can still hold once the watchdog's sales known to
             # have filled are off: the owner bought since (even where IBKR no longer
-            # reports it, and less than the bot's entry).
-            done = watchdog_filled(self.db, key, position_marker(meta))
+            # reports it, and less than the bot's entry). With the executions unread, a
+            # sale of its still working counts at what it asked (an IOC fills at once, and
+            # its record says done only on the watchdog's next poll): overstated, the bot
+            # only waits, undecided, for that poll.
+            done = watchdog_filled(self.db, key, position_marker(meta)) if read else sales
             if done is not None:
                 sold = unreported_sales(done[1], fills, bot_first, bot_until)
                 bought = bought_since(held, limit, less_sold(split, sold))
@@ -3115,14 +3119,8 @@ class Engine:
             log.info("cancelled stale entry order %s for %s", rec.id, req.instrument.key)
 
     def _sent_at(self, rec: OrderRecord) -> datetime:
-        """When an order went to the broker: its journal time, or the approval time for an
-        order that waited for the owner."""
-        created = _aware(rec.created_at)
-        raw = self.db.get_kv(SENT_PREFIX + str(rec.id)) if rec.id is not None else None
-        if raw:
-            with contextlib.suppress(ValueError):
-                return max(created, _aware(datetime.fromisoformat(raw)))
-        return created
+        """When an order went to the broker (ownership.sent_at)."""
+        return sent_at(self.db, rec)
 
     async def _sync_fills(self, now: datetime) -> None:
         """Journal new fills (deduped by exec_id), apply late commission reports, and
@@ -4497,6 +4495,9 @@ class Engine:
             except BrokerError as exc:
                 log.warning("CLOSE %s: the bot's part not read (%s)", inst.key, exc)
                 cap = None
+            if cap is not None and cap.unread:
+                log.warning("CLOSE %s: the broker's executions not read", inst.key)
+                cap = None  # sized when approved (approve_order reads the bot's part again)
             if cap is not None:
                 if cap.qty <= EPS:
                     log.info("CLOSE %s: none of it is the bot's", inst.key)
@@ -4520,6 +4521,13 @@ class Engine:
                 return
             seq = self._mark_closing(inst.key, req.reason, self._now())
             cap = await self._bot_cap(inst)
+            if cap is not None and cap.unread:
+                # Undecided, not "none of it is the bot's": nothing is sold, and the monitor
+                # keeps checking the stop (its undecided exit alerts; crypto goes to the
+                # watchdog). The next cycle may ask again.
+                self._unmark_closing(inst.key, seq)
+                log.warning("CLOSE %s: the broker's executions not read; nothing sold", inst.key)
+                return
             if cap is not None and cap.qty <= EPS:
                 self._note_close(inst.key, None, seq)  # only the owner's shares are held
                 log.info("CLOSE %s: none of it is the bot's", inst.key)

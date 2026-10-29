@@ -579,10 +579,13 @@ _ENTRY_TRACE = "ai-trader-0123456789abcdef"
 
 
 def _entry_outage(db: Database, broker: FakeBroker, *, journaled: float, held: float,
-                  working_filled: float | None) -> None:  # fmt: skip
+                  working_filled: float | None,
+                  proposed_before: timedelta = timedelta(0)) -> None:  # fmt: skip
     """The bot's BTC entry of 0.01 (its journal row as the engine writes it), `journaled`
     of it in the journal; the owner's 0.5 journaled; `held` at the broker now, the bid
-    below the bot's stop. `working_filled`: the entry still works there with that fill."""
+    below the bot's stop. `working_filled`: the entry still works there with that fill.
+    `proposed_before`: an entry that waited for approval (its row is as old as the
+    proposal, its tag the journal id's, its send time in kv)."""
     from tests.test_watchdog import crypto, q
     from trader.models import Position
 
@@ -591,12 +594,17 @@ def _entry_outage(db: Database, broker: FakeBroker, *, journaled: float, held: f
     db.set_position_meta(btc.key, stop_loss=95.0, take_profit=110.0, entry_price=100.0,
                          initial_risk=5.0 * BOT, opened_at=opened)  # fmt: skip
     db.set_kv("position_extra:" + btc.key, json.dumps({"unit_risk": 5.0, "qty": BOT}))
+    approved = proposed_before > timedelta(0)
     req = OrderRequest(instrument=btc, side=Side.BUY, qty=BOT, order_type=OrderType.LIMIT,
                        limit_price=100.0, stop_loss=95.0, take_profit=110.0,
-                       trace_id=_ENTRY_TRACE)  # fmt: skip
+                       trace_id=None if approved else _ENTRY_TRACE)  # fmt: skip
     status = OrderStatus.PARTIALLY_FILLED if journaled else OrderStatus.SUBMITTED
-    db.insert_order(OrderRecord(request=req, status=status, broker_order_id="12",
-                                filled_qty=journaled, created_at=opened))  # fmt: skip
+    oid = db.insert_order(OrderRecord(request=req, status=status, broker_order_id="12",
+                                      filled_qty=journaled,
+                                      created_at=opened - proposed_before))  # fmt: skip
+    if approved:
+        db.set_kv(f"order_sent:{oid}", opened.isoformat())
+        req = req.model_copy(update={"trace_id": f"ai-trader-{oid}"})  # as IBKR reads it back
     if journaled:
         at = opened + timedelta(seconds=5)
         db.insert_fill(Fill(exec_id="E1", broker_order_id="12", instrument=btc, side=Side.BUY,
@@ -668,3 +676,134 @@ async def test_an_entry_gone_in_the_outage_with_an_owner_sale_alerts(
     placed, sent = await _watchdog_outage(db, broker)
     assert placed == ([journaled] if journaled else [])
     assert "Crypto watchdog: the bot's part unknown" in sent
+
+
+# ----------------------------------------------------------------------------- review 44
+async def test_the_engine_waits_while_the_watchdogs_sale_is_open(db, config) -> None:
+    """The owner bought less BTC than the bot's entry and the executions read keeps
+    failing: the engine's stop is undecided and the watchdog takes over, selling the bot's
+    part. Until its next poll marks that IOC done, the engine must not take what is left
+    (the owner's coins) for the bot's."""
+    from trader.watchdog import CryptoWatchdog, WatchdogSettings
+
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 15, 0, tzinfo=UTC))
+    mine = h.broker.pos[KEY][0]
+    owner_buys(h, _BTC, 0.004, 60000.0)
+
+    async def failing(since):
+        raise BrokerError("IBKR executions timed out after 10s")
+
+    h.broker.fills_since = failing
+    _, notes = make(db, h.broker, h.clock)
+    wd = CryptoWatchdog(db, h.broker, WatchdogSettings(), notes, h.clock,
+                        started_at=h.clock() - timedelta(hours=1))  # fmt: skip
+    h.broker.set_price("BTC", 58500.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    await ticks(h, 5, seconds=15)
+    assert bot_sells(h, KEY) == []
+    await wd.tick()
+    h.clock.advance(seconds=5)
+    await wd.tick()
+    assert [r.qty for r in h.broker.placed if r.side == Side.SELL] == [pytest.approx(mine)]
+    h.clock.advance(seconds=5)
+    await h.engine.monitor_tick()  # before the watchdog's next poll
+    assert h.broker.pos[KEY][0] == pytest.approx(0.004)
+    h.clock.advance(seconds=5)
+    await wd.tick()  # marks its IOC done
+    await ticks(h, 2, seconds=15)
+    assert h.broker.pos[KEY][0] == pytest.approx(0.004)
+
+
+async def test_an_undecided_ai_close_leaves_the_crypto_stop_watched(db, config) -> None:
+    """The AI keeps asking to close the owner-shared BTC (autopilot) while the executions
+    read fails and the bid is under the bot's stop: each CLOSE is undecided, so it must
+    not mark the position closing (no stop check, a fresh heartbeat): the watchdog still
+    takes over and sells the bot's part."""
+    from trader.models import AIDecision
+    from trader.watchdog import CryptoWatchdog, WatchdogSettings
+
+    h = await _hold_btc(db, config, datetime(2026, 10, 29, 15, 0, tzinfo=UTC))
+    mine = h.broker.pos[KEY][0]
+    owner_buys(h, _BTC, 0.004, 60000.0)
+
+    async def failing(since):
+        raise BrokerError("IBKR executions timed out after 10s")
+
+    h.broker.fills_since = failing
+    _, notes = make(db, h.broker, h.clock)
+    wd = CryptoWatchdog(db, h.broker, WatchdogSettings(), notes, h.clock,
+                        started_at=h.clock() - timedelta(hours=1))  # fmt: skip
+    h.broker.set_price("BTC", 58500.0, asset_class=AssetClass.CRYPTO, spread=10.0)
+    for i in range(12):
+        h.clock.advance(seconds=15)
+        if i % 4 == 0:
+            h.decider.decisions = [
+                AIDecision(action=TradeAction.CLOSE, symbol="BTC", asset_class=AssetClass.CRYPTO,
+                           conviction=0.8, rationale="breaking down")
+            ]  # fmt: skip
+            await h.engine.run_cycle()
+            h.decider.decisions = []
+        else:
+            await h.engine.monitor_tick()
+        await wd.tick()
+    assert [r.qty for r in h.broker.placed if r.side == Side.SELL] == [pytest.approx(mine)]
+    assert h.broker.pos[KEY][0] == pytest.approx(0.004)
+
+
+@pytest.mark.parametrize("journaled", [0.0, 0.004])
+async def test_the_watchdog_reads_an_approved_entry_too(db: Database, journaled: float) -> None:
+    """The entry waited 3 minutes for the owner's approval (its journal row is as old as
+    the proposal): the watchdog still sells what IBKR says it filled."""
+    broker = FakeBroker()
+    _entry_outage(db, broker, journaled=journaled, held=0.007 + 0.3, working_filled=0.007,
+                  proposed_before=timedelta(minutes=3))  # fmt: skip
+    placed, _ = await _watchdog_outage(db, broker)
+    assert placed == [0.007]
+
+
+async def test_an_approved_entry_gone_in_the_outage_alerts(db: Database) -> None:
+    broker = FakeBroker()
+    _entry_outage(db, broker, journaled=0.004, held=BOT + 0.3, working_filled=None,
+                  proposed_before=timedelta(minutes=3))  # fmt: skip
+    placed, sent = await _watchdog_outage(db, broker)
+    assert placed == [0.004]
+    assert "Crypto watchdog: the bot's part unknown" in sent
+
+
+@pytest.mark.parametrize("before", [timedelta(minutes=4), timedelta(minutes=9)])
+def test_a_previous_trips_entry_is_none_of_this_one(db: Database, before: timedelta) -> None:
+    """An earlier trip's entry, sent minutes before this position opened, is no part of
+    it: neither sure nor unknown."""
+    from tests.test_watchdog import crypto
+    from trader.ownership import app_entry_unjournaled
+
+    btc = crypto()
+    opened = NOW - timedelta(hours=1)
+    req = OrderRequest(instrument=btc, side=Side.BUY, qty=BOT, order_type=OrderType.LIMIT,
+                       limit_price=100.0, stop_loss=95.0, take_profit=110.0,
+                       trace_id="ai-trader-old")  # fmt: skip
+    db.insert_order(OrderRecord(request=req, status=OrderStatus.SUBMITTED, broker_order_id="9",
+                                created_at=opened - before))  # fmt: skip
+    assert app_entry_unjournaled(db, btc.key, opened, [], []) == (0.0, 0.0)
+
+
+@pytest.mark.parametrize("owner_sold", [0.003, 0.006, 0.2])
+async def test_an_owner_sale_smaller_than_the_unseen_fill_alerts(
+    db: Database, owner_sold: float
+) -> None:
+    """The entry (0.004 of 0.01 journaled) filled in full in the outage and is gone at
+    IBKR; the owner sold some of his. Whatever he sold, whose coins are left is unknown:
+    the owner is told (urgent) unless the bot's whole entry is sold."""
+    broker = FakeBroker()
+    _entry_outage(db, broker, journaled=0.004, held=BOT + 0.5 - owner_sold, working_filled=None)
+    placed, sent = await _watchdog_outage(db, broker)
+    assert sum(placed) <= BOT + 1e-9
+    assert "Crypto watchdog: the bot's part unknown" in sent
+
+
+async def test_an_entry_gone_after_filling_in_full_needs_no_alert(db: Database) -> None:
+    """Held is all of the entry and the owner's coins: the watchdog sells the bot's 0.01."""
+    broker = FakeBroker()
+    _entry_outage(db, broker, journaled=0.004, held=BOT + 0.5, working_filled=None)
+    placed, sent = await _watchdog_outage(db, broker)
+    assert placed == [BOT]
+    assert "Crypto watchdog: the bot's part unknown" not in sent

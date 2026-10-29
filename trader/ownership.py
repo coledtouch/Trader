@@ -38,6 +38,10 @@ OTHER_CLIENT_PREFIX = "perm:"
 # IBKR stamps executions to the second, and this server's clock may run ahead of or behind
 # IBKR's: a bot entry that fills at once can carry a time before its metadata's opened_at.
 FILL_TIME_SKEW = timedelta(seconds=60)
+# An order that waited for the owner's approval: its journal row is as old as the proposal,
+# at most APPROVAL_TTL before it was sent; the send time is in kv SENT_PREFIX + order id.
+APPROVAL_TTL = timedelta(minutes=10)
+SENT_PREFIX = "order_sent:"  # kv: when an approved order was actually sent (order id)
 EXTRA_PREFIX = "position_extra:"  # the engine's per-position kv (same key as engine.py)
 WATCHDOG_TAG_PREFIX = "ai-trader-wd-"  # trace ids of the crypto watchdog's own orders
 # kv: {"marker", "first", "orders": {broker order id: qty}}, the crypto watchdog's sells of
@@ -445,6 +449,19 @@ def unreported_sales(
     return max(0.0, sold - seen)
 
 
+def sent_at(db: Database, rec: OrderRecord) -> datetime:
+    """When an order went to the broker: its journal time, or the approval time for an
+    order that waited for the owner."""
+    created = _aware(rec.created_at)
+    raw = db.get_kv(SENT_PREFIX + str(rec.id)) if rec.id is not None else None
+    if raw:
+        try:
+            return max(created, _aware(datetime.fromisoformat(raw)))
+        except ValueError:
+            pass
+    return created
+
+
 def app_entry_unjournaled(
     db: Database,
     key: str,
@@ -472,7 +489,10 @@ def app_entry_unjournaled(
         ):
             listed[req.trace_id] = listed.get(req.trace_id, 0.0) + order.filled_qty
     sure = unknown = 0.0
-    for rec in db.list_orders_since(_aware(opened) - FILL_TIME_SKEW):
+    since = _aware(opened) - FILL_TIME_SKEW
+    # An approved entry's row is as old as its proposal: read back to the oldest that could
+    # still be sent, and keep the rows sent since the position opened.
+    for rec in db.list_orders_since(since - APPROVAL_TTL):
         req = rec.request
         if (
             req.instrument.key != key
@@ -480,6 +500,7 @@ def app_entry_unjournaled(
             or req.is_exit
             or not rec.broker_order_id
             or (req.trace_id or "").startswith(WATCHDOG_TAG_PREFIX)
+            or sent_at(db, rec) < since
         ):
             continue
         seen = journaled.get(rec.broker_order_id, 0.0)
