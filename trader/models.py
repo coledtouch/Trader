@@ -597,7 +597,7 @@ class EngineStatus(BaseModel):
     day: str = ""
     start_equity: float | None = None
     equity: float | None = None
-    pnl_today: float = 0.0
+    pnl_today: float | None = None  # None while the equity (or the day's start) is unknown
     pnl_target: float = 0.0
     # How far today's P&L (equity - start_equity) may fall before the daily loss limit halts
     # trading, as a positive amount. Differs from start_equity x limit after a resume,

@@ -227,6 +227,13 @@
   }
 
   function orderType(req) {
+    // A sell with a stop price is a stop (an IBKR STP reads back as market + stop_loss);
+    // a buy's stop_loss is its bracket's, so it keeps its own type.
+    if (req.side === 'SELL' && isNum(req.stop_loss)) {
+      return req.order_type === 'LMT' && isNum(req.limit_price)
+        ? `Stop ${price(req.stop_loss)} limit ${price(req.limit_price)}`
+        : `Stop ${price(req.stop_loss)}`;
+    }
     if (req.order_type === 'LMT') return isNum(req.limit_price) ? `Limit ${price(req.limit_price)}` : 'Limit';
     if (req.order_type === 'OTHER') return 'Other';
     return 'Market';
@@ -703,6 +710,8 @@
       note = `${Math.min(100, Math.round((-pnl / loss) * 100))}% of today's loss limit used.`;
     } else if (pnl !== null && loss) {
       note = 'No daily loss budget used.';
+    } else if (pnl === null && isNum(s.start_equity)) {
+      note = 'P&L unknown: the broker is not connected.';
     }
     setText($('pnl-note'), note);
   }

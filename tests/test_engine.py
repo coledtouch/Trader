@@ -3636,6 +3636,98 @@ async def test_held_symbols_get_quote_lines_first_and_never_more_than_there_are(
     assert universe[0].key == held.key
 
 
+@pytest.mark.parametrize("restart_app", [False, True])
+async def test_a_paper_reset_while_away_never_halts(db, config, restart_app) -> None:
+    """Review finding: a paper reset that landed while the gateway (or the app) was away
+    tripped the daily loss halt, with a flatten and an alert, ten minutes before the
+    untraded-day check booked it as a balance change; the day then stayed halted."""
+    night = datetime(2026, 10, 21, 4, 10, tzinfo=UTC)  # Wednesday 00:10 New York
+    h = await harness(db, config, mode=Mode.PAPER, now=night)
+    h.broker.cash = 1_000_000.0
+    await h.engine.monitor_tick()
+    h.clock.advance(minutes=11)
+    await h.engine.monitor_tick()
+    h.broker._connected = h.broker.can_connect = False  # the gateway goes away
+    with pytest.raises(BrokerError):
+        await h.engine.monitor_tick()
+    h.broker.cash = 50_000.0  # the reset lands meanwhile
+    h.clock.advance(minutes=5)
+    h.broker.can_connect = True
+    engine = h.engine
+    if restart_app:
+        engine = Engine(
+            config, db, h.broker, h.decider, notifier=h.notes, clock=h.clock, scanner=h.scanner
+        )
+    for _ in range(60):  # 15 minutes
+        with contextlib.suppress(BrokerError):
+            await engine.monitor_tick()
+        h.clock.advance(seconds=15)
+    day = db.get_day("2026-10-21")
+    assert not day.halted
+    assert day.start_equity == pytest.approx(50_000.0)
+    assert "Trading halted" not in h.notes.titles()
+
+
+async def test_resume_waits_for_the_account(db, config) -> None:
+    """Review finding: Resume pressed before the broker reconnected wrote no new loss
+    baseline, so once connected the bot halted (and flattened) again from the day's start."""
+    h = await harness(db, config)
+    await h.engine.kill()
+    h.engine._account = None  # restarted, the gateway still logging in
+    with pytest.raises(ValueError, match="not connected"):
+        await h.engine.resume()
+    assert h.day().halted
+
+
+async def test_an_approved_exit_needs_no_quote(db, config) -> None:
+    """Review finding: approving the AI's CLOSE fetched a quote first, so with no market
+    data (IBKR 10197: another session of the login) every approval failed until it
+    expired, although an exit never uses the quote."""
+    h = await harness(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.engine.settings.autopilot = False
+    h.clock.advance(minutes=5)
+    h.decider.decisions = [
+        hold("F").model_copy(update={"action": TradeAction.CLOSE, "rationale": "fading"})
+    ]
+    await h.engine.run_cycle()
+    [waiting] = h.orders(OrderStatus.PENDING_APPROVAL)
+
+    async def no_data(instrument):
+        raise BrokerError("no IBKR market data for F: another session holds it (10197)")
+
+    h.broker.quote = no_data
+    rec = await h.engine.approve_order(waiting.id)
+    assert rec.status in (OrderStatus.SUBMITTED, OrderStatus.FILLED)
+    assert "STK:F" not in h.broker.pos
+
+
+async def test_a_kill_that_never_reached_the_broker_leaves_close_available(db, config) -> None:
+    """Review finding: a KILL whose connect failed kept every position marked closing for a
+    minute: Close was refused as "already being closed" with nothing selling."""
+    h = await harness(db, config)
+    await enter_f(h)
+    await h.engine.monitor_tick()
+    h.broker._connected = h.broker.can_connect = False
+    await h.engine.kill()
+    assert "STK:F" in h.broker.pos
+    h.broker.can_connect = True
+    await h.broker.connect()
+    h.clock.advance(seconds=20)
+    rec = await h.engine.close_position("STK:F")
+    assert rec.request.side == Side.SELL
+
+
+async def test_the_pnl_is_unknown_while_the_account_is(db, config) -> None:
+    """Review finding: with the account unknown (gateway down after a restart) the status
+    said P&L $0.00, and the dashboard "No daily loss budget used"."""
+    h = await harness(db, config)
+    await h.engine.monitor_tick()
+    h.engine._account = None
+    assert h.engine.status().pnl_today is None
+
+
 async def test_no_replacement_stop_without_broker_support(db, config) -> None:
     h = await harness(db, config)
     h.broker.standalone_stops = False

@@ -861,6 +861,14 @@ Contracts changed by the confirmed review findings (each has a regression test).
   open BUY entry; a journal row is matched to a broker order by its tag only when the two
   are of the same kind (side; stop or not), since a bracket's stop and target carry the
   entry's tag.
+- **Untraded-day gaps and halts** (ENG-11): while today's whole equity change may still be
+  booked as a balance change (no trading today, the account flat, a gap of 50%+, within
+  `CASH_FLOW_QUIET` + 5 min of the account last being busy), a halt waits pending (entries
+  blocked, nothing flattened) instead of confirming: a paper reset made while the app or
+  gateway was away never halts the day. Resume needs a known account (else 409), so the
+  loss limit is re-measured from the current equity; status `pnl_today` is None while the
+  equity is unknown. An approved exit takes no quote (missing data never blocks it). A KILL
+  that never reached the broker drops its close markers (nothing was sent).
 - **Engine closes** (ENG-7): a monitor exit the broker refuses alerts "Close X FAILED"
   (urgent when no stop is working; at most every `CLOSE_FAILED_ALERT_EVERY`, 15 min, while
   the 60 s retries go on), not "Closing X". An approved close whose broker call raised

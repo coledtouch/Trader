@@ -126,6 +126,8 @@ CURVE_RESTART_FRACTION = 0.5  # a change this large (e.g. a paper reset) restart
 # The untraded-day rebase only treats a gap this large (of today's start equity) as a
 # reset or transfer; a smaller unexplained gap keeps counting as P&L (safe direction).
 UNTRADED_REBASE_MIN_FRACTION = 0.5
+# How long past CASH_FLOW_QUIET a halt waits for the untraded-day rebase of such a gap.
+UNTRADED_HALT_WAIT = timedelta(minutes=5)
 BROKER_DOWN_NOTIFY_AFTER = timedelta(seconds=60)
 BACKUP_STOP_BREACH = 0.005  # stocks: engine sells only 0.5% beyond a stop the broker lacks
 FLATTEN_BEFORE_CLOSE_MIN = 10.0
@@ -720,6 +722,28 @@ class Engine:
             return 0.0
         return round(gap, 2)
 
+    def _may_be_untraded_gap(self, day: DayStats, account: AccountSnapshot, now: datetime) -> bool:
+        """Whether today's whole equity change may still be booked by _untraded_day_gap as a
+        balance change: no trading today, the account flat, a gap of at least
+        UNTRADED_REBASE_MIN_FRACTION (no flat account loses that much from trading), within
+        a bounded window after the account was last busy. A halt waits for it meanwhile."""
+        start = day.start_equity
+        if start is None or not math.isfinite(start) or start <= 0:
+            return False
+        if day.trades or day.wins or day.losses or abs(day.realized_pnl) > EPS:
+            return False
+        if (
+            any(p.qty != 0 for p in self._positions)
+            or self._open_orders
+            or self.broker.holds_untracked_positions()
+        ):
+            return False
+        if abs(account.equity - start) / start < UNTRADED_REBASE_MIN_FRACTION:
+            return False
+        if now - self._busy_at >= CASH_FLOW_QUIET + UNTRADED_HALT_WAIT:
+            return False  # the rebase did not take it: halt as before
+        return not self.db.list_fills(since=trading_day_start(day.day), limit=1)
+
     async def _rebase_untraded_day(
         self, gap: float, account: AccountSnapshot, day: DayStats, now: datetime
     ) -> None:
@@ -904,12 +928,17 @@ class Engine:
             pos.instrument.key: self._mark_closing(pos.instrument.key, KILL_REASON, now)
             for pos in self._positions
         }
+        reached = False
         try:
             async with self._entry_lock:  # no entry can slip in after the flatten
                 if not self.broker.connected:
                     await self.broker.connect()
+                reached = True
                 records = await self.broker.flatten_all(KILL_REASON)  # cancels everything
         except Exception as exc:
+            if not reached:  # the broker was never reached: nothing sent, no close in flight
+                for key, seq in seqs.items():
+                    self._unmark_closing(key, seq)
             sent = getattr(exc, "records", [])
             for rec in sent:  # sent before another position failed
                 self._journal_order(rec, now)
@@ -951,15 +980,21 @@ class Engine:
         )
 
     async def resume(self, actor: str = "owner") -> None:
-        """Clear today's halt. Halt limits are re-measured from the current equity."""
+        """Clear today's halt. Halt limits are re-measured from the current equity, so the
+        account must be known: otherwise the next ticks would measure from the day's start
+        again and halt (and flatten) once more."""
+        account = self._account
+        if account is None or not math.isfinite(account.equity) or account.equity <= 0:
+            raise ValueError(
+                "not connected to the broker yet: resume once the account is known, so the "
+                "loss limit is measured again from the current equity"
+            )
         now = self._now()
         day = self._today(now)
         previous = day.halt_reason
         day.halted, day.halt_reason = False, None
         self._save_day()
-        equity = self._account.equity if self._account is not None else None
-        if equity is not None and equity > 0:
-            self.db.set_kv(BASELINE_PREFIX + day.day, repr(equity))
+        self.db.set_kv(BASELINE_PREFIX + day.day, repr(account.equity))
         self._clear_error("kill")
         log.warning("trading resumed by %s (was: %s)", actor, previous)
         await self._notify("Trading resumed", f"Halt cleared by {actor} (was: {previous}).")
@@ -1116,8 +1151,10 @@ class Engine:
         # still holding it, immediately before anything is sent.
         await self._ensure_connected(now)
         req = rec.request
-        quote = await self.broker.quote(req.instrument)
-        self._track_halt(req.instrument.key, quote, self._now())
+        # An exit is checked against positions only: missing market data must not block it.
+        quote = None if req.is_exit else await self.broker.quote(req.instrument)
+        if quote is not None:
+            self._track_halt(req.instrument.key, quote, self._now())
         account = await self.broker.account()
         positions = await self.broker.positions()
         open_orders = await self.broker.open_orders()
@@ -1317,7 +1354,7 @@ class Engine:
             day=day.day if day else trading_day(now),
             start_equity=start,
             equity=equity,
-            pnl_today=round(equity - start, 2) if equity is not None and start else 0.0,
+            pnl_today=round(equity - start, 2) if equity is not None and start else None,
             pnl_target=self.risk.limits.profit_target_usd(start),
             loss_limit_usd=loss_limit,
             trades_today=day.trades if day else 0,
@@ -1807,6 +1844,14 @@ class Engine:
         if day.halted and not (hard and is_soft_halt(day.halt_reason)):
             self._halt_streak, self._halt_pending = None, None
             return  # already halted; only a soft halt can escalate to a hard one
+        if self._may_be_untraded_gap(day, account, now):
+            # A balance change made while the app or gateway was away (e.g. a paper reset):
+            # the untraded-day check books it once the account has been quiet. Entries wait
+            # (pending), nothing is flattened (the account is flat).
+            if self._halt_pending != reason:
+                log.warning("halt condition seen (%s); waiting for the balance check", reason)
+            self._halt_streak, self._halt_pending = None, reason
+            return
         # A halt (and the flatten that comes with a loss halt) needs the condition on
         # consecutive ticks, so one bad equity print cannot sell everything. Meanwhile no
         # new entry goes out (run_cycle and approvals check _halt_pending).
