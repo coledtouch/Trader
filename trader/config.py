@@ -10,7 +10,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from pydantic import AliasChoices, Field, SecretStr
+from pydantic import AliasChoices, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -37,37 +37,143 @@ class AppConfig(BaseSettings):
     session_max_hours: int = 12
     login_max_attempts_per_ip: int = 5  # per 15 minutes
     login_lockout_failures: int = 10  # global failures in 15 minutes -> lock all logins
-    trust_proxy_headers: bool = False  # True only behind a reverse proxy you control
+    # False: sign in with the authenticator code alone, no password, but only behind
+    # Cloudflare Access or on a paper/simulator account. The 6-digit code is then the only
+    # secret, so failed codes (sign-ins and 2FA step-ups, all addresses together) count
+    # toward a daily cap; once it is reached, sign-ins are refused (step-ups in an open
+    # session are not). Live trading still requires Cloudflare Access (below).
+    login_password_required: bool = True
+    login_daily_failures: int = Field(default=20, ge=1)  # per 24 h when the code is alone
+    # True only behind a proxy you control (cloudflared): the client IP is then taken from
+    # CF-Connecting-IP only. A missing header falls back to the socket peer, never to
+    # X-Forwarded-For (a client can spoof that).
+    trust_proxy_headers: bool = False
+    # Cloudflare Access. When BOTH are set, every request except /healthz must carry a valid
+    # Cf-Access-Jwt-Assertion for this team and application. Both are required when
+    # allow_live is true (the app refuses to start otherwise). Simulator and paper mode
+    # (allow_live false) may leave both empty.
+    cf_access_team_domain: str = ""  # e.g. "yourteam.cloudflareaccess.com"
+    cf_access_aud: str = ""  # the Access application's Audience (AUD) tag
 
     # --- broker ----------------------------------------------------------------
     broker: Literal["sim", "ibkr"] = "sim"
     ib_host: str = "127.0.0.1"
     ib_port: int = 4002  # IB Gateway: 4002 paper, 4001 live (TWS: 7497 paper, 7496 live)
     ib_client_id: int = 17
-    # 1 = live (needs a paid subscription and >= $500 equity), 3 = delayed (free)
-    ib_market_data_type: Literal[1, 2, 3, 4] = 3
+    # 1 = live (needs a paid subscription and >= $500 equity), 2 = frozen, 3 = delayed
+    # (free), 4 = delayed frozen. A plain int so the value can come from the environment.
+    ib_market_data_type: int = Field(default=3, ge=1, le=4)
     ib_account: str = ""  # optional: pin a specific account id
+    # IBKR routes US crypto through ZEROHASH (older accounts: PAXOS).
+    ib_crypto_exchange: str = "ZEROHASH"
+    # IBKR Pro pricing plan, used for fee estimates in risk checks and the simulator.
+    commission_plan: Literal["tiered", "fixed"] = "tiered"
 
     # Hard gate for real-money orders. Even when True, the owner must also "arm" live
     # trading in the UI with a fresh 2FA code.
     allow_live: bool = False
+
+    # --- crypto stop watchdog ---------------------------------------------------
+    # Separate process (see docker-compose crypto-watchdog). It does not open positions.
+    # IBKR has no native crypto stop, so this process sells via its own API client when
+    # the app's heartbeat goes stale or the kill switch is on.
+    watchdog_enabled: bool = True
+    # App heartbeat older than this (seconds): the app is unhealthy, and the watchdog
+    # sells a crypto position the bot opened once its bid is at or below that position's stop.
+    watchdog_stale_seconds: float = Field(default=45, gt=0, le=3600)
+    # Heartbeat older than this: sell every crypto position the bot opened, even above the stop.
+    watchdog_flatten_seconds: float = Field(default=180, gt=0, le=86400)
+    watchdog_poll_seconds: float = Field(default=10, ge=2, le=300)
+    # How long to wait before sending another close for the same symbol (a market sell
+    # that was rejected, or one that has not shown up in open orders yet).
+    watchdog_retry_seconds: float = Field(default=20, ge=0, le=600)
+    # Must differ from ib_client_id. The same id would kick the app off the gateway.
+    watchdog_client_id: int = Field(default=18, ge=1, le=999)
+    # auto: paper orders are allowed; live orders only when allow_live is true (exits only).
+    # off: watch-only, alert and never send.
+    watchdog_orders: Literal["auto", "off"] = "auto"
 
     # --- AI ----------------------------------------------------------------------
     anthropic_api_key: SecretStr | None = Field(
         default=None,
         validation_alias=AliasChoices("TRADER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
     )
+    # xAI (Grok) API key from console.x.ai (prepaid API credits; a SuperGrok subscription
+    # does not include API access). With both keys the default "consensus" decision mode
+    # only buys when Claude AND Grok agree.
+    xai_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("TRADER_XAI_API_KEY", "XAI_API_KEY"),
+    )
+    xai_model: str = "grok-4.7"
+    xai_base_url: str = "https://api.x.ai/v1"
+    # Grok prices in USD per million tokens, used for the daily AI budget. The defaults are
+    # third-party figures for grok-4.7 (not confirmed against xAI's own price page): check
+    # console.x.ai and override them here if they differ.
+    xai_price_input: float = Field(default=2.0, ge=0)
+    xai_price_cached_input: float = Field(default=0.5, ge=0)
+    xai_price_output: float = Field(default=6.0, ge=0)
 
     # --- notifications -------------------------------------------------------------
     # Optional ntfy topic URL, e.g. "https://ntfy.sh/<long-random-topic>"
     ntfy_url: str | None = None
     ntfy_token: SecretStr | None = None
+    # Optional dead-man's switch: a ping URL (e.g. https://hc-ping.com/<uuid> from
+    # healthchecks.io) that the app calls every healthcheck_every_seconds while the
+    # engine's heartbeat is fresh. The service alerts when the pings stop. A secret.
+    healthcheck_url: SecretStr | None = None
+    healthcheck_every_seconds: float = Field(default=60, ge=30, le=3600)
+
+    # --- backups -----------------------------------------------------------------------
+    # Nightly copy of the database to <data dir>/backups, keeping the newest backup_keep.
+    backup_enabled: bool = True
+    backup_keep: int = Field(default=14, ge=1, le=365)
 
     # --- misc ------------------------------------------------------------------------
     market_timezone: str = "America/New_York"
     log_level: str = "INFO"
     sim_seed: int = 7
     sim_starting_cash: float = 250.0
+
+    @model_validator(mode="after")
+    def _cf_access_both_or_neither(self) -> AppConfig:
+        """A half-configured Cloudflare Access check would be silently off (it needs both
+        values), e.g. after a typo in one variable name. Refuse to start instead."""
+        team, aud = self.cf_access_team_domain.strip(), self.cf_access_aud.strip()
+        if bool(team) != bool(aud):
+            missing = "TRADER_CF_ACCESS_AUD" if team else "TRADER_CF_ACCESS_TEAM_DOMAIN"
+            raise ValueError(
+                f"Cloudflare Access is half configured: {missing} is empty. Set both "
+                "TRADER_CF_ACCESS_TEAM_DOMAIN and TRADER_CF_ACCESS_AUD (check the spelling of "
+                "the variable names) or neither"
+            )
+        if self.watchdog_flatten_seconds < self.watchdog_stale_seconds:
+            raise ValueError(
+                "TRADER_WATCHDOG_FLATTEN_SECONDS must be at least "
+                "TRADER_WATCHDOG_STALE_SECONDS (flattening is the later step)"
+            )
+        if self.watchdog_client_id == self.ib_client_id:
+            raise ValueError(
+                "TRADER_WATCHDOG_CLIENT_ID must differ from TRADER_IB_CLIENT_ID "
+                f"(both are {self.ib_client_id}). A shared client id would disconnect the app "
+                "from IB Gateway"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _live_trading_requires_cloudflare_access(self) -> AppConfig:
+        """Live trading with the in-app Access check off would expose the account if the
+        tunnel or a Cloudflare setting were wrong. Refuse to start. Paper and sim
+        (TRADER_ALLOW_LIVE false) stay usable with the values empty."""
+        team, aud = self.cf_access_team_domain.strip(), self.cf_access_aud.strip()
+        if self.allow_live and not (team and aud):
+            raise ValueError(
+                "live trading is allowed (TRADER_ALLOW_LIVE=true) but Cloudflare Access is "
+                "not configured. Set both TRADER_CF_ACCESS_TEAM_DOMAIN and "
+                "TRADER_CF_ACCESS_AUD before starting. Simulator and paper mode "
+                "(TRADER_ALLOW_LIVE=false) can leave both empty"
+            )
+        return self
 
     @property
     def allowed_hosts_list(self) -> list[str]:
@@ -76,6 +182,10 @@ class AppConfig(BaseSettings):
     @property
     def public_origins_list(self) -> list[str]:
         return [o.strip().rstrip("/") for o in self.public_origins.split(",") if o.strip()]
+
+    @property
+    def cf_access_enabled(self) -> bool:
+        return bool(self.cf_access_team_domain and self.cf_access_aud)
 
     @property
     def db_path(self) -> Path:

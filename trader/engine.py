@@ -1,0 +1,5646 @@
+"""Trading engine: the loops that tie the broker, scanner, decision maker, risk manager and
+journal together (docs/SPEC.md 5.7 and 7.2).
+
+- Monitor loop (every `monitor_seconds`): keep the broker connected, refresh the
+  account/positions/orders cache (positions marked at the bid), evaluate the daily halts,
+  manage exits (engine-side stops for positions without native stops, a backup stop for
+  stocks, time stop, breakeven and trailing stops), re-place missing stock stops after a
+  reconnect, flatten stocks before the close, then journal order statuses and fills and
+  rebuild round-trip trades FIFO, expire approvals and score the signal ledger.
+- Decision loop (every `cycle_seconds`): refresh state, build and prefilter the universe,
+  fetch quotes and bars, scan, log every candidate in the signal ledger, ask the decision
+  maker (Claude or rules), then size and risk-check each BUY before it becomes an order.
+
+`stop()` ends the decision loop only: the monitor keeps protecting open positions
+(engine-managed crypto stops, halts, flatten before the close) until `shutdown()`, and
+`start_monitor()` restores that state after an app restart.
+Exit rules only touch positions the engine opened (those with positions_meta); the kill
+switch and the daily-loss flatten close everything. In shadow mode (live account, not
+armed) no entry is ever sent, but exits still are for positions the engine opened (stops,
+targets, time stops, flatten before the close, the daily-loss flatten, AI closes) because
+they only reduce risk; the owner-confirmed kill closes everything. Every broker failure is
+logged and survived; when in doubt, no order is sent.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import itertools
+import json
+import logging
+import math
+from collections import deque
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime, timedelta
+from typing import Any, Protocol
+
+from trader.broker.base import (
+    PROTECTIVE_REJECTED,
+    TARGET_REJECTED,
+    Broker,
+    BrokerError,
+    PartialFlattenError,
+)
+from trader.config import AppConfig
+from trader.db import EQUITY_SINCE_KEY, Database
+from trader.models import (
+    BAR_LOOKBACK,
+    LEVERAGED_ETFS,
+    MAX_QUOTE_STREAMS,
+    OPEN_ORDER_STATUSES,
+    SCANNER_MOVERS,
+    AccountSnapshot,
+    AIDecision,
+    AssetClass,
+    Bar,
+    BotSettings,
+    Candidate,
+    DayStats,
+    DecisionBatch,
+    DecisionContext,
+    EngineStatus,
+    Fill,
+    Instrument,
+    Mode,
+    OrderRecord,
+    OrderRequest,
+    OrderStatus,
+    OrderType,
+    Position,
+    Quote,
+    Side,
+    SignalRecord,
+    TradeAction,
+    TradeRecord,
+    order_trace_id,
+    utcnow,
+)
+from trader.notify import Notifier
+from trader.ownership import (
+    APP_SELLS_SEEN,
+    APP_SOLD_UNREPORTED,
+    APPROVAL_TTL,
+    FILL_TIME_SKEW,
+    ORDER_FORGOTTEN,
+    OWNER_HIDDEN,
+    REST_SETTLED,
+    SENT_PREFIX,
+    UNREPORTED_EXIT,
+    WATCHDOG_SALES_PREFIX,
+    WATCHDOG_TAG_PREFIX,
+    Cap,
+    Split,
+    app_entry_unjournaled,
+    app_sold_beyond_journal,
+    app_sold_unjournaled,
+    bought_since,
+    entry_held_unjournaled,
+    entry_qty,
+    for_sizing,
+    is_other_client,
+    less_app_sold,
+    less_sold,
+    merge_fills,
+    order_rows,
+    owner_evidence,
+    read_hidden,
+    read_sales_record,
+    rows_since,
+    sell_cap,
+    sent_at,
+    split_fills,
+    unreported_sales,
+    watchdog_filled,
+    watchdog_last_filled,
+    watchdog_sales,
+    watchdog_sales_end,
+)
+from trader.risk import (
+    DELAYED_QUOTE_GRACE,
+    HALT_DAILY_LOSS,
+    STALE_QUOTE_INTERVALS,
+    RiskManager,
+    is_soft_halt,
+    quote_block,
+    sane_exit_price,
+)
+from trader.strategy.common import is_failure
+from trader.strategy.consensus import PREFIX as CONSENSUS_PREFIX
+from trader.strategy.consensus import label as maker_label
+from trader.strategy.decide import DecisionMaker, RuleBasedDecisionMaker
+from trader.strategy.signals import Scanner
+from trader.timeutil import (
+    market_close_time,
+    minutes_to_close,
+    stock_market_open,
+    trading_day,
+    trading_day_start,
+)
+from trader.watchdog import (
+    WATCHDOG_CLOSED_PREFIX,
+    position_marker,
+    sold_by_watchdog,
+    write_heartbeat,
+)
+
+log = logging.getLogger(__name__)
+
+KILL_REASON = "kill switch"
+# The crypto watchdog's broker tags. They share the ai-trader- prefix with this app's
+# order ids, but they are not rows this process should adopt after a restart.
+WATCHDOG_TRACE_PREFIX = "ai-trader-wd-"
+
+
+def _app_order_trace(trace: str | None) -> str | None:
+    """An order tag this process may reconcile. Watchdog tags are skipped."""
+    if not trace or trace.startswith(WATCHDOG_TRACE_PREFIX):
+        return None
+    return trace
+
+
+ENTRY_ORDER_TTL = timedelta(minutes=10)  # unfilled entry orders are cancelled after this
+EQUITY_POINT_EVERY = timedelta(minutes=5)
+# A balance change after the account has been flat (no position, no working order, no fill)
+# for this long cannot be trading P&L: it is a deposit, a withdrawal or a paper-account
+# reset, and it is kept out of today's P&L and limits. The wait also covers IBKR's account
+# values, which can lag a closed trade by a few minutes.
+CASH_FLOW_QUIET = timedelta(minutes=10)
+CASH_FLOW_MIN_USD = 1.0
+CURVE_RESTART_FRACTION = 0.5  # a change this large (e.g. a paper reset) restarts the curve
+# The untraded-day rebase only treats a gap this large (of today's start equity) as a
+# reset or transfer; a smaller unexplained gap keeps counting as P&L (safe direction).
+UNTRADED_REBASE_MIN_FRACTION = 0.5
+# How long past CASH_FLOW_QUIET a halt waits for the untraded-day rebase of such a gap.
+UNTRADED_HALT_WAIT = timedelta(minutes=5)
+BROKER_DOWN_NOTIFY_AFTER = timedelta(seconds=60)
+BACKUP_STOP_BREACH = 0.005  # stocks: engine sells only 0.5% beyond a stop the broker lacks
+FLATTEN_BEFORE_CLOSE_MIN = 10.0
+CLOSE_RETRY = timedelta(seconds=60)  # do not resend an engine close sooner than this
+CLOSE_FAILED_ALERT_EVERY = timedelta(minutes=15)  # a refused engine close alerts this often
+# A BUY decided on market data older than this is dropped instead of sent (the decision
+# maker took too long: the setup is stale). Younger ones are re-checked on fresh data.
+DECISION_MAX_AGE = timedelta(minutes=3)
+# IBKR pushes DayTradesRemaining about every 3 minutes: the bot's own day trades younger
+# than this are subtracted from it before an entry is checked.
+PDT_REFRESH = timedelta(minutes=5)
+COMMISSION_GRACE = timedelta(minutes=2)  # wait this long for late commission reports
+STALE_META_GRACE = timedelta(minutes=2)
+ORDER_FORGET_AFTER = timedelta(days=1)
+FILL_LOOKBACK = timedelta(days=2)
+FIRST_FILL_LOOKBACK = timedelta(days=7)
+TRADE_LOOKBACK = timedelta(days=30)
+# A stock read flat this long, its last fill on an earlier day: its exit fill was lost.
+UNREPORTED_EXIT_GRACE = timedelta(minutes=15)
+FILL_QUERY_LIMIT = 5000
+SIGNAL_DEDUPE = timedelta(minutes=30)  # one ledger row per instrument+setup per window
+LEDGER_EVERY = timedelta(minutes=5)
+LEDGER_MAX_INSTRUMENTS = 5  # bar requests per ledger pass
+LEDGER_SETTLE = timedelta(minutes=5)  # wait for the last bars after the horizon
+LEDGER_GIVE_UP = timedelta(days=5)
+LEDGER_RETRY = timedelta(hours=1)  # wait before re-requesting bars that were missing
+CRYPTO_HORIZON = timedelta(hours=24)
+FETCH_CONCURRENCY = 4
+NOTIFY_WAIT_S = 1.0  # longest a trading path waits for an alert to go out
+# An engine-only stop (crypto) without a usable quote for this long fails the exits check,
+# so the heartbeat goes stale and the crypto watchdog takes over.
+UNCHECKED_STOP_GRACE = timedelta(minutes=10)
+SHUTDOWN_TICK_WAIT = 20.0  # s shutdown waits for a tick under way (compose grace: 30 s)
+FIRST_CYCLE_DELAY = 5.0
+MAX_BACKOFF = 120.0
+EPS = 1e-9
+EXTRA_PREFIX = "position_extra:"
+BASELINE_PREFIX = "halt_baseline:"
+ACCOUNT_KEY = "broker_account"  # kv: the broker account id the journal belongs to
+HALT_SEEN_PREFIX = "halt_seen:"  # kv: when an instrument was last seen halted (cooldown)
+OWNER_CLOSED_PREFIX = "owner_closed:"  # kv: trading day the owner closed this instrument
+# Engine-side stops/targets/time stops and the daily halts fire only when the breach is
+# seen on this many consecutive monitor ticks (one bad tick never sells or flattens).
+# Broker-native stops are not affected.
+BREACH_CONFIRM_TICKS = 2
+# ...and those ticks must span at least this fraction of the monitor interval, so the tick
+# run_cycle runs right after the monitor loop's never counts as a second look.
+BREACH_MIN_SPACING = 0.5
+# Which API key each LLM decision maker needs (for the "fell back" warning).
+KEY_NAMES = {"claude": "Anthropic", "grok": "xAI"}
+
+
+class SignalScanner(Protocol):
+    settings: BotSettings
+
+    def scan(
+        self, instrument: Instrument, bars: Sequence[Bar], quote: Quote | None, now: datetime
+    ) -> list[Candidate]: ...
+
+    def snapshot(
+        self, instrument: Instrument, bars: Sequence[Bar], quote: Quote | None = None
+    ) -> dict[str, float]: ...
+
+
+# --------------------------------------------------------------------------- round trips
+@dataclass
+class _Lot:
+    qty: float
+    price: float
+    commission: float  # buy commission not yet attributed to a closed quantity
+    ts: datetime
+    fallback: bool = False  # the metadata's entry, for a sell with no buy in the journal
+
+
+@dataclass
+class _Trip:
+    qty: float = 0.0
+    cost: float = 0.0
+    proceeds: float = 0.0
+    commission: float = 0.0
+    entry_ts: datetime | None = None
+    exit_ts: datetime | None = None
+    last_sell: Fill | None = None
+    fills: list[Fill] = field(default_factory=list)
+
+
+def replay_fills(
+    fills: Iterable[Fill],
+    fallback_entry: tuple[float, datetime] | None = None,
+    journaled: datetime | None = None,
+) -> tuple[list[_Trip], float]:
+    """FIFO-match one instrument's fills (oldest first) into completed round trips.
+
+    Exits are matched by instrument, never by order id (IBKR bracket children and orders
+    from other clients carry their own ids). A sell with no open lot uses `fallback_entry`
+    (price, time) from the position metadata when given, else it is skipped. Returns the
+    completed trips and the quantity still open.
+    """
+    trips: list[_Trip] = []
+    lots: deque[_Lot] = deque()
+    trip = _Trip()
+    ordered = [f for f in fills if f.qty > EPS]
+    for i, fill in enumerate(ordered):
+        trip.fills.append(fill)
+        if fill.side == Side.BUY:
+            lots.append(_Lot(fill.qty, fill.price, fill.commission, fill.ts))
+            trip.entry_ts = trip.entry_ts or fill.ts
+            continue
+        remaining = fill.qty
+        unsized = False
+        while remaining > EPS:
+            if not lots:
+                if fallback_entry is None:
+                    break
+                price, ts = fallback_entry
+                lots.append(_Lot(remaining, price, 0.0, ts, fallback=True))
+                trip.entry_ts = trip.entry_ts or ts
+            lot = lots[0]
+            take = min(lot.qty, remaining)
+            share = lot.commission * take / lot.qty
+            trip.cost += take * lot.price
+            trip.commission += share
+            trip.qty += take
+            lot.commission -= share
+            lot.qty -= take
+            remaining -= take
+            if lot.qty <= EPS:
+                lots.popleft()
+                unsized = lot.fallback
+        matched = fill.qty - remaining
+        if matched > EPS:
+            trip.proceeds += matched * fill.price
+            trip.commission += fill.commission * matched / fill.qty
+            trip.exit_ts = fill.ts
+            trip.last_sell = fill
+        if remaining > EPS:
+            log.warning(
+                "sell of %g %s has no matching buy in the journal; %g left unmatched",
+                fill.qty,
+                fill.instrument.key,
+                remaining,
+            )
+        if not lots:
+            nxt = ordered[i + 1] if i + 1 < len(ordered) else None
+            if (
+                fill.side == Side.SELL
+                and unsized
+                and nxt is not None
+                and nxt.side == Side.SELL
+                and nxt.broker_order_id == fill.broker_order_id
+                and (
+                    journaled is None or _aware(fill.ts) > journaled or _aware(nxt.ts) <= journaled
+                )
+            ):
+                # The metadata's lot is sized to each sell: the next execution of the same
+                # sell order is more of the same exit, not a trip of its own.
+                continue
+            if trip.qty > EPS:
+                trips.append(trip)
+            trip = _Trip()
+    return trips, sum(lot.qty for lot in lots)
+
+
+# --------------------------------------------------------------------------- signal ledger
+def score_signal(
+    sig: SignalRecord, bars: Sequence[Bar], end: datetime, bar_seconds: float = 60.0
+) -> SignalRecord | None:
+    """Outcome of a ledger signal in R multiples (1R = price - stop) over the bars from the
+    signal to `end` (the session close for stocks, +24h for crypto). When one bar touches
+    both levels, the stop counts as hit first. None when there are no bars to score."""
+    risk = sig.price - sig.stop
+    length = timedelta(seconds=bar_seconds)
+    window = [b for b in bars if b.ts >= sig.ts and b.ts + length <= end + timedelta(seconds=1)]
+    if risk <= 0 or not window:
+        return None
+
+    def r(price: float) -> float:
+        return round((price - sig.price) / risk, 3)
+
+    def r_at(minutes: int) -> float:
+        horizon = min(sig.ts + timedelta(minutes=minutes), end)
+        done = [b for b in window if b.ts + length <= horizon + timedelta(seconds=1)]
+        return r(done[-1].close if done else window[0].open)
+
+    first_hit: str = "neither"
+    for bar in window:
+        if bar.low <= sig.stop:
+            first_hit = "stop"
+            break
+        if bar.high >= sig.target:
+            first_hit = "target"
+            break
+    return sig.model_copy(
+        update={
+            "r_15m": r_at(15),
+            "r_30m": r_at(30),
+            "r_60m": r_at(60),
+            "r_close": r(window[-1].close),
+            "mfe_r": max(0.0, r(max(b.high for b in window))),
+            "mae_r": min(0.0, r(min(b.low for b in window))),
+            "first_hit": first_hit,
+            "evaluated": True,
+        }
+    )
+
+
+@dataclass
+class _BuyOutcome:
+    setup: str | None
+    taken: bool
+    order_id: int | None = None
+    skip_reason: str | None = None
+
+
+@dataclass
+class _Logged:
+    """A candidate's signal-ledger row during one cycle."""
+
+    cand: Candidate
+    signal_id: int
+    new: bool  # False when it reuses a recent row for the same instrument+setup
+    blocked: str | None  # why it was kept from the decision maker, if it was
+
+
+def _aware(ts: datetime) -> datetime:
+    return ts.replace(tzinfo=UTC) if ts.tzinfo is None else ts
+
+
+def _target_text(target: float | None) -> str:
+    return f"{target:g}" if target is not None else "none (trailing stop)"
+
+
+def _refused_exits(records: Iterable[OrderRecord]) -> str:
+    """Exit orders the broker rejected, as "SYMBOL: message; ..." ("" when none)."""
+    return "; ".join(
+        f"{r.request.instrument.symbol}: {r.message or 'rejected'}"
+        for r in records
+        if r.status == OrderStatus.REJECTED
+    )
+
+
+def _mask(account_id: str) -> str:
+    """Account ids in logs, the audit log and notifications: the type prefix (IBKR "DU" =
+    paper, "U" = live) and the last 3 characters."""
+    text = account_id.strip()
+    if len(text) <= 5:
+        return text
+    letters = len(text) - len(text.lstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"))
+    return f"{text[: min(letters, 2)]}...{text[-3:]}"
+
+
+def _short(text: str, limit: int = 200) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 3] + "..."
+
+
+class Engine:
+    def __init__(
+        self,
+        config: AppConfig,
+        db: Database,
+        broker: Broker,
+        decider: DecisionMaker,
+        notifier: Notifier | None = None,
+        clock: Callable[[], datetime] = utcnow,
+        *,
+        scanner: SignalScanner | None = None,
+        risk: RiskManager | None = None,
+        makers: Mapping[str, DecisionMaker] | None = None,
+    ) -> None:
+        """`makers` maps decision modes ("rules", "claude", "grok", "consensus") to the makers
+        that exist (a mode is missing when its API key is). With it, settings.decision_mode
+        picks the maker every cycle; without it, `decider` is used for every AI mode."""
+        self.config = config
+        self.db = db
+        self.broker = broker
+        self._decider = decider
+        self._makers: dict[str, DecisionMaker] | None = dict(makers) if makers is not None else None
+        self.notifier = notifier
+        self._clock = clock
+        self.settings = db.get_settings()
+        self.scanner: SignalScanner = scanner or Scanner(self.settings, tz=config.market_timezone)
+        self.risk = risk or RiskManager(self.settings.risk)
+        fallback = getattr(decider, "fallback", None)
+        listed = (self._makers or {}).get("rules")
+        if isinstance(listed, RuleBasedDecisionMaker):
+            self.rules = listed
+        elif isinstance(decider, RuleBasedDecisionMaker):
+            self.rules = decider
+        elif isinstance(fallback, RuleBasedDecisionMaker):
+            self.rules = fallback
+        else:
+            self.rules = RuleBasedDecisionMaker(self.settings)
+        self._sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
+
+        self._running = False
+        self._monitor_task: asyncio.Task[None] | None = None
+        self._decision_task: asyncio.Task[None] | None = None
+        self._cycle_lock = asyncio.Lock()
+        self._monitor_lock = asyncio.Lock()
+        self._entry_lock = asyncio.Lock()
+
+        # cached state (snapshot() and status() never call the broker)
+        self._account: AccountSnapshot | None = None
+        self._positions: list[Position] = []
+        self._open_orders: list[OrderRecord] = []
+        self._market: dict[str, dict[str, float]] = {}
+        self._latest_quotes: dict[str, Quote] = {}
+        self._quoted_at: dict[str, datetime] = {}  # when each cached quote was fetched
+        self._cycle_quote_scope: set[str] = set()
+        self._cycle_quote_scope_at: datetime | None = None
+        self._cycle_movers: set[str] = set()  # scanner movers this cycle may buy (symbols)
+        self._day: DayStats | None = None
+        self._errors: dict[str, tuple[datetime, str]] = {}
+        self._last_cycle_at: datetime | None = None
+        self._next_cycle_at: datetime | None = None
+        self._last_equity_at: datetime | None = None
+
+        # connectivity
+        self._down_since: datetime | None = None
+        self._down_notified = False
+        self._reprotect_pending = True
+        self._reprotect_armed = 0  # times re-protect was armed (see _arm_reprotect)
+
+        # journal bookkeeping
+        self._fill_commissions: dict[str, tuple[float, datetime]] | None = None
+        self._fills_synced = False
+        # When broker fills were last journaled on the current connection (None: not yet).
+        # Balance changes are judged only after that, so a fill made while the app was
+        # stopped or disconnected (e.g. a stop-loss) is journaled first, never mistaken for
+        # a deposit, withdrawal or reset.
+        self._fills_journaled_at: datetime | None = None
+        self._last_exit: dict[str, datetime] | None = None
+        self._bot_exit: dict[str, datetime] | None = None  # last journaled bot trade's exit
+        self._entry_buys: set[str] | None = None  # working app entries in the last broker read
+        self._unchecked_since: dict[str, datetime] = {}  # engine-only stops without a quote
+        self._open_qty: dict[str, float] = {}
+        self._pending_trades: set[str] = set()
+        # instruments whose replay waits for the owner's units no fill shows to be looked for
+        # (`_note_hidden_before_replay`, as of the latest fills sync)
+        self._replay_undecided: set[str] = set()
+
+        # exits and halts
+        self._closing: dict[str, datetime] = {}
+        self._close_reasons: dict[str, str] = {}
+        # Instruments whose latest close the broker refused (or found nothing to sell): not
+        # in flight, though _closing still throttles the monitor's next try.
+        self._close_refused: set[str] = set()
+        self._close_seq: dict[str, int] = {}  # close attempts per instrument (latest wins)
+        self._close_failed_at: dict[str, datetime] = {}  # last "Close X FAILED" alert
+        self._alert_tasks: set[asyncio.Future[bool]] = set()  # alerts still sending
+        self._last_halt_at: dict[str, datetime] = {}
+        self._skip_logged: set[tuple[str, str]] = set()
+        # instrument -> when the broker first read flat while the fills journal did not
+        self._mismatch_logged: dict[str, datetime] = {}
+        self._owner_noted: set[tuple[str, str]] = set()  # (key, position marker) alerted
+        # (key, position marker) -> trading day a replay's look found nothing of the bot's
+        # sold unseen (its stops covering all of its units): see _bot_units_may_be_gone
+        self._cover_seen: dict[tuple[str, str], str] = {}
+        self._ledger_retry: dict[str, datetime] = {}  # instrument -> no bar requests until
+        self._fallback_logged: str | None = None
+        self._last_ledger_at: datetime | None = None
+        self._ledger_task: asyncio.Task[None] | None = None  # a signal-ledger pass running
+        self._start_gen = 0  # start()/stop() calls: the latest one decides
+        # consecutive monitor ticks that saw an engine-side exit / a daily halt condition
+        # instrument -> (kind, ticks, first seen)
+        self._breaches: dict[str, tuple[str, int, datetime]] = {}
+        self._halt_streak: tuple[str, int, datetime] | None = None  # (halt kind, ticks, first)
+        self._halt_pending: str | None = None  # halt seen once, waiting for confirmation
+
+        # Journal epoch. The simulator keeps its account in memory, so every process trades
+        # a fresh simulated account; a change of broker account (sim -> paper -> live) is
+        # the same situation. Journal fills from before the epoch are never matched against
+        # the new account, open journal orders from before it are closed out, and today's
+        # P&L restarts from the new account's equity at the next snapshot.
+        self._epoch: datetime | None = self._now() if broker.mode == Mode.SIM else None
+        if self._epoch is not None:
+            self.db.set_kv("journal_account_since", self._epoch.isoformat())
+        self._epoch_reason = "simulator restarted"
+        self._rebase_pending = self._epoch is not None
+        if self._epoch is None and self.db.get_kv(ACCOUNT_KEY):
+            # A broker account recorded earlier: fills from before its epoch (another
+            # account's) stay out of every later process too (no P&L rebase here).
+            raw = self.db.get_kv("journal_account_since")
+            with contextlib.suppress(TypeError, ValueError):
+                self._epoch = _aware(datetime.fromisoformat(raw or ""))
+                self._epoch_reason = "broker account changed"
+        self._busy_at = self._now()  # last time the account held a position or order
+        self._enforce_live_gate()
+        self._backfill_equity_floor()
+        self._backfill_curve_after_cash_flow()
+
+    def _backfill_equity_floor(self) -> None:
+        """Journals from before equity-curve restarts existed: start the curve at the last
+        recorded broker account change so it does not jump between accounts."""
+        if self.db.get_kv(EQUITY_SINCE_KEY) is not None:
+            return
+        changes = self.db.list_audit(limit=1, action="account_changed")
+        if changes:
+            self.db.set_kv(EQUITY_SINCE_KEY, changes[0]["ts"])  # newest first
+
+    def _enforce_live_gate(self) -> None:
+        """Arming lasts only while the server gate (TRADER_ALLOW_LIVE) stays open. The gate
+        is read from the environment at process start, so a process that starts with it
+        closed clears a stored arm: re-opening the gate later always needs a fresh Arm with
+        a 2FA code (the documented lockdown must not be undone by re-enabling the gate)."""
+        if self.config.allow_live or not self.db.get_flag("live_armed"):
+            return
+        self.db.set_flag("live_armed", False)
+        self.db.audit(
+            "live_disarmed", {"reason": "TRADER_ALLOW_LIVE=false at startup"}, actor="engine"
+        )
+        log.warning("live trading disarmed: TRADER_ALLOW_LIVE is false (a fresh Arm is needed)")
+
+    # ------------------------------------------------------------------ basics
+    def _now(self) -> datetime:
+        return _aware(self._clock()).astimezone(UTC)
+
+    @property
+    def decider(self) -> DecisionMaker:
+        """The decision maker the settings select right now (see `_resolve_decider`)."""
+        return self._resolve_decider()[0]
+
+    def _resolve_decider(self) -> tuple[DecisionMaker, str | None]:
+        """(maker for settings.decision_mode, warning when it is not what the owner chose).
+
+        Consensus needs both API keys; with one, that model decides alone, and with none
+        (or a single-model mode without its key) the rule-based maker decides. The engine
+        never pretends: every fallback comes with a warning for the dashboard."""
+        if self._makers is None:
+            return self._decider, None
+        mode = self.settings.decision_mode
+        makers = self._makers
+        if mode == "rules":
+            return self.rules, None
+        if mode in makers:
+            return makers[mode], None
+        if mode == "consensus":
+            have = [name for name in ("claude", "grok") if name in makers]
+            if len(have) == 1:
+                alone = have[0]
+                missing = "grok" if alone == "claude" else "claude"
+                return makers[alone], (
+                    f"Consensus mode needs both API keys, but no {KEY_NAMES[missing]} key "
+                    f"is set: {maker_label(alone)} decides alone (no second opinion)."
+                )
+            return self.rules, (
+                "Consensus mode needs Anthropic and xAI API keys and neither is set: "
+                "rules-only decisions."
+            )
+        return self.rules, (
+            f"{maker_label(mode)} mode needs an {KEY_NAMES.get(mode, mode)} API key, "
+            "which is not set: rules-only decisions."
+        )
+
+    def _all_makers(self) -> list[DecisionMaker]:
+        """Every decision maker the engine may call, including those inside consensus."""
+        found: list[DecisionMaker] = []
+        pending: list[object] = [self._decider, *(self._makers or {}).values()]
+        while pending:
+            maker = pending.pop()
+            if maker is None or any(maker is m for m in found):
+                continue
+            found.append(maker)  # type: ignore[arg-type]
+            pending += [getattr(maker, attr, None) for attr in ("primary", "secondary")]
+        return found
+
+    @property
+    def shadow(self) -> bool:
+        """Live account without the owner's arming: decisions are logged and entries are
+        blocked; exits for positions the engine opened still go out."""
+        armed = self.config.allow_live and self.db.get_flag("live_armed")
+        return self.broker.mode == Mode.LIVE and not armed
+
+    def _set_error(self, source: str, message: str) -> None:
+        self._errors[source] = (self._now(), _short(message, 300))
+
+    def _clear_error(self, source: str) -> None:
+        self._errors.pop(source, None)
+
+    @property
+    def last_error(self) -> str | None:
+        if not self._errors:
+            return None
+        return max(self._errors.values(), key=lambda item: item[0])[1]
+
+    async def _notify(
+        self,
+        title: str,
+        message: str,
+        priority: str = "default",
+        tags: list[str] | None = None,
+        on_result: Callable[[bool], None] | None = None,
+    ) -> bool:
+        """Send an alert; True once it was delivered. Trading paths wait for it at most
+        NOTIFY_WAIT_S (a hung ntfy or push service takes 5-10 s): a slower send finishes
+        in the background, and counts as not delivered here. on_result gets the real
+        outcome whenever the send ends, however slow."""
+        if self.notifier is None:
+            if on_result is not None:
+                on_result(False)
+            return False
+        send = asyncio.ensure_future(
+            self.notifier.send(title, message, priority=priority, tags=tags)
+        )
+        self._alert_tasks.add(send)
+        send.add_done_callback(self._alert_tasks.discard)
+        if on_result is not None:
+            send.add_done_callback(
+                lambda t: on_result(
+                    not t.cancelled() and t.exception() is None and bool(t.result())
+                )
+            )
+        try:
+            return bool(await asyncio.wait_for(asyncio.shield(send), NOTIFY_WAIT_S))
+        except TimeoutError:
+            log.warning("alert %r still sending in the background", title)
+            send.add_done_callback(lambda t: t.cancelled() or t.exception())
+        except Exception as exc:  # Notifier never raises; this guards custom notifiers
+            log.warning("notification failed: %s", type(exc).__name__)
+        return False
+
+    async def _step(self, name: str, work: Awaitable[object]) -> None:
+        """Run one monitor step; a failure is logged and the remaining steps still run."""
+        source = f"monitor:{name}"
+        try:
+            await work
+        except BrokerError as exc:
+            log.warning("monitor step %s: broker error: %s", name, exc)
+            self._set_error(source, f"{name}: {exc}")
+        except Exception as exc:
+            log.exception("monitor step %s failed", name)
+            self._set_error(source, f"{name}: {type(exc).__name__}: {exc}")
+        else:
+            self._clear_error(source)
+
+    # ------------------------------------------------------------------ day stats
+    def _today(self, now: datetime) -> DayStats:
+        day = trading_day(now)
+        if self._day is not None and self._day.day == day:
+            return self._day
+        stats = self.db.get_day(day)
+        if stats is None:
+            before = self.db.latest_day_before(day)
+            stats = DayStats(day=day, loss_streak=before.loss_streak if before else 0)
+            # The kill switch stays on across days until the owner resumes.
+            if before and before.halted and (before.halt_reason or "").startswith(KILL_REASON):
+                stats.halted, stats.halt_reason = True, before.halt_reason
+            self.db.upsert_day(stats)
+        self._day = stats
+        self._skip_logged.clear()
+        return stats
+
+    def _save_day(self) -> None:
+        if self._day is not None:
+            self.db.upsert_day(self._day)
+
+    def _charge_abandoned_calls(self, day: DayStats, maker_name: str) -> None:
+        """A cancelled cycle (Stop, shutdown) journals no batch, but an AI call it cut off
+        after the provider accepted it is still billed: add the makers' estimates to the
+        day's AI spend so the daily budget does not under-count, and journal them as a
+        cost-only batch, from which the performance report sums AI spend."""
+        lost = 0.0
+        for maker in self._all_makers():
+            take = getattr(maker, "take_abandoned_cost", None)
+            if callable(take):
+                lost += take()
+        if lost > 0:
+            self._add_llm_cost(day.day, lost)
+            self.db.insert_decision(
+                DecisionBatch(
+                    ts=self._now(),
+                    maker=maker_name,
+                    error="AI call cut off by a stop or restart; tokens and cost are estimated",
+                    cost_usd=lost,
+                )
+            )
+            log.warning(
+                "AI call cut off by a stop or restart: $%.2f (estimated) added to today's AI spend",
+                lost,
+            )
+
+    def _stats_for(self, day: str) -> DayStats:
+        if self._day is not None and self._day.day == day:
+            return self._day
+        return self.db.get_day(day) or DayStats(day=day)
+
+    def _add_llm_cost(self, day: str, cost: float) -> None:
+        """Add AI spend to the trading day the call was made on, by date: the day can roll
+        over while a call runs (crypto at midnight), and self._day then holds the next."""
+        if cost <= 0:
+            return
+        stats = self._stats_for(day)
+        stats.llm_cost = round(stats.llm_cost + cost, 6)
+        self.db.upsert_day(stats)
+
+    def _add_fee(self, ts: datetime, amount: float) -> None:
+        if abs(amount) < EPS:
+            return
+        stats = self._stats_for(trading_day(ts))
+        stats.fees = round(stats.fees + amount, 4)
+        self.db.upsert_day(stats)
+
+    def _external_cash_flow(
+        self, previous: AccountSnapshot | None, account: AccountSnapshot, now: datetime
+    ) -> float:
+        """The equity change since the last snapshot when it cannot be trading P&L (the
+        account has been flat for CASH_FLOW_QUIET), else 0.0."""
+        if (
+            previous is None
+            or self._fills_journaled_at is None
+            or previous.account_id != account.account_id
+            or not math.isfinite(previous.equity)
+            or previous.equity <= 0
+        ):
+            return 0.0
+        delta = account.equity - previous.equity
+        if abs(delta) < CASH_FLOW_MIN_USD or now - self._busy_at < CASH_FLOW_QUIET:
+            return 0.0
+        if self.db.list_fills(since=now - CASH_FLOW_QUIET, limit=1):
+            return 0.0
+        return round(delta, 2)
+
+    async def _apply_cash_flow(
+        self, flow: float, account: AccountSnapshot, day: DayStats, now: datetime
+    ) -> None:
+        """Keep a deposit, withdrawal or paper reset out of today's P&L and limits."""
+        if day.start_equity is not None:
+            day.start_equity = round(day.start_equity + flow, 2)
+        raw = self.db.get_kv(BASELINE_PREFIX + day.day)
+        if raw:
+            with contextlib.suppress(ValueError):
+                self.db.set_kv(BASELINE_PREFIX + day.day, repr(float(raw) + flow))
+        previous = account.equity - flow
+        if previous > 0 and abs(flow) / previous >= CURVE_RESTART_FRACTION:
+            self.db.start_equity_history(now)
+            self._last_equity_at = None
+        kind = "deposit" if flow > 0 else "withdrawal or reset"
+        log.warning("balance change of %+.2f with no positions open: %s", flow, kind)
+        self.db.audit(
+            "cash_flow", {"amount": flow, "equity": round(account.equity, 2)}, actor="engine"
+        )
+        await self._notify(
+            "Balance change detected",
+            f"{'+' if flow > 0 else '-'}${abs(flow):,.2f} while no positions were open: "
+            f"treated as a {kind}. Today's P&L and limits leave it out.",
+        )
+
+    def _untraded_day_gap(self, day: DayStats, account: AccountSnapshot, now: datetime) -> float:
+        """Equity minus today's start equity when today cannot have trading P&L, else 0.0:
+        no fills or trades since the day began (with this connection's fills journaled), the
+        account flat for CASH_FLOW_QUIET since it last held anything or (re)connected, and a
+        gap of at least UNTRADED_REBASE_MIN_FRACTION, i.e. one that looks like a reset or a
+        transfer. Catches a balance change the snapshot comparison never saw: one made while
+        the app was stopped, or before an upgrade that added the comparison."""
+        start = day.start_equity
+        if start is None or not math.isfinite(start) or start <= 0:
+            return 0.0
+        if day.trades or day.wins or day.losses or abs(day.realized_pnl) > EPS:
+            return 0.0
+        if self._fills_journaled_at is None:
+            return 0.0
+        gap = account.equity - start
+        if abs(gap) / start < UNTRADED_REBASE_MIN_FRACTION:
+            return 0.0
+        if abs(gap) < CASH_FLOW_MIN_USD or now - self._busy_at < CASH_FLOW_QUIET:
+            return 0.0
+        if self.db.list_fills(since=trading_day_start(day.day), limit=1):
+            return 0.0
+        return round(gap, 2)
+
+    def _may_be_untraded_gap(self, day: DayStats, account: AccountSnapshot, now: datetime) -> bool:
+        """Whether today's whole equity change may still be booked by _untraded_day_gap as a
+        balance change: no trading today, the account flat, a gap of at least
+        UNTRADED_REBASE_MIN_FRACTION (no flat account loses that much from trading), within
+        a bounded window after the account was last busy. A halt waits for it meanwhile."""
+        start = day.start_equity
+        if start is None or not math.isfinite(start) or start <= 0:
+            return False
+        if day.trades or day.wins or day.losses or abs(day.realized_pnl) > EPS:
+            return False
+        if (
+            any(p.qty != 0 for p in self._positions)
+            or self._open_orders
+            or self.broker.holds_untracked_positions()
+        ):
+            return False
+        if abs(account.equity - start) / start < UNTRADED_REBASE_MIN_FRACTION:
+            return False
+        if now - self._busy_at >= CASH_FLOW_QUIET + UNTRADED_HALT_WAIT:
+            return False  # the rebase did not take it: halt as before
+        return not self.db.list_fills(since=trading_day_start(day.day), limit=1)
+
+    async def _rebase_untraded_day(
+        self, gap: float, account: AccountSnapshot, day: DayStats, now: datetime
+    ) -> None:
+        """Restart today's P&L and limits from the current equity (see _untraded_day_gap).
+        A halt stays: only the owner clears it."""
+        old = day.start_equity or 0.0
+        day.start_equity = account.equity
+        if self.db.get_kv(BASELINE_PREFIX + day.day):
+            self.db.set_kv(BASELINE_PREFIX + day.day, repr(account.equity))
+        self._restart_curve_after_jump(account.equity, trading_day_start(day.day), now, now)
+        log.warning(
+            "no trading today but equity moved %+.2f from the day's start: treated as a "
+            "balance change",
+            gap,
+        )
+        self.db.audit(
+            "cash_flow",
+            {"amount": gap, "equity": round(account.equity, 2), "source": "untraded day"},
+            actor="engine",
+        )
+        await self._notify(
+            "Balance change detected",
+            f"Today started at ${old:,.2f} and there were no trades, so the "
+            f"{'+' if gap > 0 else '-'}${abs(gap):,.2f} difference is a deposit, withdrawal "
+            f"or reset. Today's P&L and limits now start from ${account.equity:,.2f}.",
+        )
+
+    def _restart_curve_after_jump(
+        self, equity: float, since: datetime, before: datetime, now: datetime
+    ) -> None:
+        """Start the equity curve right after the newest jump of CURVE_RESTART_FRACTION or
+        more between two consecutive points from `since` up to (`before`, `equity`), so a
+        balance change that reached the curve before it was recognised does not show as a
+        cliff. Gradual moves, however large in total, are never hidden (the risk limits keep
+        trading far from a 50% move between two points), nor are points from `before` on."""
+        series = [
+            (_aware(datetime.fromisoformat(p["ts"])), float(p["equity"]))
+            for p in self.db.list_equity(since=since)
+        ]
+        series = [(ts, value) for ts, value in series if ts < before] + [(before, equity)]
+        cut: datetime | None = None
+        for (_, old), (ts, new) in itertools.pairwise(series):
+            if old > 0 and abs(new - old) / old >= CURVE_RESTART_FRACTION:
+                cut = ts
+        if cut is None:
+            return
+        self.db.start_equity_history(cut)
+        if cut >= before:
+            self._last_equity_at = None  # the next tick records the first point
+
+    def _backfill_curve_after_cash_flow(self) -> None:
+        """Journals from before the check above: a paper reset recognised only later (the
+        untraded-day rebase) left a cliff on the curve. Start the curve after it. Idempotent."""
+        flows = self.db.list_audit(limit=1, action="cash_flow")
+        if not flows:
+            return
+        latest = flows[0]  # newest first
+        equity = latest["detail"].get("equity")
+        if isinstance(equity, bool) or not isinstance(equity, int | float) or not equity > 0:
+            return
+        at = _aware(datetime.fromisoformat(latest["ts"]))
+        self._restart_curve_after_jump(
+            float(equity), trading_day_start(trading_day(at)), at, self._now()
+        )
+
+    def _halt_eval_day(self, day: DayStats) -> DayStats:
+        """After a resume, halts are measured from the equity at the resume."""
+        raw = self.db.get_kv(BASELINE_PREFIX + day.day)
+        if raw:
+            with contextlib.suppress(ValueError):
+                return day.model_copy(update={"start_equity": float(raw)})
+        return day
+
+    # ------------------------------------------------------------------ lifecycle
+    async def start(self) -> None:
+        """Connect and start both loops (idempotent). Connection errors are retried by the
+        monitor loop."""
+        if self._decision_task is not None and not self._decision_task.done():
+            return
+        self._start_gen += 1
+        gen = self._start_gen
+        self._running = True
+        self.db.set_flag("engine_running", True)
+        await self._start_monitor()
+        if gen != self._start_gen or (
+            self._decision_task is not None and not self._decision_task.done()
+        ):
+            return  # a stop() (or a later start()) came in while connecting: it wins
+        self._decision_task = asyncio.create_task(self._decision_loop(), name="engine-decision")
+        log.info("engine started (%s, %s)", self.broker.name, self.broker.mode.value)
+
+    async def start_monitor(self) -> None:
+        """Connect and run only the monitor loop (idempotent): open positions stay protected
+        (engine-managed stops, halts, flatten before the close, journal) while no decisions
+        are made. The app calls this at startup when the bot was stopped, which is the same
+        state `stop()` leaves behind."""
+        await self._start_monitor()
+        log.info("engine monitor running; decisions stay off until the bot is started")
+
+    async def _start_monitor(self) -> None:
+        self._arm_reprotect()
+        try:
+            await self.broker.connect()
+        except BrokerError as exc:
+            log.warning("broker connect failed at start: %s", exc)
+            self._set_error("monitor", f"connect: {exc}")
+            self._down_since = self._down_since or self._now()
+        if self._monitor_task is None or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(
+                self._loop("monitor", self.monitor_tick, lambda: self.settings.monitor_seconds),
+                name="engine-monitor",
+            )
+
+    async def stop(self) -> None:
+        """Stop making decisions. Positions, broker stops and the monitor loop (which
+        manages engine-side stops) stay in place."""
+        self.db.set_flag("engine_running", False)
+        await self._stop_decisions()
+        log.info("engine stopped (monitor keeps protecting open positions)")
+
+    async def shutdown(self) -> None:
+        """Stop everything and disconnect (app shutdown). Broker-side stops remain, and the
+        persisted running flag is kept so a restart resumes the previous state."""
+        await self._stop_decisions()
+        # A monitor tick under way (a halt's flatten, the journal) finishes first, within
+        # bounds; holding the lock, no new one starts while the tasks are cancelled.
+        locked = False
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._monitor_lock.acquire(), SHUTDOWN_TICK_WAIT)
+            locked = True
+        try:
+            for name in ("_monitor_task", "_ledger_task"):
+                task = getattr(self, name)
+                setattr(self, name, None)
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+        finally:
+            if locked:
+                self._monitor_lock.release()
+        try:
+            await self.broker.disconnect()
+        except Exception as exc:
+            log.warning("broker disconnect failed: %s", type(exc).__name__)
+        log.info("engine shut down (broker-side stops remain in place)")
+
+    async def _stop_decisions(self) -> None:
+        self._start_gen += 1  # a start() still connecting must not start the decisions
+        self._running = False
+        task, self._decision_task = self._decision_task, None
+        self._next_cycle_at = None
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    async def _decision_loop(self) -> None:
+        await self._sleep(FIRST_CYCLE_DELAY)
+        await self._loop("decision", self.run_cycle, lambda: self.settings.cycle_seconds)
+
+    async def _loop(
+        self, name: str, step: Callable[[], Awaitable[object]], interval: Callable[[], float]
+    ) -> None:
+        """Run `step` forever: errors are logged and recorded, never raised, with
+        exponential backoff while they persist."""
+        failures = 0
+        while True:
+            try:
+                await step()
+            except BrokerError as exc:
+                failures += 1
+                log.warning("%s loop: broker error: %s", name, exc)
+                self._set_error(name, f"{name}: {exc}")
+            except Exception as exc:
+                failures += 1
+                log.exception("%s loop failed", name)
+                self._set_error(name, f"{name}: {type(exc).__name__}: {exc}")
+            else:
+                failures = 0
+                self._clear_error(name)
+            base = float(interval())
+            delay = base
+            if failures:
+                delay = min(base * 2 ** min(failures, 6), max(MAX_BACKOFF, base))
+            if name == "decision":
+                self._next_cycle_at = self._now() + timedelta(seconds=delay)
+            await self._sleep(delay)
+
+    # ------------------------------------------------------------------ owner actions
+    async def kill(self, actor: str = "owner") -> None:
+        """Halt, cancel every order and close every position (also in shadow mode: the
+        owner confirmed it). Failures are recorded and notified, never raised."""
+        now = self._now()
+        day = self._today(now)
+        day.halted, day.halt_reason = True, KILL_REASON
+        self._save_day()
+        log.warning("KILL switch pressed by %s", actor)
+        self._cancel_pending("cancelled: kill switch")
+        seqs = {
+            pos.instrument.key: self._mark_closing(pos.instrument.key, KILL_REASON, now)
+            for pos in self._positions
+        }
+        reached = False
+        try:
+            async with self._entry_lock:  # no entry can slip in after the flatten
+                if not self.broker.connected:
+                    await self.broker.connect()
+                reached = True
+                records = await self.broker.flatten_all(KILL_REASON)  # cancels everything
+        except Exception as exc:
+            if not reached:  # the broker was never reached: nothing sent, no close in flight
+                for key, seq in seqs.items():
+                    self._unmark_closing(key, seq)
+            sent = getattr(exc, "records", [])
+            for rec in sent:  # sent before another position failed
+                self._journal_order(rec, now)
+                key = rec.request.instrument.key
+                self._note_close(key, rec, seqs.get(key))
+            refused = _refused_exits(sent)
+            text = f"the broker refused to close {refused}; {exc}" if refused else str(exc)
+            log.exception("kill switch could not finish")
+            self._set_error("kill", f"kill switch failed: {text}")
+            await self._notify(
+                "KILL switch FAILED",
+                f"Could not cancel/close everything: {_short(text)}. Check the broker now.",
+                priority="urgent",
+                tags=["rotating_light"],
+            )
+            return
+        for rec in records:
+            self._journal_order(rec, now)
+            key = rec.request.instrument.key
+            self._note_close(key, rec, seqs.get(key))
+        refused = _refused_exits(records)
+        if refused:
+            log.error("kill switch: the broker refused to close %s", refused)
+            self._set_error("kill", f"kill switch failed: the broker refused to close {refused}")
+            await self._notify(
+                "KILL switch FAILED",
+                f"Orders cancelled, but the broker refused to close {_short(refused)}. "
+                "Check the broker now.",
+                priority="urgent",
+                tags=["rotating_light"],
+            )
+            return
+        self._clear_error("kill")
+        await self._notify(
+            "Kill switch",
+            f"Trading halted, orders cancelled, {len(records)} position(s) being closed.",
+            priority="high",
+            tags=["stop_sign"],
+        )
+
+    async def resume(self, actor: str = "owner") -> None:
+        """Clear today's halt. Halt limits are re-measured from the current equity, so the
+        account must be known: otherwise the next ticks would measure from the day's start
+        again and halt (and flatten) once more."""
+        account = self._account
+        if account is None or not math.isfinite(account.equity) or account.equity <= 0:
+            raise ValueError(
+                "not connected to the broker yet: resume once the account is known, so the "
+                "loss limit is measured again from the current equity"
+            )
+        now = self._now()
+        day = self._today(now)
+        previous = day.halt_reason
+        day.halted, day.halt_reason = False, None
+        self._save_day()
+        self.db.set_kv(BASELINE_PREFIX + day.day, repr(account.equity))
+        self._clear_error("kill")
+        log.warning("trading resumed by %s (was: %s)", actor, previous)
+        await self._notify("Trading resumed", f"Halt cleared by {actor} (was: {previous}).")
+
+    async def close_position(self, key: str, actor: str = "owner") -> OrderRecord:
+        """Sell one position at market on the owner's request (the dashboard's Close button).
+        Its working orders at the broker (bracket stop and target) are cancelled first, and
+        the stop is put back if the broker refuses the sell (Broker.close_position). Like
+        KILL it also works in shadow mode, while halted and on positions the owner opened:
+        the owner asked for it. Raises LookupError (no such position), ValueError (market
+        closed, already closing) or BrokerError (not sent, or refused)."""
+        try:
+            inst = Instrument.from_key(key)
+        except ValueError:
+            raise LookupError(f"unknown instrument {key!r}") from None
+        now = self._now()
+        if inst.asset_class == AssetClass.STOCK and not stock_market_open(now):
+            raise ValueError(
+                f"the stock market is closed: close {inst.symbol} in IBKR, or after the open"
+            )
+        reason = f"closed by the {actor}"
+        async with self._entry_lock:  # no entry or second close can interleave
+            if self._close_in_flight(key, now):
+                raise ValueError(f"{inst.symbol} is already being closed")
+            if not self.broker.connected:
+                raise BrokerError("not connected to the broker")
+            held = next(
+                (p for p in await self.broker.positions() if p.instrument.key == key and p.qty > 0),
+                None,
+            )
+            if held is None:
+                raise LookupError(f"no open {inst.symbol} position")
+            sells = [
+                o
+                for o in await self.broker.open_orders()
+                if o.request.instrument.key == key
+                and o.request.side == Side.SELL
+                and o.status in OPEN_ORDER_STATUSES
+            ]
+            # A sell order placed outside the bot cannot be cancelled from here; left
+            # working after the close, it could sell shares no longer held (a short).
+            if any(not self.broker.can_cancel(o) for o in sells):
+                raise ValueError(
+                    f"{inst.symbol} has a sell order placed in TWS or IBKR Mobile: cancel it "
+                    "there first, or it could sell again after this close"
+                )
+            # A market sell already working is a close in flight, whatever the bookkeeping
+            # says (a kill that failed after sending it). The monitor's exits do not take
+            # the entry lock, so the marker is checked again here, with no await before
+            # the stamp.
+            selling = any(
+                o.request.order_type == OrderType.MARKET
+                and o.request.stop_loss is None
+                and self.broker.can_cancel(o)
+                for o in sells
+            )
+            if selling or self._close_in_flight(key, self._now()):
+                raise ValueError(f"{inst.symbol} is already being closed")
+            seq = self._mark_closing(key, reason, self._now())
+            self._cancel_pending(f"cancelled: {reason}", key=key)
+            try:
+                meta = self.db.get_position_meta(key)
+                bot_position = (
+                    meta is not None
+                    and not self._meta_used(key, meta)
+                    and not sold_by_watchdog(self.db, key, meta)
+                )
+                # A position the bot opened, with shares the owner bought next to it: Close
+                # sells the bot's own. One the bot did not open is the owner's: all of it.
+                cap = await self._bot_cap(held.instrument) if bot_position else None
+                if cap is not None and cap.unread:
+                    raise BrokerError("the broker's executions could not be read: try again")
+                if cap is not None and cap.qty <= EPS:
+                    raise ValueError(
+                        f"none of the {held.qty:g} {inst.symbol} held is the bot's: you bought "
+                        "it in TWS or IBKR Mobile, sell it there"
+                    )
+                rec = await self._broker_close(
+                    held.instrument,
+                    reason=reason,
+                    max_qty=cap.qty if cap else None,
+                    keep=cap.keep if cap else 0.0,
+                )
+            except BaseException:
+                self._unmark_closing(key, seq)  # the monitor manages it again
+                raise
+        if rec is None:  # sold in between (a stop or target filled)
+            self._unmark_closing(key, seq)
+            raise LookupError(f"no open {inst.symbol} position")
+        if cap is not None and rec.request.qty < cap.qty - EPS:
+            self._unmark_closing(key, seq)  # see _note_capped_close
+        self._journal_order(rec, now)
+        refused = _refused_exits([rec])
+        if refused:
+            self._unmark_closing(key, seq)
+            log.error("close by %s: the broker refused to close %s", actor, refused)
+            restored = "protective stop re-placed at" in (rec.message or "")
+            await self._notify(
+                f"Close {inst.symbol} FAILED",
+                f"The broker refused the sell ({_short(refused)}). "
+                + ("The stop was put back. " if restored else "No stop is working at IBKR. ")
+                + "Check IBKR now.",
+                priority="high" if restored else "urgent",
+                tags=["warning"] if restored else ["rotating_light"],
+            )
+            raise BrokerError(f"the broker refused to close {refused}")
+        # The owner overrode the bot: no new entry in this symbol for the rest of the day.
+        self.db.set_kv(OWNER_CLOSED_PREFIX + key, trading_day(now))
+        log.warning("%s: %s at market (%g)", key, reason, rec.request.qty)
+        await self._notify(
+            f"Closing {inst.symbol}",
+            f"Sold at market: {reason}. No new {inst.symbol} entries today.",
+        )
+        return rec
+
+    def _owner_closed_today(self, key: str, now: datetime) -> bool:
+        return self.db.get_kv(OWNER_CLOSED_PREFIX + key) == trading_day(now)
+
+    async def arm_live(self, actor: str = "owner") -> None:
+        """Allow real-money orders. The caller has already verified a fresh TOTP code."""
+        if not self.config.allow_live:
+            raise PermissionError("live trading is disabled on the server (TRADER_ALLOW_LIVE)")
+        if self.broker.mode != Mode.LIVE:
+            raise PermissionError("the broker is not connected to a live account")
+        self.db.set_flag("live_armed", True)
+        log.warning("live trading ARMED by %s", actor)
+        await self._notify("Live trading armed", f"Real-money orders enabled by {actor}.", "high")
+
+    async def disarm_live(self, actor: str = "owner") -> None:
+        """Back to shadow mode on a live account: no new entries, while the engine keeps
+        managing exits for the positions it opened (broker-side stops stay in place)."""
+        self.db.set_flag("live_armed", False)
+        log.warning("live trading disarmed by %s", actor)
+        if self.shadow and any(p.qty > 0 for p in self._positions):
+            await self._notify(
+                "Live trading disarmed",
+                "No new entries. The bot keeps managing exits (stops, targets, time stops, "
+                "close before 4 PM) for positions it opened; other positions are yours.",
+                priority="high",
+                tags=["warning"],
+            )
+
+    def reload_settings(self) -> None:
+        """Re-read BotSettings from the database and apply them everywhere."""
+        self.settings = self.db.get_settings()
+        self.risk.set_limits(self.settings.risk)
+        self.scanner.settings = self.settings
+        self.rules.settings = self.settings
+        # Dynamic results belong to the previous settings snapshot. The next universe
+        # scan can add them again; configured symbols and held positions remain visible.
+        self._cycle_quote_scope.clear()
+        self._cycle_quote_scope_at = None
+        self._prune_quote_cache(self._now())
+        from trader.strategy.claude import ClaudeDecisionMaker
+
+        for maker in self._all_makers():  # decision_mode itself is read every cycle
+            fallback = getattr(maker, "fallback", None)
+            if isinstance(fallback, RuleBasedDecisionMaker):
+                fallback.settings = self.settings
+            if isinstance(maker, ClaudeDecisionMaker):
+                maker.model = self.settings.llm_model
+                maker.effort = self.settings.llm_effort
+
+    # ------------------------------------------------------------------ approvals
+    async def approve_order(self, order_id: int, actor: str = "owner") -> OrderRecord:
+        """Send a pending order after a fresh risk check. Raises LookupError (unknown id),
+        ValueError (not pending) or BrokerError (no fresh data: the order stays pending)."""
+        self._pending(order_id)
+        async with self._entry_lock:
+            rec = self._pending(order_id)  # again: a concurrent approval may have sent it
+            now = self._now()
+            if now - _aware(rec.created_at) >= APPROVAL_TTL:
+                self._expire(rec)
+                return self._get_order(order_id)
+        # Prices are fetched without the entry lock so Reject can cancel the order while
+        # this is in flight. Reject takes the same lock; the check below runs again,
+        # still holding it, immediately before anything is sent.
+        await self._ensure_connected(now)
+        req = rec.request
+        # An exit is checked against positions only: missing market data must not block it.
+        quote = None if req.is_exit else await self.broker.quote(req.instrument)
+        if quote is not None:
+            self._track_halt(req.instrument.key, quote, self._now())
+        async with self._entry_lock:
+            rec = self._pending(order_id)  # rejected (or already sent) while prices loaded
+            now = self._now()
+            if now - _aware(rec.created_at) >= APPROVAL_TTL:
+                self._expire(rec)
+                return self._get_order(order_id)
+            # Read under the lock: another approval or a cycle may have sent an entry.
+            account = await self.broker.account()
+            positions = await self.broker.positions()
+            open_orders = await self.broker.open_orders()
+            req = rec.request
+            day = self._today(now)
+            verdict = None
+            checked_account = self._with_day_trades(account, now)
+            known_account = self.db.get_kv(ACCOUNT_KEY)
+            if known_account and account.account_id and account.account_id != known_account:
+                self.db.update_order(
+                    order_id,
+                    status=OrderStatus.CANCELLED,
+                    message="cancelled: broker account changed since this order was proposed",
+                )
+                self._revert_signal(order_id, "broker account changed")
+                return self._get_order(order_id)
+            if req.instrument.key in self._pending_trades:
+                reasons = ["previous trade in this symbol is still being journaled"]
+            elif self._halt_pending is not None and not req.is_exit:
+                reasons = [f"halt condition being confirmed: {self._halt_pending}"]
+            else:
+                verdict = self.risk.check(
+                    req,
+                    quote=quote,
+                    account=checked_account,
+                    positions=positions,
+                    open_orders=open_orders,
+                    day=day,
+                    mode=self.broker.mode,
+                    data_delayed=self.broker.data_delayed,
+                    broker=self.broker,
+                    now=now,
+                    settings=self.settings,
+                    last_halt_at=self._halt_seen_at(req.instrument.key),
+                )
+                reasons = verdict.reasons
+            if verdict is None or not verdict.approved:
+                message = "re-check at approval failed: " + "; ".join(reasons)
+                self.db.update_order(order_id, status=OrderStatus.BLOCKED, message=message)
+                self._revert_signal(order_id, "risk at approval: " + "; ".join(reasons))
+                return self._get_order(order_id)
+            order = self._traced(verdict.order or req, order_id)
+            if self.shadow and not order.is_exit:  # exits only reduce risk: still allowed
+                self.db.update_order(
+                    order_id, status=OrderStatus.BLOCKED, message="shadow mode: live not armed"
+                )
+                self._revert_signal(order_id, "shadow mode")
+                return self._get_order(order_id)
+            # Again, immediately before the broker call: Reject holds this lock to cancel.
+            self._pending(order_id)
+            if order.is_exit:
+                key = order.instrument.key
+                if self._fills_journaled_at is None:  # the order stays pending
+                    raise BrokerError("fills since the reconnect not journaled yet: try again")
+                meta = self.db.get_position_meta(key)
+                if (
+                    meta is None
+                    or sold_by_watchdog(self.db, key, meta)
+                    or self._meta_used(key, meta)
+                ):
+                    # The bot's position closed while the approval waited: what is held
+                    # under the symbol now is not the bot's (the owner's buy since).
+                    self.db.update_order(
+                        order_id,
+                        status=OrderStatus.CANCELLED,
+                        message="cancelled: the bot's position already closed",
+                    )
+                    return self._get_order(order_id)
+                # The monitor's exits do not take the entry lock: check and stamp with no
+                # await in between, before the broker call (as Close and the AI close do).
+                if self._close_in_flight(key, self._now()):
+                    self.db.update_order(
+                        order_id, status=OrderStatus.CANCELLED, message="already being closed"
+                    )
+                    return self._get_order(order_id)
+                seq = self._mark_closing(key, order.reason, self._now())
+                try:
+                    cap = await self._bot_cap(order.instrument)
+                    if cap is not None and cap.unread:  # the approval stays pending
+                        raise BrokerError("the broker's executions could not be read: try again")
+                    if cap is not None and cap.qty <= EPS:
+                        self._unmark_closing(key, seq)
+                        self.db.update_order(
+                            order_id,
+                            status=OrderStatus.CANCELLED,
+                            message="nothing held is the bot's (the owner's shares)",
+                        )
+                        return self._get_order(order_id)
+                    placed = await self._broker_close(
+                        order.instrument,
+                        order.reason,
+                        trace_id=order.trace_id,
+                        max_qty=cap.qty if cap else None,
+                        keep=cap.keep if cap else 0.0,
+                    )
+                except BrokerError:
+                    # Nothing was sold (a broker error comes before the sell goes out): the
+                    # owner may approve again. A stop it cancelled is put back (re-protect).
+                    self._unmark_closing(key, seq)
+                    raise
+                self._note_capped_close(key, cap, placed, seq)
+                if placed is None:
+                    self.db.update_order(
+                        order_id, status=OrderStatus.CANCELLED, message="no position to close"
+                    )
+                    return self._get_order(order_id)
+                # Journal what was sold: the bot's part when the owner holds the rest.
+                order = order.model_copy(update={"qty": placed.request.qty})
+            else:
+                placed = await self._send_entry(order, now)
+                # Journal the target as sent: none when winners run (exits.no_target).
+                order = order.model_copy(update={"take_profit": placed.request.take_profit})
+                # The stale-entry timer runs from now, not from when it was proposed.
+                self.db.set_kv(SENT_PREFIX + str(order_id), now.isoformat())
+            self.db.update_order(
+                order_id,
+                request=order,
+                status=placed.status,
+                broker_order_id=placed.broker_order_id,
+                filled_qty=placed.filled_qty,
+                avg_fill_price=placed.avg_fill_price,
+                commission=placed.commission,
+                message=_short(f"approved by {actor}; {placed.message}".rstrip("; ")),
+            )
+            if not order.is_exit and placed.status not in _ACCEPTED:
+                self._revert_signal(order_id, f"broker rejected: {placed.message}")
+            log.info("order %d approved by %s -> %s", order_id, actor, placed.status.value)
+            return self._get_order(order_id)
+
+    async def reject_order(self, order_id: int, actor: str = "owner") -> OrderRecord:
+        """Cancel a pending order. Raises LookupError / ValueError like approve_order.
+
+        Uses the same lock as approve_order, so a reject that lands while approval is
+        fetching prices cancels the order before it can be sent.
+        """
+        async with self._entry_lock:
+            self._pending(order_id)
+            self.db.update_order(
+                order_id, status=OrderStatus.CANCELLED, message=f"rejected by {actor}"
+            )
+            self._revert_signal(order_id, f"rejected by {actor}")
+            return self._get_order(order_id)
+
+    def _traced(self, order: OrderRequest, order_id: int | None) -> OrderRequest:
+        """Copy of `order` carrying a unique broker tag, the journal id when we have one."""
+        trace = order_trace_id(order_id, order.trace_id)
+        if order.trace_id == trace:
+            return order
+        return order.model_copy(update={"trace_id": trace})
+
+    def _pending(self, order_id: int) -> OrderRecord:
+        rec = self.db.get_order(order_id)
+        if rec is None:
+            raise LookupError(f"order {order_id} not found")
+        if rec.status != OrderStatus.PENDING_APPROVAL:
+            raise ValueError(f"order {order_id} is not pending approval ({rec.status.value})")
+        return rec
+
+    def _get_order(self, order_id: int) -> OrderRecord:
+        rec = self.db.get_order(order_id)
+        if rec is None:  # pragma: no cover - rows are never deleted
+            raise LookupError(f"order {order_id} not found")
+        return rec
+
+    def _awaiting_approval(self) -> set[str]:
+        return {
+            rec.request.instrument.key
+            for rec in self.db.list_orders(limit=200, statuses=[OrderStatus.PENDING_APPROVAL])
+        }
+
+    def _expire(self, rec: OrderRecord) -> None:
+        if rec.id is None:
+            return
+        self.db.update_order(rec.id, status=OrderStatus.CANCELLED, message="approval expired")
+        self._revert_signal(rec.id, "approval expired")
+        self.db.audit(
+            "approval_expired",
+            {"order_id": rec.id, "symbol": rec.request.instrument.symbol},
+            actor="engine",
+        )
+
+    def _expire_approvals(self, now: datetime) -> None:
+        for rec in self.db.list_orders(limit=200, statuses=[OrderStatus.PENDING_APPROVAL]):
+            if now - _aware(rec.created_at) >= APPROVAL_TTL:
+                self._expire(rec)
+
+    def _cancel_pending(self, message: str, key: str | None = None) -> None:
+        """Cancel the orders waiting for approval (only those for `key` when given)."""
+        for rec in self.db.list_orders(limit=200, statuses=[OrderStatus.PENDING_APPROVAL]):
+            if rec.id is not None and (key is None or rec.request.instrument.key == key):
+                self.db.update_order(rec.id, status=OrderStatus.CANCELLED, message=message)
+                self._revert_signal(rec.id, message)
+
+    # ------------------------------------------------------------------ status
+    def status(self) -> EngineStatus:
+        now = self._now()
+        self._prune_quote_cache(now)
+        day = self._day
+        maker, warning = self._resolve_decider()
+        equity = self._account.equity if self._account is not None else None
+        start = day.start_equity if day is not None else None
+        loss_limit: float | None = None
+        if day is not None and start:
+            baseline = self._halt_eval_day(day).start_equity or start
+            floor = baseline * (1 - self.risk.limits.max_daily_loss_pct / 100)
+            # Negative after a resume while up: the halt then fires above the day's start.
+            loss_limit = round(start - floor, 2)
+        quotes = sorted(self._latest_quotes.values(), key=lambda q: q.instrument.key)
+        return EngineStatus(
+            running=self._running,
+            mode=self.broker.mode,
+            broker=self.broker.name,
+            connected=self.broker.connected,
+            halted=bool(day and day.halted),
+            halt_reason=day.halt_reason if day else None,
+            autopilot=self.settings.autopilot,
+            live_armed=self.db.get_flag("live_armed"),
+            live_allowed=self.config.allow_live,
+            shadow=self.shadow,
+            stock_market_open=stock_market_open(now),
+            last_cycle_at=self._last_cycle_at,
+            next_cycle_at=self._next_cycle_at,
+            last_error=self.last_error,
+            day=day.day if day else trading_day(now),
+            start_equity=start,
+            equity=equity,
+            pnl_today=round(equity - start, 2) if equity is not None and start else None,
+            pnl_target=self.risk.limits.profit_target_usd(start),
+            loss_limit_usd=loss_limit,
+            trades_today=day.trades if day else 0,
+            llm_cost_today=round(day.llm_cost, 4) if day else 0.0,
+            data_delayed=self.broker.data_delayed,
+            decision_maker=maker.name if self.settings.llm_enabled else self.rules.name,
+            decision_warning=warning if self.settings.llm_enabled else None,
+            data_warning=self._data_warning(),
+            delayed_paper_entries=self._delayed_paper_entries_allowed(),
+            quote_health=[self._quote_health(quote, now) for quote in quotes],
+        )
+
+    def _quote_health(self, quote: Quote, now: datetime) -> dict[str, object]:
+        key = quote.instrument.key
+        # The quote as the bot saw it when it last fetched it (what an entry check sees).
+        quoted_at = self._quoted_at.get(key, now)
+        block = quote_block(
+            quote, quoted_at, self.settings.monitor_seconds, self.risk.limits.max_spread_pct
+        )
+        problem, market = (block.reason, block.market) if block else (None, False)
+        # Held positions are re-quoted every monitor tick, other symbols once per decision
+        # cycle (an entry always re-quotes first): only a missed round makes it out of date.
+        held = any(p.qty > 0 and p.instrument.key == key for p in self._positions)
+        # The loop waits the interval after a round ends, and a round itself takes time (a
+        # decision cycle up to DECISION_MAX_AGE), so allow for that before calling it missed.
+        if held:
+            allowed = (STALE_QUOTE_INTERVALS + 1) * self.settings.monitor_seconds
+        else:
+            allowed = (
+                STALE_QUOTE_INTERVALS
+                * max(self.settings.monitor_seconds, self.settings.cycle_seconds)
+                + DECISION_MAX_AGE.total_seconds()
+            )
+        since = (_aware(now) - _aware(quoted_at)).total_seconds()
+        # Out-of-date data outranks a market condition seen in it: the halt or spread may
+        # be long over, and the feed is what needs attention.
+        if (problem is None or market) and since > allowed:
+            problem, market = f"not re-checked for {since:.0f}s", False
+        cooldown = self.risk.limits.halt_cooldown_minutes
+        halted_at = self._halt_seen_at(key)
+        if problem is None and halted_at is not None and cooldown > 0:
+            since = _aware(now) - _aware(halted_at)
+            if since < timedelta(minutes=cooldown):
+                problem = (
+                    f"halted {since.total_seconds() / 60:.0f} min ago (cooldown {cooldown} min)"
+                )
+                market = True
+        is_stock = quote.instrument.asset_class == AssetClass.STOCK
+        delayed = quote.delayed or (self.broker.data_delayed and is_stock)
+        return {
+            "symbol": quote.instrument.symbol,
+            "age_seconds": max(0.0, (_aware(now) - _aware(quote.ts)).total_seconds()),
+            "delayed": delayed,
+            # As the entry check: delayed data blocks stock entries unless paper allows them.
+            "delay_blocks_entry": is_stock
+            and delayed
+            and not self._delayed_paper_entries_allowed(),
+            "has_price": quote.price is not None and math.isfinite(quote.price),
+            "valid": problem is None,
+            "problem": problem,
+            "market_block": problem is not None and market,
+        }
+
+    def _prune_quote_cache(self, now: datetime) -> None:
+        """Keep health warnings scoped to configured, held and recent dynamic symbols."""
+        active = {p.instrument.key for p in self._positions if p.qty > 0}
+        if self.settings.trade_stocks:
+            active.update(
+                Instrument(symbol=s.strip().upper()).key
+                for s in self.settings.stock_universe
+                if self.risk.limits.allow_leveraged_etfs or s.upper() not in LEVERAGED_ETFS
+            )
+        if self.settings.trade_crypto:
+            active.update(
+                Instrument(symbol=s.strip().upper(), asset_class=AssetClass.CRYPTO).key
+                for s in self.settings.crypto_universe
+            )
+        ttl = timedelta(
+            seconds=max(2 * self.settings.cycle_seconds, 2 * self.settings.monitor_seconds)
+        )
+        if (
+            self.settings.trade_stocks
+            and self.settings.dynamic_universe
+            and self._cycle_quote_scope_at is not None
+            and now - self._cycle_quote_scope_at <= ttl
+        ):
+            active.update(self._cycle_quote_scope)
+        self._latest_quotes = {k: q for k, q in self._latest_quotes.items() if k in active}
+        self._quoted_at = {k: t for k, t in self._quoted_at.items() if k in active}
+
+    def _delayed_paper_entries_allowed(self) -> bool:
+        return self.broker.mode == Mode.PAPER and self.risk.limits.allow_delayed_paper_entries
+
+    def _is_delayed_paper_entry(self, order: OrderRequest) -> bool:
+        """A paper stock entry made on delayed data, which only the owner's switch allows
+        (crypto entries were never blocked on delayed data and are not tagged)."""
+        if order.instrument.asset_class != AssetClass.STOCK or self.broker.mode != Mode.PAPER:
+            return False
+        latest = self._latest_quotes.get(order.instrument.key)
+        return self.broker.data_delayed or (latest is not None and latest.delayed)
+
+    def _data_warning(self) -> str | None:
+        warnings = [self.broker.data_warning] if self.broker.data_warning else []
+        delayed = sorted(
+            q.instrument.symbol
+            for q in self._latest_quotes.values()
+            if q.instrument.asset_class == AssetClass.STOCK and q.delayed
+        )
+        paper_allowed = self._delayed_paper_entries_allowed()
+        if paper_allowed and (self.broker.data_delayed or delayed):
+            warnings.append(
+                "Delayed stock market data: paper entries are allowed by your setting. They "
+                "test the order plumbing; their results are kept out of the edge statistics"
+            )
+        elif self.broker.data_delayed:
+            warnings.append("Delayed stock market data: stock entries are blocked")
+        elif delayed:
+            warnings.append(
+                f"Delayed market data for {', '.join(delayed)}: stock entries are blocked"
+            )
+        return "; ".join(warnings) or None
+
+    def snapshot(self) -> dict[str, Any]:
+        """Cached {"account": AccountSnapshot | None, "positions": [Position],
+        "open_orders": [OrderRecord]} from the last monitor tick. Never calls the broker."""
+        return {
+            "account": self._account,
+            "positions": list(self._positions),
+            "open_orders": list(self._open_orders),
+        }
+
+    # ------------------------------------------------------------------ connectivity
+    async def _ensure_connected(self, now: datetime) -> None:
+        if self.broker.connected:
+            if self._down_since is not None:
+                await self._on_reconnected(now)
+            return
+        if self._down_since is None:
+            self._down_since = now
+            log.warning("broker %s is disconnected", self.broker.name)
+            self.db.audit("broker_disconnected", {"broker": self.broker.name}, actor="engine")
+        if not self._down_notified and now - self._down_since >= BROKER_DOWN_NOTIFY_AFTER:
+            # Marked before it goes out, so a slow send is not sent again each tick; one
+            # that was not delivered clears the mark and the next tick retries (the network
+            # may be what is down).
+            self._down_notified = True
+            outage = self._down_since
+            await self._notify(
+                "Broker disconnected",
+                f"{self.broker.name} has been unreachable since "
+                f"{self._down_since:%H:%M:%S} UTC. Broker-side stops still protect stocks.",
+                priority="high",
+                tags=["warning"],
+                on_result=lambda sent: self._down_alert_result(outage, sent),
+            )
+        await self.broker.connect()
+        if not self.broker.connected:
+            raise BrokerError("broker did not report connected after connect()")
+        await self._on_reconnected(now)
+
+    def _down_alert_result(self, outage: datetime, delivered: bool) -> None:
+        if not delivered and self._down_since == outage:
+            self._down_notified = False  # still down: the next tick sends it again
+
+    async def _on_reconnected(self, now: datetime) -> None:
+        down_for = (now - self._down_since).total_seconds() if self._down_since else 0.0
+        log.info("broker connected again after %.0fs", down_for)
+        self.db.audit("broker_reconnected", {"down_seconds": round(down_for)}, actor="engine")
+        if self._down_notified:
+            await self._notify("Broker reconnected", f"Connection restored after {down_for:.0f}s.")
+        self._down_since = None
+        self._down_notified = False
+        self._arm_reprotect()
+        self._busy_at = now  # what happened while disconnected is not known to be quiet
+        self._fills_journaled_at = None
+
+    # ------------------------------------------------------------------ monitor
+    async def monitor_tick(self) -> None:
+        """One monitor pass. Raises BrokerError when the broker is unreachable."""
+        async with self._monitor_lock:
+            now = self._now()
+            day = self._today(now)
+            self._expire_approvals(now)
+            await self._ensure_connected(now)
+            account = await self.broker.account()
+            await self._check_account(account, now)
+            close_seq = dict(self._close_seq)  # a close stamped after this is not in the reads
+            armed = self._reprotect_armed  # likewise for re-protect armed after the reads
+            raw_positions = await self.broker.positions()
+            open_orders = await self.broker.open_orders()
+            # Which app entries are working, from the broker (journal rows may be stale here).
+            fresh = self._working_buys(open_orders)
+            if self._fills_journaled_at is None or self._entry_buys is None:
+                self._entry_buys = fresh  # first tick of a connection: fills journaled below
+            else:
+                # An entry that finished filling since the last read has its fills journaled
+                # only later this tick: it counts as working until they are.
+                self._entry_buys = fresh | self._entry_buys
+            if self._fills_journaled_at is None:
+                # First tick on this connection: journal what filled while the app was down
+                # before managing anything, so a bot position that closed meanwhile is not
+                # managed again on shares held under its symbol now (the owner's buy since).
+                # (The working orders of this read: what the app's own sells filled.)
+                self._open_orders = open_orders
+                await self._step("journal", self._first_sync(now))
+            # A bot position the crypto watchdog sold, or whose exit is already journaled:
+            # what is held under the symbol now (the owner's buy since) is not the bot's.
+            metas = {
+                key: meta
+                for key, meta in self.db.all_position_meta().items()
+                if not sold_by_watchdog(self.db, key, meta) and not self._meta_used(key, meta)
+            }
+            quotes = await self._quotes([p.instrument for p in raw_positions if p.qty > 0], now)
+            self._note_data_warning()
+            positions = self._mark_positions(raw_positions, quotes, metas)
+            account = self._mark_account(account, raw_positions, positions)
+            previous = self._account
+            if (
+                any(p.qty != 0 for p in raw_positions)
+                or open_orders
+                or self.broker.holds_untracked_positions()
+            ):
+                self._busy_at = now
+            self._account, self._positions, self._open_orders = account, positions, open_orders
+            self._prune_quote_cache(now)
+
+            if math.isfinite(account.equity) and account.equity > 0:
+                changed = False
+                if not self._rebase_pending:
+                    flow = self._external_cash_flow(previous, account, now)
+                    if flow:
+                        await self._apply_cash_flow(flow, account, day, now)
+                        changed = True
+                if self._rebase_pending:
+                    self._rebase_pending = False
+                    if day.start_equity is not None and day.start_equity != account.equity:
+                        log.info(
+                            "%s: today's P&L restarts from $%.2f",
+                            self._epoch_reason,
+                            account.equity,
+                        )
+                        day.start_equity, changed = account.equity, True
+                        self.db.set_kv(BASELINE_PREFIX + day.day, "")
+                        if is_soft_halt(day.halt_reason):  # the target was the old account's
+                            day.halted, day.halt_reason = False, None
+                        # The equity curve restarts too, with a first point right now.
+                        self.db.start_equity_history(now)
+                        self._last_equity_at = None
+                if not changed:
+                    gap = self._untraded_day_gap(day, account, now)
+                    if gap:
+                        await self._rebase_untraded_day(gap, account, day, now)
+                        changed = True
+                if day.start_equity is None:
+                    day.start_equity, changed = account.equity, True
+                if day.end_equity != account.equity:
+                    day.end_equity, changed = account.equity, True
+                if changed:
+                    self._save_day()
+                if self._last_equity_at is None or now - self._last_equity_at >= EQUITY_POINT_EVERY:
+                    self.db.add_equity_point(account.equity, ts=now)
+                    self._last_equity_at = now
+                await self._step("halts", self._check_halts(now, account))
+            else:
+                # e.g. IBKR before the account summary arrives: never halt or flatten on it.
+                # A pending halt stays pending (no entries) but must be seen again twice.
+                self._halt_streak = None
+                log.warning("account equity %r is not usable; halts not evaluated", account.equity)
+                self._set_error("monitor:halts", "account equity not available")
+            if self._fills_journaled_at is None:
+                # What filled while the app was down is not journaled yet: a metadata row
+                # may describe a bot position that closed meanwhile, and shares under its
+                # symbol may be the owner's. Broker stops keep protecting the bot's stocks;
+                # the stale heartbeat lets the crypto watchdog act. Re-protect stays armed.
+                self._set_error("monitor:exits", "fills since the (re)connect not journaled yet")
+            else:
+                # Also in shadow mode: these only exit or protect positions the engine opened.
+                await self._step("exits", self._manage_positions(now, positions, quotes, metas))
+                # Only a pass that actually checked stops refreshes the heartbeat. A broker
+                # failure leaves it stale so the crypto watchdog can sell on its own
+                # connection.
+                if "monitor:exits" not in self._errors:
+                    write_heartbeat(self.db, now)
+                await self._step("flatten", self._flatten_before_close(now, positions, metas))
+                await self._step(
+                    "re-protect",
+                    self._reprotect(now, positions, open_orders, metas, close_seq, armed),
+                )
+            await self._step("journal", self._sync_journal(now, positions, open_orders))
+            # Scoring the ledger requests history (up to 45 s a request): in a task of its
+            # own, so stop checks, halts and the heartbeat never wait for it.
+            if self._ledger_task is None or self._ledger_task.done():
+                self._ledger_task = asyncio.create_task(
+                    self._step("signals", self._evaluate_signals(now)), name="engine-ledger"
+                )
+
+    async def _quotes(self, instruments: Sequence[Instrument], now: datetime) -> dict[str, Quote]:
+        """Quotes for several instruments (concurrency-limited); failures are skipped."""
+        sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+        async def one(inst: Instrument) -> tuple[str, Quote | None]:
+            async with sem:
+                try:
+                    return inst.key, await self.broker.quote(inst)
+                except Exception as exc:
+                    log.warning("quote for %s failed: %s", inst.key, exc)
+                    return inst.key, None
+
+        out: dict[str, Quote] = {}
+        for key, quote in await asyncio.gather(*(one(i) for i in instruments)):
+            if quote is not None:
+                self._track_halt(key, quote, self._now())
+                out[key] = quote
+        return out
+
+    def _note_data_warning(self) -> None:
+        """Mirror the broker's market-data warning (e.g. IBKR 10197) into last_error."""
+        warning = self.broker.data_warning
+        if not warning:
+            self._clear_error("market data")
+        elif self._errors.get("market data", (None, None))[1] != _short(warning, 300):
+            log.warning("market data: %s", warning)
+            self._set_error("market data", warning)
+
+    # ------------------------------------------------------------------ day trades
+    def _with_day_trades(self, account: AccountSnapshot, now: datetime) -> AccountSnapshot:
+        """`account` with DayTradesRemaining lowered by the bot's own recent day trades.
+
+        IBKR pushes DayTradesRemaining only every few minutes, so a stock round trip that
+        just closed may not be counted yet and one more entry could become the day trade
+        that flags the account. Same-day round trips whose closing fill is younger than
+        PDT_REFRESH are subtracted. This is conservative: for a few minutes a trade IBKR
+        already counted may be subtracted twice, which can only block an entry."""
+        remaining = account.day_trades_remaining
+        if remaining is None:
+            return account
+        used = self._recent_day_trades(now) + self._open_day_trades(now)
+        if used <= 0:
+            return account
+        return account.model_copy(update={"day_trades_remaining": max(0, remaining - used)})
+
+    def _open_day_trades(self, now: datetime) -> int:
+        """Bot stock positions opened today and not closed yet, entries still working
+        included (their meta is written before the order is sent): each becomes a day
+        trade when it is sold today, at the latest by the flatten before the close, but
+        IBKR counts it only then. Counted now, so one more entry cannot be the day trade
+        that flags the account."""
+        today = trading_day(now)
+        return sum(
+            1
+            for key, meta in self.db.all_position_meta().items()
+            if key.startswith(f"{AssetClass.STOCK.value}:")
+            and meta.get("opened_at") is not None
+            and trading_day(_aware(meta["opened_at"])) == today
+        )
+
+    def _recent_day_trades(self, now: datetime) -> int:
+        """Stock exit orders (by order id) filled within PDT_REFRESH that closed shares
+        bought earlier the same New York day, from the fills journal."""
+        today = trading_day(now)
+        fills = [
+            f
+            for f in self.db.list_fills(since=now - timedelta(days=1), limit=FILL_QUERY_LIMIT)
+            if f.instrument.asset_class == AssetClass.STOCK
+            and trading_day(_aware(f.ts)) == today
+            and (self._epoch is None or _aware(f.ts) >= self._epoch)
+        ]
+        fills.sort(key=lambda f: (_aware(f.ts), f.exec_id))
+        bought: set[str] = set()
+        closed: set[tuple[str, str]] = set()
+        for fill in fills:
+            key = fill.instrument.key
+            if fill.side == Side.BUY:
+                bought.add(key)
+            elif key in bought and now - _aware(fill.ts) <= PDT_REFRESH:
+                closed.add((key, fill.broker_order_id or fill.exec_id))
+        return len(closed)
+
+    # ------------------------------------------------------------------ account changes
+    async def _check_account(self, account: AccountSnapshot, now: datetime) -> None:
+        """Remember which broker account the journal belongs to. When it changes (sim ->
+        paper "DU..." -> live "U..."), start a new journal epoch so the engine never manages
+        positions or orders it did not open on this account."""
+        current = (account.account_id or "").strip()
+        if not current:
+            return
+        known = self.db.get_kv(ACCOUNT_KEY)
+        if known == current:
+            return
+        self.db.set_kv(ACCOUNT_KEY, current)
+        if not current.upper().startswith("DU"):
+            self._end_code_only_sessions(current)
+        if not known:
+            self.db.set_kv("journal_account_since", now.isoformat())
+            log.info("journal belongs to broker account %s", _mask(current))
+            return
+        await self._on_account_changed(known, current, now)
+
+    def _end_code_only_sessions(self, account: str) -> None:
+        """With Cloudflare Access off, a session opened with the code alone on paper must not
+        carry over to a live account: end every session, so the next sign-in needs the
+        password. Also when the password was turned back on in the same restart (sessions
+        outlive restarts, and how one was opened is not recorded): one extra sign-in."""
+        cfg = self.config
+        if cfg.cf_access_enabled or cfg.broker == "sim":
+            return
+        self.db.delete_all_sessions()
+        log.warning("now on live account %s: every session ended", _mask(account))
+        self.db.audit(
+            "sessions_ended",
+            {"account": _mask(account), "reason": "live account without Cloudflare Access"},
+            actor="engine",
+        )
+
+    async def _on_account_changed(self, old: str, new: str, now: datetime) -> None:
+        reason = "broker account changed"
+        log.warning("%s: %s -> %s; starting a new journal epoch", reason, _mask(old), _mask(new))
+        self._epoch, self._epoch_reason, self._rebase_pending = now, reason, True
+        self.db.set_kv("journal_account_since", now.isoformat())
+        # The equity curve restarts with the new account, whatever today's row holds (the
+        # first tick of a new day has no start equity to compare yet).
+        self.db.start_equity_history(now)
+        self._last_equity_at = None
+        self._latest_quotes.clear()
+        self._cycle_quote_scope.clear()
+        self._cycle_quote_scope_at = None
+        self._cancel_pending(f"cancelled: {reason}")
+        stale = self.db.list_orders(limit=500, statuses=OPEN_ORDER_STATUSES)
+        for rec in stale:
+            if rec.id is not None:
+                self.db.update_order(
+                    rec.id,
+                    status=OrderStatus.CANCELLED,
+                    message=_short(f"{rec.message}; {reason}: left with the previous account"),
+                )
+        metas = self.db.all_position_meta()
+        for key in metas:
+            self.db.delete_position_meta(key)
+            self.db.set_kv(EXTRA_PREFIX + key, "{}")
+        for cache in (self._closing, self._close_reasons, self._open_qty, self._breaches):
+            cache.clear()
+        self._pending_trades.clear()
+        self._halt_streak, self._halt_pending = None, None
+        disarmed = self.db.get_flag("live_armed")
+        if disarmed:
+            self.db.set_flag("live_armed", False)  # arming was for the previous account
+        self.db.audit(
+            "account_changed",
+            {
+                "from": _mask(old),
+                "to": _mask(new),
+                "orders_closed_out": len(stale),
+                "positions_forgotten": len(metas),
+                "live_disarmed": disarmed,
+            },
+            actor="engine",
+        )
+        await self._notify(
+            "Broker account changed",
+            f"Now on {_mask(new)} (was {_mask(old)}). The bot forgot {len(metas)} position(s) "
+            f"and {len(stale)} working order(s) of the previous account and will not manage "
+            "them; today's P&L restarts from this account's equity."
+            + (" Live trading was disarmed." if disarmed else ""),
+            priority="high",
+            tags=["warning"],
+        )
+
+    def _track_halt(self, key: str, quote: Quote, now: datetime) -> None:
+        self._latest_quotes[key] = quote
+        self._quoted_at[key] = now
+        if quote.halted:
+            if key not in self._last_halt_at or now - self._last_halt_at[key] > CLOSE_RETRY:
+                log.info("%s is halted", key)
+            self._last_halt_at[key] = now
+            self.db.set_kv(
+                HALT_SEEN_PREFIX + key, now.isoformat()
+            )  # the cooldown survives a restart
+
+    def _halt_seen_at(self, key: str) -> datetime | None:
+        """When the instrument was last seen halted (this process, else the journal)."""
+        seen = self._last_halt_at.get(key)
+        if seen is None:
+            raw = self.db.get_kv(HALT_SEEN_PREFIX + key)
+            with contextlib.suppress(TypeError, ValueError):
+                seen = self._last_halt_at[key] = _aware(datetime.fromisoformat(raw or ""))
+        return seen
+
+    def _mark_positions(
+        self, raw: list[Position], quotes: dict[str, Quote], metas: dict[str, dict[str, Any]]
+    ) -> list[Position]:
+        """Positions valued at the bid (what they could be sold for) with engine metadata."""
+        out: list[Position] = []
+        for pos in raw:
+            key = pos.instrument.key
+            quote = quotes.get(key)
+            # Implausible quotes (crossed, bid far from last) are ignored: the broker's own
+            # mark is used instead, so one bad tick cannot move equity or trigger a halt.
+            mark = sane_exit_price(quote) or pos.market_price
+            meta = metas.get(key, {})
+            out.append(
+                pos.model_copy(
+                    update={
+                        "market_price": mark,
+                        "unrealized_pnl": (
+                            (mark - pos.avg_cost) * pos.qty if mark else pos.unrealized_pnl
+                        ),
+                        "stop_loss": meta.get("stop_loss"),
+                        "take_profit": meta.get("take_profit"),
+                        "opened_at": meta.get("opened_at") or pos.opened_at,
+                        "setup": meta.get("setup"),
+                    }
+                )
+            )
+        return out
+
+    @staticmethod
+    def _mark_account(
+        account: AccountSnapshot, raw: list[Position], marked: list[Position]
+    ) -> AccountSnapshot:
+        """Re-value the broker's equity with positions at the bid."""
+        adjust = 0.0
+        for before, after in zip(raw, marked, strict=True):
+            if before.market_price and after.market_price:
+                adjust += before.qty * (after.market_price - before.market_price)
+        return account.model_copy(
+            update={
+                "equity": account.equity + adjust,
+                "unrealized_pnl": sum(p.unrealized_pnl for p in marked),
+            }
+        )
+
+    # ------------------------------------------------------------------ halts
+    async def _check_halts(self, now: datetime, account: AccountSnapshot) -> None:
+        day = self._today(now)
+        reason = self.risk.halt_reason(account=account, day=self._halt_eval_day(day))
+        if reason is None:
+            self._halt_streak, self._halt_pending = None, None
+            return
+        hard = reason.startswith(HALT_DAILY_LOSS)
+        if day.halted and not (hard and is_soft_halt(day.halt_reason)):
+            self._halt_streak, self._halt_pending = None, None
+            return  # already halted; only a soft halt can escalate to a hard one
+        if self._may_be_untraded_gap(day, account, now):
+            # A balance change made while the app or gateway was away (e.g. a paper reset):
+            # the untraded-day check books it once the account has been quiet. Entries wait
+            # (pending), nothing is flattened (the account is flat).
+            if self._halt_pending != reason:
+                log.warning("halt condition seen (%s); waiting for the balance check", reason)
+            self._halt_streak, self._halt_pending = None, reason
+            return
+        # A halt (and the flatten that comes with a loss halt) needs the condition on
+        # consecutive ticks, so one bad equity print cannot sell everything. Meanwhile no
+        # new entry goes out (run_cycle and approvals check _halt_pending).
+        kind = "loss" if hard else "target"
+        streak = self._halt_streak
+        ticks, first = (streak[1] + 1, streak[2]) if streak and streak[0] == kind else (1, now)
+        self._halt_streak = (kind, ticks, first)
+        if not self._confirms(ticks, first, now):
+            if self._halt_pending != reason:
+                log.warning("halt condition seen (%s); confirming on the next tick", reason)
+            self._halt_pending = reason
+            return
+        self._halt_streak, self._halt_pending = None, None
+        day.halted, day.halt_reason = True, reason
+        self._save_day()
+        log.warning("trading halted: %s", reason)
+        self.db.audit("halt", {"reason": reason}, actor="engine")
+        self._cancel_pending(f"cancelled: trading halted ({reason})")
+        flatten = hard and self.risk.limits.flatten_on_halt
+        detail = reason
+        if flatten:
+            try:
+                if self.shadow:
+                    records = await self._flatten_engine_positions(reason, now)
+                    detail += f"; shadow mode: closing {len(records)} bot position(s) only"
+                else:
+                    records = await self._flatten_all(reason, now)
+                    detail += f"; closing {len(records)} position(s)"
+            except Exception as exc:
+                log.exception("flatten after halt failed")
+                self._set_error("flatten", f"flatten failed: {exc}")
+                await self._notify(
+                    "Flatten FAILED",
+                    f"Halted ({reason}) but could not close positions: {_short(str(exc))}",
+                    priority="urgent",
+                    tags=["rotating_light"],
+                )
+        await self._notify(
+            "Trading halted",
+            detail,
+            priority="high" if hard else "default",
+            tags=["warning"] if hard else ["white_check_mark"],
+        )
+
+    async def _flatten_all(self, reason: str, now: datetime) -> list[OrderRecord]:
+        seqs = {
+            pos.instrument.key: self._mark_closing(pos.instrument.key, reason, now)
+            for pos in self._positions
+        }
+        async with self._entry_lock:  # no entry can slip in after the flatten
+            try:
+                records = await self.broker.flatten_all(reason)  # cancels everything first
+            except PartialFlattenError as exc:
+                for rec in exc.records:  # sent before another position failed
+                    self._journal_order(rec, now)
+                    key = rec.request.instrument.key
+                    self._note_close(key, rec, seqs.get(key))
+                refused = _refused_exits(exc.records)
+                if refused:  # the alert must name these too
+                    raise PartialFlattenError(
+                        f"the broker refused to close {refused}; {exc}", exc.records
+                    ) from exc
+                raise
+        for rec in records:
+            self._journal_order(rec, now)
+            key = rec.request.instrument.key
+            self._note_close(key, rec, seqs.get(key))
+        self.db.audit("flatten", {"reason": reason, "orders": len(records)}, actor="engine")
+        refused = _refused_exits(records)
+        if refused:
+            raise BrokerError(f"the broker refused to close {refused}")
+        self._clear_error("flatten")
+        return records
+
+    async def _flatten_engine_positions(self, reason: str, now: datetime) -> list[OrderRecord]:
+        """Shadow-mode flatten: close only the positions the engine opened (with
+        positions_meta). Positions the owner holds on the live account are never touched."""
+        metas = self.db.all_position_meta()
+        records: list[OrderRecord] = []
+        failed: list[str] = []
+        try:
+            async with self._entry_lock:
+                for pos in list(self._positions):
+                    key = pos.instrument.key
+                    meta = metas.get(key)
+                    if (
+                        pos.qty <= 0
+                        or meta is None
+                        or sold_by_watchdog(self.db, key, meta)
+                        or self._meta_used(key, meta)
+                    ):
+                        continue
+                    seq = self._mark_closing(key, reason, now)
+                    # One failure must not leave the other positions unsold (as flatten_all).
+                    try:
+                        cap = await self._bot_cap(pos.instrument)
+                        if cap is not None and cap.unread:  # undecided: the halt alerts
+                            self._unmark_closing(key, seq)
+                            failed.append(
+                                f"{pos.instrument.symbol}: the broker's executions could not "
+                                "be read"
+                            )
+                            continue
+                        if cap is not None and cap.qty <= EPS:
+                            self._note_close(key, None, seq)  # only the owner's shares
+                            continue
+                        rec = await self._broker_close(
+                            pos.instrument,
+                            reason=reason,
+                            max_qty=cap.qty if cap else None,
+                            keep=cap.keep if cap else 0.0,
+                        )
+                    except BrokerError as exc:  # close_position put the stop back
+                        failed.append(f"{pos.instrument.symbol}: {exc}")
+                        continue
+                    self._note_capped_close(key, cap, rec, seq)
+                    if rec is not None:
+                        records.append(rec)
+        finally:
+            for rec in records:  # what was sent is journaled even if a later close failed
+                self._journal_order(rec, now)
+        self.db.audit(
+            "flatten", {"reason": reason, "orders": len(records), "scope": "bot"}, actor="engine"
+        )
+        refused = _refused_exits(records)
+        problems = ([f"the broker refused to close {refused}"] if refused else []) + failed
+        if problems:
+            raise BrokerError("; ".join(problems))
+        self._clear_error("flatten")
+        return records
+
+    # ------------------------------------------------------------------ exits
+    def _closing_now(self, key: str, now: datetime) -> bool:
+        since = self._closing.get(key)
+        return since is not None and now - since < CLOSE_RETRY
+
+    def _close_in_flight(self, key: str, now: datetime) -> bool:
+        """A close was sent in the last CLOSE_RETRY and the broker did not refuse it."""
+        return self._closing_now(key, now) and key not in self._close_refused
+
+    def _arm_reprotect(self) -> None:
+        """Have the next monitor pass look for positions missing their broker stop. The
+        count tells a pass whether it was armed again after the pass read the positions
+        (an entry whose stop the broker refused, filled meanwhile): then it stays armed."""
+        self._reprotect_pending = True
+        self._reprotect_armed += 1
+
+    def _mark_closing(self, key: str, reason: str, at: datetime) -> int:
+        """Stamp a close attempt; returns its number for _note_close. Arms re-protect: a
+        close that fails part-way (e.g. the link drops after the stop's cancel, before the
+        sell) gets its stop back once the attempt's marker lapses."""
+        self._arm_reprotect()
+        self._closing[key] = at
+        self._close_reasons[key] = reason
+        self._close_refused.discard(key)
+        seq = self._close_seq.get(key, 0) + 1
+        self._close_seq[key] = seq
+        return seq
+
+    def _unmark_closing(self, key: str, seq: int) -> None:
+        """Drop this attempt's marker, unless a newer attempt stamped its own meanwhile."""
+        if self._close_seq.get(key) == seq:
+            self._closing.pop(key, None)
+            self._close_reasons.pop(key, None)
+
+    def _note_close(self, key: str, rec: OrderRecord | None, seq: int | None) -> None:
+        """After a close attempt: one the broker refused (or that found nothing to sell)
+        is not in flight, unless a newer attempt was stamped meanwhile. An exception is
+        never noted: the sell may have gone out before it."""
+        if seq is not None and self._close_seq.get(key) != seq:
+            return
+        if rec is None or rec.status == OrderStatus.REJECTED:
+            self._close_refused.add(key)
+
+    def _note_capped_close(
+        self, key: str, cap: Cap | None, rec: OrderRecord | None, seq: int
+    ) -> None:
+        """_note_close for a close sized to the bot's part. The broker sizes it again after
+        cancelling the bot's stop: when the position changed meanwhile (the owner sold) and
+        it sold less than the bot's part, or nothing, the bot's units may be left with no
+        stop. Look again on the next tick (re-protect, a fresh cap), not after CLOSE_RETRY."""
+        if cap is not None and (rec is None or rec.request.qty < cap.qty - EPS):
+            self._unmark_closing(key, seq)
+            return
+        self._note_close(key, rec, seq)
+
+    async def _bot_cap(self, inst: Instrument) -> Cap | None:
+        """How much a bot exit may sell of `inst` right now: None when nothing says the
+        owner bought the symbol since the bot's entry was sent (sell all of it, as before);
+        else the bot's own quantity (`qty`, 0: none of it) and the owner's known units
+        (`keep`). The position is read fresh, and the fills are the journal and the
+        broker's executions: the journal alone is a tick behind (a bot sale and an owner
+        buy since then may net out)."""
+        key = inst.key
+        meta = self.db.get_position_meta(key)
+        opened = meta.get("opened_at") if meta else None
+        if meta is None or opened is None:
+            return None
+        held = next(
+            (p.qty for p in await self.broker.positions() if p.instrument.key == key and p.qty > 0),
+            0.0,
+        )
+        if held <= EPS:
+            return None
+        since = _aware(opened) - FILL_TIME_SKEW
+        sales = watchdog_sales(self.db, key, position_marker(meta), opened)
+        bot_first = sales[0] - FILL_TIME_SKEW if sales is not None else None
+        sales_end = watchdog_sales_end(self.db, key, position_marker(meta))
+        bot_until = sales_end + FILL_TIME_SKEW if sales_end is not None else None
+        journal = [
+            f
+            for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+            if f.instrument.key == key
+        ]
+        read = True
+        try:
+            fresh = [f for f in await self.broker.fills_since(since) if f.instrument.key == key]
+        except BrokerError as exc:
+            log.warning(
+                "%s: executions not read (%s); the journal decides the bot's part", key, exc
+            )
+            fresh, read = [], False
+        fills = merge_fills(journal, fresh)
+        extra = self._extra(key)
+        limit = entry_qty(extra, meta)
+        split = split_fills(
+            fills,
+            bot_first_from=bot_first,
+            bot_first_qty=sales[1] if sales is not None else None,
+            bot_first_until=bot_until,
+            entry=limit,
+            entry_sent=opened,
+            hidden=read_hidden(extra),
+        )
+        rows = order_rows(self.db, _aware(opened), key)  # the app's order rows: read once
+        # The app's own sells its order rows (or its working orders) show filled beyond the
+        # fills read (the journal is behind, or they filled on a day IBKR no longer reports)
+        # sold the bot's units, whatever is held now.
+        app_sold = self._app_sold_beyond(key, _aware(opened), fills, rows)
+        filled = 0.0  # of the unseen part of the entry, what surely filled and is the bot's
+        working: list[OrderRecord] | None = None  # the broker's open orders, read fresh
+        # The executions read, and nobody else in the window (no other client's fill, none of
+        # the owner's units no fill shows, no watchdog sale) and no more held than the bot's
+        # fills show less its own known sales: all of it is the bot's whatever the unseen
+        # part of its entry, so the open orders are not read again (pure bot, as before).
+        alone = (
+            read
+            and sales is None
+            and not extra.get(OWNER_HIDDEN)
+            and not any(is_other_client(f) for f in fills)
+            and held <= max(0.0, split.bot - app_sold) + max(EPS, 1e-6 * held)
+        )
+        if limit is not None and split.unseen > EPS and not extra.get(REST_SETTLED) and not alone:
+            # Read after the position: an entry's fill in between only credits more.
+            working = await self.broker.open_orders()
+            # The app's own sells as this read shows them too: a bracket child may have sold
+            # since the tick's read, out of the very fill credited below.
+            app_sold = self._app_sold_beyond(key, _aware(opened), fills, rows, working)
+            # Only what of the entry may really have filled beyond the fills is held unseen:
+            # an entry still working that filled nothing, or one the app saw lapse, holds
+            # none of it (units no fill shows are then the owner's buy).
+            possible = entry_held_unjournaled(
+                self.db, key, _aware(opened), fills, working, rows=rows
+            )
+            filled = await self._entry_filled_unseen(
+                inst, _aware(opened), fills, split, limit, working, app_sold, rows
+            )
+            unseen = split.unseen if possible is None else min(split.unseen, possible)
+            split = replace(split, bot=split.bot + filled, unseen=max(0.0, unseen - filled))
+        if app_sold > EPS:
+            split = less_sold(split, app_sold)
+        split = for_sizing(split, extra)
+        if extra.get(OWNER_HIDDEN) and inst.asset_class != AssetClass.CRYPTO and split.unseen > EPS:
+            # The owner's units no fill shows were found with all of the entry's unseen part
+            # taken as held; a bracket child that sold some of it on a day IBKR no longer
+            # reports shrank the stop: the bot holds no more than its stops cover.
+            cover = await self._stop_cover(inst, working)
+            split = replace(split, unseen=min(split.unseen, max(0.0, cover - split.bot)))
+        base = split
+        bought = lagging = False
+        if sales is not None and bot_first is not None:
+            # More held than the bot can still hold once the watchdog's sales known to
+            # have filled are off: the owner bought since (even where IBKR no longer
+            # reports it, and less than the bot's entry). With the executions unread, a
+            # sale of its still working counts at what it asked (an IOC fills at once, and
+            # its record says done only on the watchdog's next poll): overstated, the bot
+            # only waits, undecided, for that poll.
+            done = watchdog_filled(self.db, key, position_marker(meta)) if read else sales
+            if done is not None:
+                sold = unreported_sales(done[1], fills, bot_first, bot_until)
+                bought = bought_since(held, limit, less_sold(split, sold))
+            # The watchdog's sales no fill shows (an earlier day IBKR no longer reports)
+            # came out of the bot's units all the same.
+            split = less_sold(split, unreported_sales(sales[1], fills, bot_first, bot_until))
+        if not bought:
+            # More held than the bot can still hold after its own sales (a partial exit
+            # leaves room under the entry's quantity): the owner bought where neither the
+            # journal nor the executions show it (the read failed, or an earlier day IBKR
+            # no longer reports). A sale of the app's of the last moments may not be in the
+            # position read yet: its units may still be in `held`.
+            now = self._now()
+            recent = app_sold + sum(
+                f.qty
+                for f in base.bot_fills
+                if f.side == Side.SELL
+                and not is_other_client(f)
+                and now - _aware(f.ts) < 2 * FILL_TIME_SKEW
+            )
+            bought = bought_since(held - recent, limit, base)
+            # More held than the bot can still hold only while those sales count: the read
+            # may lag them (pure bot), or the owner bought where no fill shows it (the
+            # retry right after a partial exit). Either way the bot holds at most its own
+            # units: sell no more, keeping the owner's known ones (the broker sizes again
+            # on a fresh read after the cancels, so a lagging read still sells them all).
+            lagging = not bought and bought_since(held, limit, base)
+        if lagging and limit is not None:
+            if not read:
+                self._reprotect_pending = True  # undecided, not "none of it": look again
+                return Cap(qty=0.0, keep=held, unread=True)
+            # The unseen part of the entry only for what the read less those sales leaves
+            # beyond both sides' units, only with no owner buy known (else the excess may be
+            # his: sell_cap credits it only when it fits in that part), and only for what of
+            # the entry may really have filled beyond the journal (a lapsed rest did not).
+            unseen = 0.0
+            if split.owner_bought <= EPS and split.unseen > EPS:
+                sure, unknown = app_entry_unjournaled(
+                    self.db, key, _aware(opened), fills, [], rows=rows
+                )
+                unseen = min(
+                    split.unseen,
+                    max(0.0, sure + unknown - filled),  # `filled` is in split.bot already
+                    max(0.0, held - recent - split.bot - split.owner),
+                )
+            mine = self.broker.round_qty(
+                inst,
+                round(max(0.0, min(split.bot + unseen, limit)), 8),
+                allow_fractional=self.settings.allow_fractional_stocks,
+            )
+            return Cap(qty=mine, keep=max(0.0, split.owner))
+        cap = sell_cap(held, limit, split, evidence=bought)
+        if cap is None:
+            if not read:
+                # Nothing says the owner bought, but with the executions unread only as of
+                # this position read and the journal (a tick behind): the read may lag his
+                # buy. Sell no more than this read holds: the broker's fresh read after its
+                # cancels only shrinks it, never sells what a later read shows beyond it.
+                return Cap(qty=held, keep=0.0)
+            return None
+        if not read and working is None:
+            # The tick's open orders may be older than a fill of the bot's own bracket child
+            # that the position read lags (IBKR's portfolio is slower than its order
+            # status) and the journal does not show yet: look at them again.
+            working = await self.broker.open_orders()
+            app_sold = self._app_sold_beyond(key, _aware(opened), fills, rows, working)
+        if not read and (
+            app_sold > EPS
+            or abs(held - (split.bot + split.owner)) > max(EPS, 1e-6 * held)
+            or await self._bot_sold_unseen(inst, opened, fills, split.bot, rows, working)
+        ):
+            # The journal is behind the position and the executions could not say whose
+            # the difference is: sell nothing now (looked at again after CLOSE_RETRY). A
+            # sale of the app's beyond the journal says it is behind too, even when the
+            # read matches once that sale is off (a bracket child's sale beside it has no
+            # row, and his buy since may fill the gap). So does a bracket stop that no
+            # longer covers the bot's units: a child that sold them all is done, in no
+            # open-orders read, and the position read may lag its sale.
+            log.warning(
+                "%s: %g held, the journal shows %g of the bot's and %g of the owner's; not "
+                "sized until the executions are read",
+                key,
+                held,
+                split.bot,
+                split.owner,
+            )
+            self._reprotect_pending = True  # undecided, not "none of it": look again
+            return Cap(qty=0.0, keep=held, unread=True)
+        owner = cap.keep
+        short = split.bot + split.owner - held
+        if short > max(EPS, 1e-6 * held) and owner > EPS:
+            # Less held than the bot's and the owner's units: a sale on a day IBKR no
+            # longer reports. Another client's sells come out of the owner's units first,
+            # so unless one of the bot's own may have sold unseen, it was his.
+            if await self._bot_sold_unseen(inst, opened, fills, split.bot, rows, working):
+                self._note_unknown_sale(inst, meta, held, split.bot, owner)
+            else:
+                # Only units he held before today were in it (today's executions still
+                # report a sale): what he bought since was not sold.
+                today = trading_day_start(trading_day(self._now()))
+                before = for_sizing(
+                    split_fills(
+                        [f for f in fills if _aware(f.ts) < today],
+                        bot_first_from=bot_first,
+                        bot_first_qty=sales[1] if sales is not None else None,
+                        bot_first_until=bot_until,
+                        entry=limit,
+                        entry_sent=opened,
+                        hidden=[(at, q) for at, q in read_hidden(extra) if at < today],
+                    ),
+                    extra,
+                )
+                owner = max(0.0, owner - min(short, before.owner))
+        mine = self.broker.round_qty(
+            inst,
+            round(min(cap.qty, max(0.0, held - owner)), 8),
+            allow_fractional=self.settings.allow_fractional_stocks,
+        )
+        # Everything held now that is not the bot's stays: a sale of the bot's (its bracket
+        # child) or a second close landing before this one's sell only shrinks it.
+        cap = Cap(qty=mine, keep=max(owner, held - mine))
+        if mine < held - EPS:
+            self._note_owner_shares(inst, meta, held, mine)
+        if held - (split.bot + split.owner) > max(EPS, mine - split.bot, 1e-6 * held):
+            self._note_unexplained(inst, meta, held, split.bot, split.owner)
+        return cap
+
+    async def _entry_filled_unseen(
+        self,
+        inst: Instrument,
+        opened: datetime,
+        fills: list[Fill],
+        split: Split,
+        limit: float,
+        working: list[OrderRecord],
+        app_sold: float,
+        rows: list[OrderRecord],
+    ) -> float:
+        """Of the unseen part of the bot's entry (`split`, of `fills`), what surely filled
+        and is still the bot's: what IBKR or the app saw the entry fill beyond the fills
+        (`app_entry_unjournaled`), less what the bot's sells took of that part. These units
+        are the bot's like its seen ones: a sale or a buy of the owner's where no fill shows
+        it never makes them his. None while another client's sell took some of the unseen
+        part (it may have sold units of the owner's no fill shows, not looked for yet:
+        `_note_hidden`), or a sell of the app's of unknown fill may have sold it (one known
+        to have filled, `app_sold`, comes off after). For a stock the bot then holds no more
+        than its working stops cover and what its own sells are known to have sold of it (a
+        bracket child that sold some of it on a day IBKR no longer reports shrank them, or
+        sold all of it), unless none works after an exit of the app's was sent (it cancelled
+        them, and a stop may be re-placed): then they say nothing, and what the children were
+        seen to sell is in `app_sold` (`_keep_app_sales`, `_broker_close`)."""
+        if split.unseen_other > EPS:
+            return 0.0
+        sure, _ = app_entry_unjournaled(self.db, inst.key, opened, fills, working, rows=rows)
+        start = max(0.0, limit - split.entry_seen)  # the unseen part before any sell
+        filled = max(0.0, min(sure, start) - (start - split.unseen))
+        if filled <= EPS:
+            return 0.0
+        if app_sold <= EPS and app_sold_unjournaled(self.db, inst.key, opened, fills, rows=rows):
+            return 0.0
+        if inst.asset_class != AssetClass.CRYPTO:
+            cover = await self._stop_cover(inst, working)
+            if cover > EPS or not self._app_exit_sent(inst.key, opened, rows):
+                filled = min(filled, max(0.0, cover + app_sold - split.bot))
+        return filled
+
+    def _app_exit_sent(self, key: str, opened: datetime, rows: list[OrderRecord]) -> bool:
+        """Whether this app sent a sell of `key` since the bot's entry (a close, a re-placed
+        stop): it cancels the bracket's children, so none working says nothing of them (what
+        they were seen to sell is kept: `_keep_app_sales`, `_broker_close`)."""
+        return any(
+            rec.request.instrument.key == key
+            and rec.request.side == Side.SELL
+            and rec.broker_order_id
+            and rec.status != OrderStatus.REJECTED
+            and not (rec.request.trace_id or "").startswith(WATCHDOG_TAG_PREFIX)
+            for rec in rows_since(self.db, rows, opened - FILL_TIME_SKEW)
+        )
+
+    def _app_sold_beyond(
+        self,
+        key: str,
+        opened: datetime,
+        fills: list[Fill],
+        rows: list[OrderRecord] | None = None,
+        fresh: list[OrderRecord] | None = None,
+    ) -> float:
+        """What the app's own sells of `key` are known to have filled beyond `fills`: its
+        order rows (`rows`, else read), its working orders of the latest read and of a
+        `fresh` one (a bracket child has no row), and what such an order was seen to fill
+        beyond the journal before it was done (`_keep_app_sales`) or when a close of the
+        app's cancelled it (`_broker_close`)."""
+        own = [o for o in [*self._open_orders, *(fresh or [])] if self.broker.can_cancel(o)]
+        kept = self._extra(key).get(APP_SOLD_UNREPORTED)
+        seen = self._extra(key).get(APP_SELLS_SEEN)
+        return app_sold_beyond_journal(
+            self.db,
+            key,
+            opened,
+            fills,
+            own=own,
+            rows=rows,
+            unreported=kept if isinstance(kept, dict) else None,
+            seen=seen if isinstance(seen, dict) else None,
+        )
+
+    async def _broker_close(
+        self, inst: Instrument, *args: Any, **kwargs: Any
+    ) -> OrderRecord | None:
+        """broker.close_position, keeping with the bot's position what the app's sells it
+        cancelled were seen to have filled, before or during its cancels (`APP_SELLS_SEEN`):
+        a bracket child's sale beside the close is in no row, and the app may go down
+        before the journal reads it."""
+        try:
+            return await self.broker.close_position(inst, *args, **kwargs)
+        finally:
+            seen = {oid: q for oid, q in self.broker.sells_seen(inst).items() if q > EPS}
+            if seen and self.db.get_position_meta(inst.key) is not None:
+                raw = self._extra(inst.key).get(APP_SELLS_SEEN)
+                kept = dict(raw) if isinstance(raw, dict) else {}
+                for oid, qty in seen.items():
+                    kept[oid] = max(float(kept.get(oid, 0.0)), qty)
+                self._set_extra(inst.key, **{APP_SELLS_SEEN: kept})
+
+    def _keep_app_sales(
+        self,
+        key: str,
+        meta: dict[str, Any],
+        open_orders: list[OrderRecord],
+        seen: Any = None,
+    ) -> None:
+        """Right after the journal caught up with today's executions: what a working sell of
+        the app's (`open_orders`, read before them) filled beyond the journal's fills of it
+        was sold on a day IBKR no longer reports, and once the order is done no read shows
+        it again (a bracket child has no order row). Kept with the position
+        (`APP_SOLD_UNREPORTED`), so the bot's units never count it as held. `seen`: what a
+        close of the app's saw them fill (`APP_SELLS_SEEN`) as of before the executions
+        were read; a close after this tick's read cancels them and sees more."""
+        opened = meta.get("opened_at")
+        own = [
+            o
+            for o in open_orders
+            if o.request.instrument.key == key
+            and o.request.side == Side.SELL
+            and o.status in OPEN_ORDER_STATUSES
+            and o.broker_order_id
+            and o.filled_qty > EPS
+            and self.broker.can_cancel(o)
+            and not (o.request.trace_id or "").startswith(WATCHDOG_TAG_PREFIX)
+        ]
+        if opened is None or not own:
+            return
+        since = _aware(opened) - FILL_TIME_SKEW
+        journaled: dict[str, float] = {}
+        for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT):
+            if (
+                f.instrument.key == key
+                and f.side == Side.SELL
+                and not is_other_client(f)
+                and _aware(f.ts) >= since
+                # What it kept is beyond the executions: never beyond its own estimate of an
+                # earlier one (a later outage's sale of the same order adds to it).
+                and not f.exec_id.startswith(f"{UNREPORTED_EXIT}:")
+            ):
+                journaled[f.broker_order_id] = journaled.get(f.broker_order_id, 0.0) + f.qty
+        raw = self._extra(key).get(APP_SOLD_UNREPORTED)
+        kept = dict(raw) if isinstance(raw, dict) else {}
+        changed = False
+        looked = seen if isinstance(seen, dict) else {}
+        for o in own:
+            oid = str(o.broker_order_id)
+            # A close of the app's since the read saw more of it filled (during its
+            # cancels): that part is in today's executions, never an earlier day's.
+            later = looked.get(oid)
+            filled = max(o.filled_qty, float(later) if isinstance(later, int | float) else 0.0)
+            missing = round(filled - journaled.get(oid, 0.0), 10)
+            before = kept.get(oid)
+            if missing > (float(before) if isinstance(before, int | float) else 0.0) + EPS:
+                kept[oid] = missing
+                changed = True
+        if changed:
+            self._set_extra(key, **{APP_SOLD_UNREPORTED: kept})
+
+    async def _journal_app_sales(
+        self, key: str, meta: dict[str, Any], now: datetime, open_orders: list[OrderRecord]
+    ) -> bool:
+        """What the app's own sells were seen to sell on a day IBKR no longer reports
+        (`_keep_app_sales`) is journaled at an estimate, like an exit the executions never
+        showed (`_close_unreported_exit`): under the order's id, at what the broker says it
+        filled at (else its price, else the stop or the entry), dated just after the
+        position's last fill before today (never before its entry was sent, nor before a
+        trip of it already journaled). So the bot's trade closes with what it really sold,
+        and the owner's sale is never taken for it. True when something was journaled (the
+        caller replays the position)."""
+        raw = self._extra(key).get(APP_SOLD_UNREPORTED)
+        opened = meta.get("opened_at")
+        fallback = meta.get("stop_loss") or meta.get("entry_price")
+        today = trading_day_start(trading_day(now))
+        if not isinstance(raw, dict) or not raw or opened is None or not fallback:
+            return False
+        if _aware(opened) >= today:
+            return False  # all of it is in today's executions
+        since = _aware(opened) - FILL_TIME_SKEW
+        fills = [
+            f
+            for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+            if f.instrument.key == key and _aware(f.ts) >= since
+        ]
+        estimated: dict[str, float] = {}
+        for f in fills:
+            if f.side == Side.SELL and f.exec_id.startswith(f"{UNREPORTED_EXIT}:"):
+                estimated[f.broker_order_id] = estimated.get(f.broker_order_id, 0.0) + f.qty
+        earlier = [_aware(f.ts) for f in fills if _aware(f.ts) < today]
+        at = max([_aware(opened), *(ts + timedelta(seconds=1) for ts in earlier)])
+        done = self._last_exit_for(key)
+        if done is not None and _aware(opened) <= done:
+            at = max(at, done + timedelta(seconds=1))
+        orders = {o.broker_order_id: o for o in open_orders if o.broker_order_id}
+        journaled = 0.0
+        for oid, qty in raw.items():
+            if not isinstance(qty, int | float):
+                continue
+            left = round(float(qty) - estimated.get(str(oid), 0.0), 10)
+            if left <= EPS:
+                continue
+            order = orders.get(str(oid))
+            price = float(fallback)
+            if order is not None:
+                price = float(
+                    order.avg_fill_price
+                    or order.request.limit_price
+                    or order.request.stop_loss
+                    or fallback
+                )
+            estimate = Fill(
+                exec_id=f"{UNREPORTED_EXIT}:{key}:{oid}:{float(qty):g}",
+                broker_order_id=str(oid),
+                instrument=Instrument.from_key(key),
+                side=Side.SELL,
+                qty=left,
+                price=price,
+                ts=at,
+            )
+            if self.db.insert_fill(estimate):
+                journaled += left
+        if journaled <= EPS:
+            return False
+        symbol = Instrument.from_key(key).symbol
+        log.warning(
+            "%s: the bot's sale of %g on an earlier day journaled (estimate)", key, journaled
+        )
+        self.db.audit(
+            "unreported_exit",
+            {"instrument": key, "qty": journaled, "watchdog": False},
+        )
+        await self._notify(
+            f"Exit of {symbol} not reported",
+            f"The bot's exit orders sold {journaled:g} {symbol} on an earlier day IBKR no "
+            "longer reports. The trade is journaled at an estimate of the price: check the "
+            "real price in IBKR's statements.",
+            priority="high",
+            tags=["warning"],
+        )
+        return True
+
+    async def _bot_sold_unseen(
+        self,
+        inst: Instrument,
+        opened: datetime,
+        fills: list[Fill],
+        bot: float,
+        rows: list[OrderRecord] | None = None,
+        orders: list[OrderRecord] | None = None,
+    ) -> bool:
+        """Whether a sell of the bot's may have filled where the fills do not show it: an
+        exit of the app's the journal may not have (trader/ownership.app_sold_unjournaled),
+        or, for a stock, its bracket stop no longer working for all its shares (a bracket
+        child has no journal row of its own). `rows`, `orders`: the app's order rows and the
+        broker's open orders when already read."""
+        if app_sold_unjournaled(self.db, inst.key, _aware(opened), fills, rows=rows):
+            return True
+        if inst.asset_class == AssetClass.CRYPTO:
+            return False  # no bracket at IBKR: every sell of the bot's is journaled
+        return await self._stop_cover(inst, orders) < bot - max(EPS, 1e-6 * bot)
+
+    async def _stop_cover(self, inst: Instrument, orders: list[OrderRecord] | None = None) -> float:
+        """What a stock's protective stops of the app's working at the broker cover (in
+        `orders`, the broker's open orders when already read, else read)."""
+        if orders is None:
+            orders = await self.broker.open_orders()
+        return sum(
+            o.request.qty - o.filled_qty
+            for o in orders
+            if o.request.instrument.key == inst.key
+            and o.request.side == Side.SELL
+            and o.request.stop_loss is not None
+            and o.status in OPEN_ORDER_STATUSES
+            and self.broker.can_cancel(o)
+        )
+
+    def _note_unknown_sale(
+        self, inst: Instrument, meta: dict[str, Any], held: float, bot: float, owner: float
+    ) -> None:
+        """Less held than the bot's and the owner's units, sold where IBKR no longer
+        reports, and maybe by the bot: its exits keep off the owner's units. Once per
+        position."""
+        mark = (inst.key + ":unknown_sale", position_marker(meta))
+        if mark in self._owner_noted:
+            return
+        self._owner_noted.add(mark)
+        self._spawn_notify(
+            f"{inst.symbol}: whose sale?",
+            f"IBKR holds {held:g} {inst.symbol}; the fills show {bot:g} of the bot's and "
+            f"{owner:g} of yours, and {bot + owner - held:g} was sold where IBKR no longer "
+            "reports it. The bot cannot tell whose it was, so it sells only what is surely "
+            f"its own: check {inst.symbol} in IBKR.",
+            priority="urgent" if inst.asset_class == AssetClass.CRYPTO else "high",
+        )
+
+    def _note_unexplained(
+        self, inst: Instrument, meta: dict[str, Any], held: float, bot: float, owner: float
+    ) -> None:
+        """Part of the position is in no journaled fill (e.g. filled on a day IBKR no
+        longer reports): the bot neither sells nor protects it. Once per position."""
+        mark = (inst.key + ":unexplained", position_marker(meta))
+        if mark in self._owner_noted:
+            return
+        self._owner_noted.add(mark)
+        crypto = inst.asset_class == AssetClass.CRYPTO
+        self._spawn_notify(
+            f"{inst.symbol}: shares of unknown owner",
+            f"IBKR holds {held:g} {inst.symbol}; the fills show {bot:g} as the bot's and "
+            f"{owner:g} as yours. The bot sells and protects only its {bot:g}"
+            + (": nothing guards the rest. Check IBKR now." if crypto else "."),
+            priority="urgent" if crypto else "high",
+        )
+
+    def _note_owner_shares(
+        self, inst: Instrument, meta: dict[str, Any], held: float, mine: float
+    ) -> None:
+        """Tell the owner once per bot position that its exits leave the owner's shares."""
+        mark = (inst.key, position_marker(meta))
+        if mark in self._owner_noted:
+            return
+        self._owner_noted.add(mark)
+        log.warning(
+            "%s: %g held, %g of it the bot's; its exits sell only that", inst.key, held, mine
+        )
+        self.db.audit(
+            "owner_shares", {"instrument": inst.key, "held": held, "bot": mine}, actor="engine"
+        )
+        self._spawn_notify(
+            f"{inst.symbol}: your shares stay",
+            f"IBKR holds {held:g} {inst.symbol}, {mine:g} of it the bot's. You bought the rest "
+            "in TWS or IBKR Mobile: the bot's stops, exits and Close sell only its own "
+            f"{mine:g}. Manage the rest yourself in IBKR.",
+        )
+
+    def _spawn_notify(self, title: str, message: str, priority: str = "high") -> None:
+        task = asyncio.ensure_future(
+            self._notify(title, message, priority=priority, tags=["warning"])
+        )
+        self._alert_tasks.add(task)
+        task.add_done_callback(self._alert_tasks.discard)
+
+    async def _engine_close(self, inst: Instrument, reason: str, now: datetime) -> None:
+        """Close a position for a protective reason (never waits for approval). With the
+        owner's shares next to the bot's, only the bot's own are sold."""
+        seq = self._mark_closing(inst.key, reason, now)
+        cap = await self._bot_cap(inst)
+        if cap is not None and cap.unread:
+            # Undecided, not "none of it is the bot's": nothing is sold until the
+            # executions are read, and the owner is told. Crypto (no stop at the broker)
+            # is tried again next tick, and the failure lets the heartbeat go stale so the
+            # watchdog takes over; a stock keeps its broker stop, tried after CLOSE_RETRY.
+            if self.broker.supports_native_stops(inst):
+                self._note_close(inst.key, None, seq)
+            else:
+                self._unmark_closing(inst.key, seq)
+            await self._note_undecided_exit(inst, reason, now)
+            raise _ExitUndecided(
+                f"{reason}: the broker's executions could not be read; nothing sold yet"
+            )
+        if cap is not None and cap.qty <= EPS:
+            # Nothing of it is the bot's (it sold its part, the rest is the owner's):
+            # like a close that found nothing to sell; looked at again after CLOSE_RETRY.
+            self._note_close(inst.key, None, seq)
+            log.info("%s: %s, but none of it is the bot's", inst.key, reason)
+            return
+        log.warning("closing %s: %s", inst.key, reason)
+        rec = await self._broker_close(
+            inst,
+            reason=reason,
+            max_qty=cap.qty if cap else None,
+            keep=cap.keep if cap else 0.0,
+        )
+        self._note_capped_close(inst.key, cap, rec, seq)
+        if rec is not None:
+            self._journal_order(rec, now)
+        self.db.audit("engine_close", {"instrument": inst.key, "reason": reason}, actor="engine")
+        if rec is None:
+            return  # nothing sold here: already flat, or another close's sell is working
+        refused = _refused_exits([rec])
+        if not refused:
+            self._close_failed_at.pop(inst.key, None)
+            await self._notify(f"Closing {inst.symbol}", reason)
+            return
+        log.error("engine close (%s): the broker refused to close %s", reason, refused)
+        last = self._close_failed_at.get(inst.key)
+        if last is not None and now - last < CLOSE_FAILED_ALERT_EVERY:
+            return  # retried every CLOSE_RETRY: one alert per stretch, not one a minute
+        restored = "protective stop re-placed at" in (rec.message or "")
+        self._close_failed_at[inst.key] = now  # cleared if not delivered: the next retry alerts
+        await self._notify(
+            f"Close {inst.symbol} FAILED",
+            f"{reason}: the broker refused the sell ({_short(refused)}). "
+            + ("The stop was put back. " if restored else "No stop is working at IBKR. ")
+            + "The bot retries; check IBKR.",
+            priority="high" if restored else "urgent",
+            tags=["warning"] if restored else ["rotating_light"],
+            on_result=lambda sent: self._close_alert_result(inst.key, now, sent),
+        )
+
+    async def _note_undecided_exit(self, inst: Instrument, reason: str, now: datetime) -> None:
+        """An exit the bot could not size (the executions not read): one alert a stretch."""
+        last = self._close_failed_at.get(inst.key)
+        if last is not None and now - last < CLOSE_FAILED_ALERT_EVERY:
+            return
+        crypto = not self.broker.supports_native_stops(inst)
+        self._close_failed_at[inst.key] = now  # cleared if not delivered: the next retry alerts
+        await self._notify(
+            f"Close {inst.symbol} FAILED",
+            f"{reason}: the broker's executions could not be read, so the bot cannot tell "
+            f"its {inst.symbol} from yours and sold nothing. "
+            + ("The crypto watchdog takes over. " if crypto else "")
+            + "The bot retries; check IBKR.",
+            priority="urgent" if crypto else "high",
+            tags=["rotating_light"] if crypto else ["warning"],
+            on_result=lambda sent: self._close_alert_result(inst.key, now, sent),
+        )
+
+    def _close_alert_result(self, key: str, stamped: datetime, delivered: bool) -> None:
+        if not delivered and self._close_failed_at.get(key) == stamped:
+            del self._close_failed_at[key]
+
+    def _native_stops(self, open_orders: list[OrderRecord]) -> dict[str, float]:
+        """Highest working broker-side protective stop of this app per instrument. An
+        owner's stop from TWS or IBKR Mobile does not count (a stop-limit or trailing limit
+        may never fill, and it may cover only part of the position), nor does a stop this
+        app asked to cancel."""
+        stops: dict[str, float] = {}
+        for order in open_orders:
+            req = order.request
+            if (
+                order.status in OPEN_ORDER_STATUSES
+                and req.side == Side.SELL
+                and req.stop_loss is not None
+                and self.broker.can_cancel(order)
+                and not self.broker.cancel_requested(order)
+            ):
+                key = req.instrument.key
+                stops[key] = max(stops.get(key, 0.0), req.stop_loss)
+        return stops
+
+    def _working_targets(self, open_orders: list[OrderRecord]) -> set[str]:
+        """Instruments with a take-profit (a SELL limit) of this app working at the broker.
+        A refused close puts back only the stop, and the broker may refuse a bracket's
+        take-profit: without one the engine sells at the target itself."""
+        return {
+            order.request.instrument.key
+            for order in open_orders
+            if order.status in OPEN_ORDER_STATUSES
+            and order.request.side == Side.SELL
+            and order.request.order_type == OrderType.LIMIT
+            and order.request.stop_loss is None
+            and self.broker.can_cancel(order)
+            and not self.broker.cancel_requested(order)
+        }
+
+    def _app_targets(self, open_orders: list[OrderRecord], key: str) -> list[OrderRecord]:
+        """This app's working take-profits (SELL limits) for `key`, a cancel asked or not
+        (one can fill until IBKR confirms the cancel)."""
+        return [
+            order
+            for order in open_orders
+            if order.status in OPEN_ORDER_STATUSES
+            and order.request.instrument.key == key
+            and order.request.side == Side.SELL
+            and order.request.order_type == OrderType.LIMIT
+            and order.request.stop_loss is None
+            and self.broker.can_cancel(order)
+        ]
+
+    def _queued_exits(self, open_orders: list[OrderRecord]) -> dict[str, float]:
+        """Unfilled quantity of this app's working market SELL exits per instrument: closes
+        the broker holds until it can execute them (e.g. a kill or flatten sent after hours,
+        or an exit queued during a halt). A protective stop next to one could sell the
+        shares twice. Bracket take-profit children are limit orders and do not count, nor
+        does an owner's order from TWS or IBKR Mobile (an MIT or LOC may never execute)."""
+        queued: dict[str, float] = {}
+        for order in open_orders:
+            req = order.request
+            if (
+                order.status in OPEN_ORDER_STATUSES
+                and req.side == Side.SELL
+                and req.stop_loss is None
+                and req.order_type == OrderType.MARKET
+                and self.broker.can_cancel(order)
+            ):
+                key = req.instrument.key
+                queued[key] = queued.get(key, 0.0) + max(0.0, req.qty - order.filled_qty)
+        return queued
+
+    def _working_buys(self, open_orders: list[OrderRecord]) -> set[str]:
+        """Instruments with a working entry of this app. An owner's BUY from TWS or IBKR
+        Mobile is no entry of this app and holds nothing back. An entry this app asked to
+        cancel still counts: it can fill until IBKR confirms the cancel."""
+        return {
+            o.request.instrument.key
+            for o in open_orders
+            if o.status in OPEN_ORDER_STATUSES
+            and o.request.side == Side.BUY
+            and self.broker.can_cancel(o)
+        }
+
+    def _extra(self, key: str) -> dict[str, float]:
+        """Engine-side position data the positions_meta table has no columns for
+        (initial stop, planned risk per unit, best price since entry)."""
+        raw = self.db.get_kv(EXTRA_PREFIX + key)
+        if not raw:
+            return {}
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _set_extra(self, key: str, **values: float) -> None:
+        data = self._extra(key)
+        data.update(values)
+        self.db.set_kv(EXTRA_PREFIX + key, json.dumps(data))
+
+    def _unit_risk(self, key: str, entry: float, meta: dict[str, Any] | None) -> float | None:
+        """Initial risk per unit (1R) for a position entered at `entry`."""
+        extra = self._extra(key)
+        initial = extra.get("initial_stop")
+        if initial is not None and entry > initial:
+            return entry - initial
+        planned = extra.get("unit_risk")
+        if planned is not None and planned > 0:
+            return planned
+        stop = meta.get("stop_loss") if meta else None
+        if stop is not None and entry > stop:
+            return entry - stop
+        return None
+
+    async def _manage_positions(
+        self,
+        now: datetime,
+        positions: list[Position],
+        quotes: dict[str, Quote],
+        metas: dict[str, dict[str, Any]],
+    ) -> None:
+        """Engine-side stops/targets, time stop, breakeven and trailing for positions the
+        engine opened (those with positions_meta). Stops only ever move up."""
+        native_stops = self._native_stops(self._open_orders)
+        targets = self._working_targets(self._open_orders)
+        stocks_open = stock_market_open(now)
+        failures: list[str] = []
+        breached: set[str] = set()
+        for pos in positions:
+            key = pos.instrument.key
+            meta = metas.get(key)
+            quote = quotes.get(key)
+            mark = sane_exit_price(quote)  # None: no quote, or an implausible one
+            if pos.qty <= 0 or meta is None or self._closing_now(key, now):
+                continue
+            if pos.instrument.asset_class == AssetClass.STOCK and not stocks_open:
+                continue  # stock orders cannot execute now; broker stops still protect
+            engine_only = not self.broker.supports_native_stops(pos.instrument)
+            if mark is not None and quote is not None and engine_only:
+                max_age = timedelta(seconds=STALE_QUOTE_INTERVALS * self.settings.monitor_seconds)
+                if quote.delayed:
+                    max_age += DELAYED_QUOTE_GRACE
+                if _aware(now) - _aware(quote.ts) > max_age:
+                    mark = None  # a line that stopped ticking (data farm break) checks nothing
+            if mark is None:
+                if engine_only:
+                    if key in self._breaches:
+                        breached.add(key)  # a missing quote is no recovery: keep the breach
+                    # Nothing else enforces this position's stop (crypto). A short gap (the
+                    # owner's IBKR Mobile taking the data, 10197) keeps the heartbeat: the
+                    # watchdog shares the gateway and could only flatten blind. A lasting
+                    # one fails the check, so the heartbeat goes stale and it takes over.
+                    since = self._unchecked_since.setdefault(key, now)
+                    if now - since >= UNCHECKED_STOP_GRACE:
+                        minutes = (now - since).total_seconds() / 60
+                        failures.append(
+                            f"{key}: no usable quote for {minutes:.0f} min, stop not checked"
+                        )
+                continue
+            self._unchecked_since.pop(key, None)
+            try:
+                await self._manage_one(
+                    pos,
+                    meta,
+                    mark,
+                    native_stops.get(key),
+                    now,
+                    breached,
+                    broker_target=key in targets,
+                )
+            except _ExitUndecided as exc:
+                if engine_only:  # nothing else enforces its stop: the watchdog takes over
+                    failures.append(f"{key}: {exc}")
+            except BrokerError as exc:
+                failures.append(f"{key}: {exc}")
+        # A breach must be seen on consecutive ticks; anything not seen this tick restarts.
+        self._breaches = {k: v for k, v in self._breaches.items() if k in breached}
+        held = {p.instrument.key for p in positions if p.qty > 0}
+        self._unchecked_since = {k: v for k, v in self._unchecked_since.items() if k in held}
+        if failures:
+            raise BrokerError("; ".join(failures))
+
+    def _confirms(self, ticks: int, first_seen: datetime, now: datetime) -> bool:
+        """Whether a condition seen on `ticks` consecutive monitor ticks since `first_seen`
+        is confirmed: BREACH_CONFIRM_TICKS ticks that span at least half a monitor interval.
+        run_cycle runs its own monitor tick right after (or even at the same moment as) the
+        monitor loop's, and two looks at one bad print must not count as two."""
+        spacing = timedelta(seconds=self.settings.monitor_seconds * BREACH_MIN_SPACING)
+        return ticks >= BREACH_CONFIRM_TICKS and now - first_seen >= spacing
+
+    def _confirmed(self, key: str, kind: str, breached: set[str], now: datetime) -> bool:
+        """Count one more tick with an engine-side exit condition; True once it is
+        confirmed (see `_confirms`)."""
+        breached.add(key)
+        last_kind, ticks, first = self._breaches.get(key, (kind, 0, now))
+        ticks, first = (ticks + 1, first) if last_kind == kind else (1, now)
+        self._breaches[key] = (kind, ticks, first)
+        return self._confirms(ticks, first, now)
+
+    async def _manage_one(
+        self,
+        pos: Position,
+        meta: dict[str, Any],
+        mark: float,
+        broker_stop: float | None,
+        now: datetime,
+        breached: set[str] | None = None,
+        *,
+        broker_target: bool = True,
+    ) -> None:
+        """Exit rules for one engine position valued at `mark` (the bid). `broker_stop` is
+        the highest protective stop working at the broker, if any; `broker_target` whether
+        a take-profit of this app works there (else the engine sells at the target). Exits
+        fire only after the condition held on BREACH_CONFIRM_TICKS consecutive ticks
+        (`breached` collects the instruments that saw one this tick)."""
+        exits = self.settings.exits
+        key = pos.instrument.key
+        stop, target = meta.get("stop_loss"), meta.get("take_profit")
+        native = self.broker.supports_native_stops(pos.instrument)
+        reason: str | None = None
+        kind = "stop"
+        if stop is not None:
+            if not native:
+                if mark <= stop:
+                    reason = f"stop-loss {stop:g} hit (engine-managed, bid {mark:g})"
+            elif broker_stop is None:
+                if mark <= stop * (1 - BACKUP_STOP_BREACH):
+                    reason = (
+                        f"backup stop: bid {mark:g} is >0.5% below the stop {stop:g} "
+                        "and no broker stop is working"
+                    )
+            elif stop > broker_stop + EPS and mark <= stop:
+                reason = f"stop-loss {stop:g} hit (engine-managed, bid {mark:g})"
+        if (
+            reason is None
+            and (not native or not broker_target)
+            and target is not None
+            and mark >= target
+        ):
+            reason, kind = f"take-profit {target:g} hit (engine-managed, bid {mark:g})", "target"
+
+        unit = self._unit_risk(key, pos.avg_cost, meta)
+        r_now = (mark - pos.avg_cost) / unit if unit else None
+        opened = meta.get("opened_at")
+        if (
+            reason is None
+            and exits.time_stop_minutes > 0
+            and opened is not None
+            and r_now is not None
+            and now - _aware(opened) >= timedelta(minutes=exits.time_stop_minutes)
+            and r_now < exits.time_stop_min_r
+        ):
+            reason, kind = (
+                (
+                    f"time stop: {exits.time_stop_minutes} min with {r_now:.2f}R "
+                    f"(< {exits.time_stop_min_r:g}R)"
+                ),
+                "time",
+            )
+        if reason is not None:
+            if not self._confirmed(key, kind, breached if breached is not None else set(), now):
+                log.info("%s: %s; confirming on the next tick", key, reason)
+                return
+            await self._engine_close(pos.instrument, reason, now)
+            self._breaches.pop(key, None)  # undecided (raised): the breach stands
+            return
+
+        new_stop: float | None = None
+        why = ""
+        if (
+            exits.breakeven_at_r > 0
+            and r_now is not None
+            and r_now >= exits.breakeven_at_r
+            and (stop is None or stop < pos.avg_cost)
+        ):
+            new_stop, why = pos.avg_cost, f"breakeven at {r_now:.2f}R"
+        extra = self._extra(key)
+        best = max(extra.get("best_price", mark), mark)
+        if best != extra.get("best_price"):
+            self._set_extra(key, best_price=best)
+        current = new_stop if new_stop is not None else stop
+        # The last cycle's ATR, else the one saved with the position: no decision cycle
+        # runs while halted (or right after a restart), and the trail must keep moving.
+        atr = self._market.get(key, {}).get("atr14") or extra.get("atr")
+        trailing = exits.trail_atr_mult > 0 and (
+            exits.breakeven_at_r == 0 or (current is not None and current >= pos.avg_cost)
+        )
+        if trailing and atr and atr > 0:
+            trail = best - exits.trail_atr_mult * atr
+            if current is None or trail > current + EPS:
+                new_stop, why = trail, f"trailing {exits.trail_atr_mult:g} ATR below {best:g}"
+        if new_stop is not None and (stop is None or new_stop > stop + EPS):
+            await self._raise_stop(pos, meta, round(new_stop, 6), why)
+
+    async def _raise_stop(
+        self, pos: Position, meta: dict[str, Any], new_stop: float, why: str
+    ) -> None:
+        inst = pos.instrument
+        moved = False
+        if self.broker.supports_native_stops(inst):
+            try:
+                moved = await self.broker.modify_stop(inst, new_stop)
+            except BrokerError as exc:
+                log.warning("modify_stop for %s failed: %s", inst.key, exc)
+        self.db.set_position_meta(
+            inst.key,
+            stop_loss=new_stop,
+            take_profit=meta.get("take_profit"),
+            entry_price=meta.get("entry_price"),
+            initial_risk=meta.get("initial_risk"),
+            opened_at=meta.get("opened_at"),
+            decision_id=meta.get("decision_id"),
+            setup=meta.get("setup"),
+        )
+        meta["stop_loss"] = new_stop
+        log.info(
+            "%s stop raised to %g (%s; %s)",
+            inst.key,
+            new_stop,
+            why,
+            "broker stop moved" if moved else "engine-managed",
+        )
+
+    async def _flatten_before_close(
+        self, now: datetime, positions: list[Position], metas: dict[str, dict[str, Any]]
+    ) -> None:
+        """Day-trade rule: close the engine's stock positions 10 minutes before the close.
+        Positions the engine did not open (no positions_meta) are left alone."""
+        if not self.settings.flatten_stocks_before_close:
+            return
+        left = minutes_to_close(now)
+        if left is None or left > FLATTEN_BEFORE_CLOSE_MIN:
+            return
+        failures: list[str] = []
+        for pos in positions:
+            key = pos.instrument.key
+            if (
+                pos.instrument.asset_class == AssetClass.STOCK
+                and pos.qty > 0
+                and key in metas
+                and not self._closing_now(key, now)
+            ):
+                try:
+                    await self._engine_close(pos.instrument, "flatten before close", now)
+                except BrokerError as exc:
+                    failures.append(f"{key}: {exc}")
+        if failures:
+            raise BrokerError("; ".join(failures))
+
+    async def _reprotect(
+        self,
+        now: datetime,
+        positions: list[Position],
+        open_orders: list[OrderRecord],
+        metas: dict[str, dict[str, Any]],
+        close_seq: dict[str, int],
+        armed: int,
+    ) -> None:
+        """After a (re)connect: re-place a broker stop for engine stock positions that have
+        none working. Only brokers that rest a stop for a SELL request carrying stop_loss
+        (`supports_standalone_stops`) get one; otherwise, or when the broker rejects it, the
+        owner is notified and the engine's backup stop guards the position. Shares a working
+        market exit of this app will already sell are not protected again (never sell
+        twice); an owner's order from TWS (a conditional sell, a stop-limit, a buy) does
+        not count. A position with a close attempt under way (or in its CLOSE_RETRY
+        window), or one stamped since this tick read the orders (`close_seq`: e.g. a
+        refused owner Close that put the stop back and dropped its marker), is looked at
+        again on a later tick. A stop is only placed after a fresh read of the position
+        and its orders, under the broker's close lock for the instrument (no close of it
+        half-done), so it never doubles one a close put back or sits next to its sell."""
+        if not self._reprotect_pending:
+            return
+        # Armed again after this tick read the positions: the next pass must look too.
+        self._reprotect_pending = self._reprotect_armed != armed
+        protected = self._native_stops(open_orders)
+        buying = self._working_buys(open_orders)
+        queued = self._queued_exits(open_orders)
+        for pos in positions:
+            key = pos.instrument.key
+            meta = metas.get(key)
+            stop = meta.get("stop_loss") if meta else None
+            qty = round(pos.qty - queued.get(key, 0.0), 8)
+            if self._closing_now(key, now) or self._close_seq.get(key, 0) != close_seq.get(key, 0):
+                # This tick's orders may predate the close (a stop it has since cancelled,
+                # or put back): decide once the attempt is over.
+                self._reprotect_pending = True
+                continue
+            if (
+                qty <= EPS
+                or stop is None
+                or pos.instrument.asset_class != AssetClass.STOCK
+                or not self.broker.supports_native_stops(pos.instrument)
+                or key in protected
+            ):
+                continue
+            if key in buying:
+                # Its entry still works (e.g. part filled, its bracket stop refused): look
+                # again once the entry is done.
+                self._reprotect_pending = True
+                continue
+            if not self.broker.supports_standalone_stops(pos.instrument):
+                await self._notify(
+                    f"Unprotected {pos.instrument.symbol}",
+                    f"No broker stop is working (stop {stop:g}) and this broker cannot re-place "
+                    "one automatically. The engine's backup stop watches it while the app runs.",
+                    priority="high",
+                    tags=["warning"],
+                )
+                continue
+            try:
+                # This tick's reads may predate a close that ran since (its sell, or the
+                # stop it put back): decide again from fresh ones, with no close of the
+                # instrument running meanwhile.
+                async with self.broker.close_lock(pos.instrument):
+                    orders = await self.broker.open_orders()
+                    targets = self._app_targets(orders, key)
+                    if (
+                        targets
+                        and key not in self._native_stops(orders)
+                        and key not in self._working_buys(orders)
+                    ):
+                        # The bracket's take-profit is in its dead stop's OCA group, not
+                        # the new stop's: a (part) fill of it would not shrink the stop,
+                        # which would then sell beyond the bot's units (the owner's). The
+                        # engine sells at the target itself instead.
+                        for order in targets:
+                            if order.broker_order_id:
+                                await self.broker.cancel_order(order.broker_order_id)
+                        orders = await self.broker.open_orders()
+                        if self._app_targets(orders, key):  # not confirmed gone yet
+                            self._reprotect_pending = True
+                            continue
+                    held = next(
+                        (p.qty for p in await self.broker.positions() if p.instrument.key == key),
+                        0.0,
+                    )
+                    cap = await self._bot_cap(pos.instrument) if held > EPS else None
+                    mine = held if cap is None else min(cap.qty, held - cap.keep)
+                    qty = round(mine - self._queued_exits(orders).get(key, 0.0), 8)
+                    if qty <= EPS or key in self._native_stops(orders):
+                        continue
+                    if key in self._working_buys(orders):
+                        self._reprotect_pending = True
+                        continue
+                    req = OrderRequest(
+                        instrument=pos.instrument,
+                        side=Side.SELL,
+                        qty=qty,
+                        order_type=OrderType.MARKET,
+                        stop_loss=stop,
+                        is_exit=True,
+                        reason="protective stop (re-placed)",
+                        decision_id=meta.get("decision_id") if meta else None,
+                        setup=meta.get("setup") if meta else None,
+                    )
+                    rec = await self.broker.place_order(req)
+            except BrokerError as exc:
+                log.warning("re-placing the stop for %s failed: %s", key, exc)
+                self._reprotect_pending = True
+                continue
+            self._journal_order(rec, now)
+            if rec.status in _ACCEPTED:
+                log.warning("re-placed missing protective stop for %s at %g", key, stop)
+                self.db.audit("reprotect", {"instrument": key, "stop": stop}, actor="engine")
+            else:
+                await self._notify(  # its own title: an "Unprotected X" may be minutes old
+                    f"Stop re-place failed {pos.instrument.symbol}",
+                    f"Broker rejected the re-placed stop at {stop:g}: {rec.message}. "
+                    "The engine's backup stop still watches it.",
+                    priority="high",
+                    tags=["warning"],
+                )
+
+    # ------------------------------------------------------------------ journal
+    def _journal_order(self, rec: OrderRecord, now: datetime) -> int:
+        return self.db.insert_order(
+            rec.model_copy(update={"id": None, "created_at": now, "updated_at": now})
+        )
+
+    async def _sync_journal(
+        self, now: datetime, positions: list[Position], open_orders: list[OrderRecord]
+    ) -> None:
+        await self._sync_orders(now)
+        await self._cancel_stale_entries(now)  # cancelling only reduces risk (shadow too)
+        await self._sync_fills(now)
+        self._entry_buys = self._working_buys(open_orders)  # the journal caught up
+        await self._cleanup_meta(now, positions, open_orders)
+
+    async def _first_sync(self, now: datetime) -> None:
+        """The first journal of a connection. The app's order rows are as it last saw them
+        (an entry last seen working may have filled or lapsed while it was down): they are
+        read again first, so what of the bot's entry may have filled where no fill shows it
+        is what the broker says now, not more (the owner's units no fill shows are looked
+        for, and the journal replayed, with it)."""
+        await self._sync_orders(now)
+        await self._sync_fills(now)
+
+    async def _sync_orders(self, now: datetime) -> None:
+        traced: dict[tuple[str, Side, bool], OrderRecord] | None = None
+
+        def kind(req: OrderRequest) -> tuple[Side, bool]:
+            return req.side, req.side == Side.SELL and req.stop_loss is not None
+
+        async def by_trace(req: OrderRequest) -> OrderRecord | None:
+            """Working broker order whose tag matches, fetched once per sync, of the same
+            kind as the journal row: a bracket's stop and target carry the entry's tag,
+            and a close's put-back stop carries the close's.
+
+            Watchdog closes use ai-trader-wd-... and belong to the other process.
+            Adopting one of those onto an app order would point the journal at the
+            wrong broker id.
+            """
+            nonlocal traced
+            trace = _app_order_trace(req.trace_id)
+            if not trace:
+                return None
+            if traced is None:
+                traced = {}
+                for live in await self.broker.open_orders():
+                    live_trace = _app_order_trace(live.request.trace_id)
+                    if live_trace and live.broker_order_id:
+                        traced.setdefault((live_trace, *kind(live.request)), live)
+            return traced.get((trace, *kind(req)))
+
+        for rec in self.db.list_orders(limit=200, statuses=OPEN_ORDER_STATUSES):
+            if rec.id is None or not rec.broker_order_id:
+                continue
+            latest = await self.broker.order_status(rec.broker_order_id)
+            if latest is None:
+                adopted = await by_trace(rec.request)
+                if adopted is not None:
+                    self.db.update_order(
+                        rec.id,
+                        status=adopted.status,
+                        broker_order_id=adopted.broker_order_id,
+                        filled_qty=adopted.filled_qty,
+                        avg_fill_price=adopted.avg_fill_price,
+                        commission=adopted.commission,
+                    )
+                    log.info(
+                        "reconciled order %s via %s -> broker %s",
+                        rec.id,
+                        rec.request.trace_id,
+                        adopted.broker_order_id,
+                    )
+                    continue
+                created = _aware(rec.created_at)
+                restarted = self._epoch is not None and created < self._epoch
+                if restarted or now - created > ORDER_FORGET_AFTER:
+                    self.db.update_order(
+                        rec.id,
+                        status=OrderStatus.CANCELLED,
+                        message=self._epoch_reason if restarted else ORDER_FORGOTTEN,
+                    )
+                continue
+            updates: dict[str, Any] = {}
+            for name in ("status", "filled_qty", "avg_fill_price", "commission"):
+                if getattr(latest, name) != getattr(rec, name):
+                    updates[name] = getattr(latest, name)
+            if (
+                latest.status in (OrderStatus.REJECTED, OrderStatus.CANCELLED)
+                and latest.message
+                and latest.message != rec.message
+            ):
+                updates["message"] = _short(f"{rec.message}; {latest.message}".lstrip("; "))
+            if updates:
+                self.db.update_order(rec.id, **updates)
+
+    async def _cancel_stale_entries(self, now: datetime) -> None:
+        """Cancel engine entry orders that did not fill at all within ENTRY_ORDER_TTL: the
+        setup that justified them is stale."""
+        for rec in self.db.list_orders(limit=100, statuses=OPEN_ORDER_STATUSES):
+            req = rec.request
+            if (
+                rec.id is None
+                or not rec.broker_order_id
+                or req.side != Side.BUY
+                or req.is_exit
+                or rec.filled_qty > 0
+                or now - self._sent_at(rec) < ENTRY_ORDER_TTL
+            ):
+                continue
+            latest = await self.broker.order_status(rec.broker_order_id)
+            if (
+                latest is None
+                or latest.status not in OPEN_ORDER_STATUSES
+                or latest.filled_qty > 0
+                or latest.request.side != Side.BUY  # never an exit the row points at
+                or latest.request.is_exit
+            ):
+                continue
+            await self.broker.cancel_order(rec.broker_order_id)
+            final = await self.broker.order_status(rec.broker_order_id) or latest
+            minutes = int(ENTRY_ORDER_TTL.total_seconds() // 60)
+            self.db.update_order(
+                rec.id,
+                status=final.status,
+                filled_qty=final.filled_qty,
+                message=_short(f"{rec.message}; not filled within {minutes} min, cancel sent"),
+            )
+            log.info("cancelled stale entry order %s for %s", rec.id, req.instrument.key)
+
+    def _sent_at(self, rec: OrderRecord) -> datetime:
+        """When an order went to the broker (ownership.sent_at)."""
+        return sent_at(self.db, rec)
+
+    async def _sync_fills(self, now: datetime) -> None:
+        """Journal new fills (deduped by exec_id), apply late commission reports, and
+        rebuild round trips for every instrument that changed."""
+        if self._fill_commissions is None:
+            self._fill_commissions = {
+                f.exec_id: (f.commission, f.ts)
+                for f in self.db.list_fills(since=now - FIRST_FILL_LOOKBACK, limit=FILL_QUERY_LIMIT)
+            }
+        first = not self._fills_synced
+        lookback = FIRST_FILL_LOOKBACK if first else FILL_LOOKBACK
+        # What closes of the app's saw its sells with a fill in this tick's read had filled,
+        # as of before the executions are read (a close after the read may see more).
+        seen = {
+            o.request.instrument.key: self._extra(o.request.instrument.key).get(APP_SELLS_SEEN)
+            for o in self._open_orders
+            if o.request.side == Side.SELL and o.filled_qty > EPS
+        }
+        fills = await self.broker.fills_since(now - lookback)
+        self._fills_synced = True
+        touched = set(self._pending_trades)
+        if first:
+            # A restart forgot which trips were waiting for a commission report (one that
+            # stays 0 never touches its key again): rebuild every position the bot describes.
+            touched |= set(self.db.all_position_meta())
+        for fill in sorted(fills, key=lambda f: (f.ts, f.exec_id)):
+            key = fill.instrument.key
+            replaced = self.db.correct_fill(fill)
+            if replaced is not None:
+                # IBKR corrected an execution: the new revision replaces the old one (never
+                # both: that would count the shares twice).
+                log.warning(
+                    "execution %s corrected by %s (%s %g @ %g -> %g @ %g)",
+                    replaced.exec_id,
+                    fill.exec_id,
+                    key,
+                    replaced.qty,
+                    replaced.price,
+                    fill.qty,
+                    fill.price,
+                )
+                self._fill_commissions.pop(replaced.exec_id, None)
+                self._fill_commissions[fill.exec_id] = (fill.commission, fill.ts)
+                self._add_fee(replaced.ts, -replaced.commission)
+                self._add_fee(fill.ts, fill.commission)
+                touched.add(key)
+                continue
+            if self.db.insert_fill(fill):
+                self._fill_commissions[fill.exec_id] = (fill.commission, fill.ts)
+                self._add_fee(fill.ts, fill.commission)
+                touched.add(key)
+                continue
+            known = self._fill_commissions.get(fill.exec_id)
+            if fill.commission > 0 and (known is None or abs(known[0] - fill.commission) > EPS):
+                self.db.update_fill_commission(fill.exec_id, fill.commission)
+                if known is not None:
+                    self._add_fee(fill.ts, fill.commission - known[0])
+                self._fill_commissions[fill.exec_id] = (fill.commission, fill.ts)
+                touched.add(key)
+        cutoff = now - FIRST_FILL_LOOKBACK
+        self._fill_commissions = {
+            k: v for k, v in self._fill_commissions.items() if _aware(v[1]) >= cutoff
+        }
+        # What the app's own working sells (this tick's read) filled beyond the journal now
+        # fell on a day IBKR no longer reports: kept, and journaled at an estimate before the
+        # replay, so the replay never takes another client's sale for those units.
+        for key, meta in self.db.all_position_meta().items():
+            self._keep_app_sales(key, meta, self._open_orders, seen.get(key))
+            if await self._journal_app_sales(key, meta, now, self._open_orders):
+                touched.add(key)
+        undecided = await self._note_hidden_before_replay(touched, now)
+        self._replay_undecided = undecided
+        for key in sorted(touched):
+            await self._reconstruct(key, now, hidden_undecided=key in undecided)
+        self._fills_journaled_at = now
+
+    async def _note_hidden_before_replay(self, keys: set[str], now: datetime) -> set[str]:
+        """Before the journal replays a bot position that another client sold in, note the
+        owner's units no fill shows (`_note_hidden`): his sale of units he bought on a day
+        IBKR no longer reports must not close the bot's trade. One positions read, and only
+        for such positions (none on the pure-bot path). Returns the positions it could not
+        look at yet (a fill of the last moments, or no positions read) while nothing of the
+        bot's can have sold unseen: their replay must not journal another client's sell as
+        the bot's until it can."""
+        held: dict[str, float] | None = None
+        unread = False
+        undecided: set[str] = set()
+        for key in sorted(keys):
+            meta = self.db.get_position_meta(key)
+            opened = meta.get("opened_at") if meta else None
+            if meta is None or opened is None or self._meta_used(key, meta):
+                continue
+            since = _aware(opened) - FILL_TIME_SKEW
+            fills = [
+                f
+                for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+                if f.instrument.key == key and _aware(f.ts) >= since
+            ]
+            others = [f for f in fills if f.side == Side.SELL and is_other_client(f)]
+            if not others:
+                continue
+            theirs = self._watchdog_own_sells(key, meta, fills)
+            if all(f.exec_id in theirs for f in others):
+                continue  # the watchdog's own sells: none of them is the owner's
+            rows = order_rows(self.db, _aware(opened), key)  # the app's order rows: read once
+            if held is None and not unread:
+                try:
+                    held = {p.instrument.key: p.qty for p in await self.broker.positions()}
+                except BrokerError as exc:
+                    log.warning("positions not read before the journal replay: %s", exc)
+                    unread = True
+            if (
+                held is None or not self._note_hidden(key, meta, held.get(key, 0.0), now, rows)
+            ) and not await self._bot_units_may_be_gone(key, meta, fills, rows):
+                undecided.add(key)
+        return undecided
+
+    def _watchdog_own_sells(self, key: str, meta: dict[str, Any], fills: list[Fill]) -> set[str]:
+        """Another client's sells in `fills` (by execution id) that are the crypto
+        watchdog's own: every one of its orders is done, they fall inside its window (its
+        first send to its last, plus the clock skew) and add up to no more than it sold.
+        None of them is a sale of the owner's."""
+        marker = position_marker(meta)
+        sales = watchdog_sales(self.db, key, marker, meta.get("opened_at"))
+        end = watchdog_sales_end(self.db, key, marker)
+        if sales is None or end is None:
+            return set()
+        start, until = sales[0] - FILL_TIME_SKEW, end + FILL_TIME_SKEW
+        inside = [
+            f
+            for f in fills
+            if f.side == Side.SELL and is_other_client(f) and start <= _aware(f.ts) <= until
+        ]
+        if sum(f.qty for f in inside) > sales[1] + max(EPS, 1e-6 * sales[1]):
+            return set()  # more than it sold: some of them are the owner's
+        return {f.exec_id for f in inside}
+
+    async def _bot_units_may_be_gone(
+        self, key: str, meta: dict[str, Any], fills: list[Fill], rows: list[OrderRecord]
+    ) -> bool:
+        """Whether a sale of the bot's own may have sold its units where no fill shows it
+        (the crypto watchdog's, an exit of the app's, a bracket child): then another
+        client's sell beyond the owner's units is no sure sign of units of his no fill
+        shows. Undecided (a failed read) counts as yes."""
+        opened = _aware(meta["opened_at"])
+        marker = position_marker(meta)
+        if (
+            watchdog_sales(self.db, key, marker, opened) is not None
+            and watchdog_sales_end(self.db, key, marker) is None
+        ):
+            # One of the watchdog's sells may still fill (or its record cannot say when each
+            # was sent). Once all are done, the split counts what they sold: another client's
+            # sell after its last one is no sign of one.
+            return True
+        mark, day = (key, marker), trading_day(self._now())
+        if self._cover_seen.get(mark) == day:
+            # A look earlier today found its stops covering all of the bot's units: a
+            # bracket child's sale since then is in today's executions, and a smaller cover
+            # now (the app's own exit cancelled the bracket) is no sign of an unseen one.
+            return app_sold_unjournaled(self.db, key, opened, fills, rows=rows)
+        own = self._bot_split(
+            key, meta, [f for f in fills if not (f.side == Side.SELL and is_other_client(f))]
+        )
+        try:
+            gone = await self._bot_sold_unseen(
+                Instrument.from_key(key), opened, fills, own.bot + own.unseen, rows
+            )
+        except BrokerError:
+            return True
+        if not gone:
+            self._cover_seen[mark] = day
+        return gone
+
+    def _last_exit_for(self, key: str) -> datetime | None:
+        if self._last_exit is None:
+            self._last_exit = {}
+            for tr in self.db.list_trades(limit=1000):
+                k = tr.instrument.key
+                ts = _aware(tr.exit_ts)
+                if k not in self._last_exit or ts > self._last_exit[k]:
+                    self._last_exit[k] = ts
+        return self._last_exit.get(key)
+
+    def _bot_exit_for(self, key: str) -> datetime | None:
+        """Exit time of the last trade journaled for `key` (bot trades only)."""
+        if self._bot_exit is None:
+            self._bot_exit = {}
+            for tr in self.db.list_trades(limit=1000):
+                k, ts = tr.instrument.key, _aware(tr.exit_ts)
+                if k not in self._bot_exit or ts > self._bot_exit[k]:
+                    self._bot_exit[k] = ts
+        return self._bot_exit.get(key)
+
+    def _meta_used(self, key: str, meta: dict[str, Any] | None) -> bool:
+        """The position this metadata describes is finished and journaled: a bot trade's
+        exit is after the metadata was written and the bot's own entry is not still
+        filling. It then no longer describes anything held."""
+        opened = meta.get("opened_at") if meta else None
+        exit_ts = self._bot_exit_for(key)
+        if opened is None or exit_ts is None:
+            return False
+        opened = _aware(opened)
+        if exit_ts < opened:
+            return False
+        if exit_ts == opened and not any(
+            tr.instrument.key == key
+            and _aware(tr.exit_ts) == exit_ts
+            and _aware(tr.entry_ts) >= opened
+            for tr in self.db.list_trades(since=exit_ts, limit=1000)
+        ):
+            return False  # the previous trade's exit, re-entered at the same instant
+        return not self._bot_entry_live(key, exit_ts)
+
+    def _bot_entry_live(self, key: str, exit_ts: datetime) -> bool:
+        """The bot's entry for `key` is still working, or one of its own buys filled after
+        the journaled exit (a partly filled entry whose filled part was sold by its
+        bracket): the position is not finished."""
+        if self._entry_buys is not None:  # the broker's open orders of the latest tick
+            if key in self._entry_buys:
+                return True
+        elif any(  # no broker read yet: the journal's view
+            o.request.instrument.key == key and o.request.side == Side.BUY and not o.request.is_exit
+            for o in self.db.list_orders(limit=200, statuses=OPEN_ORDER_STATUSES)
+        ):
+            return True
+        if any(
+            f.instrument.key == key
+            and f.side == Side.BUY
+            and _aware(f.ts) > exit_ts
+            and self.db.get_order_by_broker_id(f.broker_order_id) is not None
+            for f in self.db.list_fills(since=exit_ts, limit=FILL_QUERY_LIMIT)
+        ):
+            return True
+        return self._entry_unseen_held(key)
+
+    def _entry_unseen_held(
+        self, key: str, rows: list[OrderRecord] | None = None, sure: bool = False
+    ) -> bool:
+        """Part of the bot's entry for `key` filled beyond the journal's fills of it (the
+        rest of a partly filled entry filled while the app was down, on a day IBKR no
+        longer reports), or may have (an entry the app last saw working that IBKR no
+        longer lists; not with `sure`), and the bot's journaled trades do not cover what it
+        bought: those units are still the bot's, so its position is not finished. `rows`:
+        the app's order rows of the position, when already read."""
+        meta = self.db.get_position_meta(key)
+        opened = meta.get("opened_at") if meta else None
+        if opened is None or self._extra(key).get(REST_SETTLED):
+            return False
+        since = _aware(opened) - FILL_TIME_SKEW
+        fills = [
+            f
+            for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+            if f.instrument.key == key and _aware(f.ts) >= since
+        ]
+        filled, unknown = app_entry_unjournaled(self.db, key, _aware(opened), fills, [], rows=rows)
+        if sure:
+            unknown = 0.0
+        if filled + unknown <= EPS:
+            return False
+        bought = sum(f.qty for f in fills if f.side == Side.BUY and not is_other_client(f))
+        journaled = sum(
+            trade.qty
+            for trade in self.db.list_trades(since=since, limit=1000)
+            if trade.instrument.key == key and _aware(trade.entry_ts) >= since
+        )
+        return journaled < bought + filled + unknown - EPS
+
+    def _sold_unseen_lot(self, key: str, meta: dict[str, Any]) -> float:
+        """The part of the bot's entry its order rows say filled where no fill shows it,
+        that its sells left (the rest of it, or all of it, filled while the app was down),
+        when the app's own sells are known to have sold that and the journal's open lot
+        beyond the journal (their rows, or what a close of the app's saw them fill): those
+        units are sold where no fill shows them. 0 otherwise."""
+        opened = meta.get("opened_at")
+        if opened is None or self._extra(key).get(REST_SETTLED):
+            return 0.0
+        since = _aware(opened) - FILL_TIME_SKEW
+        fills = [
+            f
+            for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+            if f.instrument.key == key and _aware(f.ts) >= since
+        ]
+        sure, _ = app_entry_unjournaled(self.db, key, _aware(opened), fills, [])
+        lot = min(self._bot_split(key, meta, fills).unseen, sure)
+        if lot <= EPS:
+            return 0.0
+        sold = self._app_sold_beyond(key, _aware(opened), fills)
+        return lot if sold >= self._open_qty.get(key, 0.0) + lot - EPS else 0.0
+
+    def _settle_unseen_rest(
+        self,
+        key: str,
+        meta: dict[str, Any],
+        positions: list[Position],
+        now: datetime,
+        rows: list[OrderRecord] | None = None,
+    ) -> bool:
+        """The bot's entry is no longer working and the position read is exactly what the
+        journal's fills explain (the bot's units and the owner's): no unit is the unseen
+        rest of the entry (it lapsed, or filled and was sold while the app was down), and
+        none can come later. Record it, so a later owner buy no fill shows is never taken
+        for that rest. Not while a sale of the crypto watchdog's no fill shows is still to
+        be journaled (`_journal_watchdog_sale`): it sold part of the entry's lot. Nor while
+        a fill may be newer than the position read (`positions`, read at the tick's `now`,
+        before the executions this tick journaled)."""
+        if not self._entry_unseen_held(key, rows):
+            return False
+        if self._watchdog_unjournaled(key, meta)[0] > EPS:
+            return False
+        held = next((p.qty for p in positions if p.instrument.key == key and p.qty > 0), 0.0)
+        since = _aware(meta["opened_at"]) - FILL_TIME_SKEW
+        fills = [
+            f
+            for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+            if f.instrument.key == key and _aware(f.ts) >= since
+        ]
+        if any(_aware(f.ts) > now - FILL_TIME_SKEW for f in fills):
+            # The position read (at `now`) is older than this tick's executions: a fill
+            # after it (his buy) can make it match by chance while the rest is held.
+            return False
+        split = self._bot_split(key, meta, fills)
+        opened = meta["opened_at"]
+        marker = position_marker(meta)
+        sales = watchdog_sales(self.db, key, marker, opened)
+        if sales is not None:
+            # The bot's units as its exits count them: less the crypto watchdog's sales no
+            # fill shows (an earlier day). A read that matches only without them is the
+            # rest that filled and that the watchdog sold: settling it would leave those
+            # sales to come out of the bot's seen units a second time.
+            end = watchdog_sales_end(self.db, key, marker)
+            split = less_sold(
+                split,
+                unreported_sales(
+                    sales[1],
+                    fills,
+                    sales[0] - FILL_TIME_SKEW,
+                    end + FILL_TIME_SKEW if end is not None else None,
+                ),
+            )
+        if abs(held - (split.bot + split.owner)) > max(EPS, 1e-6 * held):
+            return False
+        self._set_extra(key, **{REST_SETTLED: 1.0})
+        return True
+
+    def _bot_split(
+        self,
+        key: str,
+        meta: dict[str, Any] | None,
+        fills: list[Fill],
+        hidden: list[tuple[datetime, float]] | None = None,
+        journal: bool = False,
+        args: dict[str, Any] | None = None,
+    ) -> Split:
+        """split_fills of a window of `key`'s fills for the bot position `meta` (None: no
+        position): its entry's quantity and send time, the crypto watchdog's sales of it
+        bounding the window in which another client's sells come out of the bot's, and the
+        owner's units no fill shows (`hidden`, default: as recorded). `journal` (the bot's
+        trips, and the owner's units no fill shows): in time order, what the watchdog's
+        sales known done sold that no fill in the window shows (an earlier day IBKR no
+        longer reports, not yet journaled at an estimate) comes out of the bot's units at
+        its first sale, the unseen part of the entry is only what may really have filled
+        beyond the journal, and the bot's own later sells keep the units they sold, so
+        another client's sell never takes what the bot sold or never held. `args`: the rest
+        of split_fills' arguments (`_split_args`), when read once for several splits."""
+        if meta is None:
+            return split_fills(fills)
+        if args is None:
+            args = self._split_args(key, meta, fills, journal)
+        hidden = read_hidden(self._extra(key)) if hidden is None else hidden
+        return split_fills(fills, hidden=hidden, **args)
+
+    def _split_args(
+        self,
+        key: str,
+        meta: dict[str, Any],
+        fills: list[Fill],
+        journal: bool = False,
+        rows: list[OrderRecord] | None = None,
+    ) -> dict[str, Any]:
+        """split_fills' arguments for `_bot_split` besides the fills and the owner's units
+        no fill shows: the same for every split of these fills. `rows`: the app's order
+        rows of the position, when already read."""
+        opened = meta.get("opened_at")
+        marker = position_marker(meta)
+        sales = watchdog_sales(self.db, key, marker, opened)
+        end = watchdog_sales_end(self.db, key, marker)
+        bot_first = sales[0] - FILL_TIME_SKEW if sales is not None else None
+        until = end + FILL_TIME_SKEW if end is not None else None
+        unseen_sale: tuple[datetime, float] | None = None
+        cap: float | None = None
+        entry = entry_qty(self._extra(key), meta)
+        if journal:
+            filled = watchdog_filled(self.db, key, marker)
+            if filled is not None and bot_first is not None:
+                unseen_sale = (filled[0], unreported_sales(filled[1], fills, bot_first, until))
+            # The bot's buys since its entry was sent are its entry's (a previous trip's were
+            # sold flat before): with all of it in them, no part of it is unseen.
+            seen = sum(
+                f.qty
+                for f in fills
+                if f.side == Side.BUY
+                and not is_other_client(f)
+                and opened is not None
+                and _aware(f.ts) >= _aware(opened)
+            )
+            if opened is not None and (entry is None or seen < entry - EPS):
+                # As this tick's open orders show the entry: one still working holds only
+                # what IBKR reports it filled, never its whole unfilled rest.
+                cap = entry_held_unjournaled(
+                    self.db, key, _aware(opened), fills, self._open_orders, rows=rows
+                )
+        return {
+            "bot_first_from": bot_first,
+            "bot_first_qty": sales[1] if sales is not None else None,
+            "bot_first_until": until,
+            "entry": entry,
+            "entry_sent": opened,
+            "unreported": unseen_sale,
+            "unseen_cap": cap,
+            "reserve": journal,
+        }
+
+    def _note_hidden(
+        self,
+        key: str,
+        meta: dict[str, Any],
+        held: float,
+        now: datetime,
+        rows: list[OrderRecord] | None = None,
+    ) -> bool:
+        """Units held beyond what the fills explain and beyond the unseen part of the bot's
+        entry are the owner's, bought where IBKR no longer reports (the bot never adds to a
+        position, and its entry went out with the symbol flat): record them, so another
+        client's sell comes out of them before the bot's. They were bought before today
+        (today's executions show every buy): dated at the trading day's start, so his sale
+        of them earlier today is his too, all of it (a split that charged part of it to the
+        bot explains less: look again with what was found). Not while a fill of the last
+        moments may be missing from the position read (returns False: it could not look).
+        Flat, nothing held shows them, but the bot's own sells may (`_note_hidden_sold`).
+        `rows`: the app's order rows of the position, when already read."""
+        opened = meta.get("opened_at")
+        if opened is None or entry_qty(self._extra(key), meta) is None:
+            return True
+        since = _aware(opened) - FILL_TIME_SKEW
+        fills = [
+            f
+            for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+            if f.instrument.key == key and _aware(f.ts) >= since
+        ]
+        settled = bool(self._extra(key).get(REST_SETTLED))
+        pools = read_hidden(self._extra(key))
+        day = trading_day_start(trading_day(now))
+        if held <= EPS:
+            return self._note_hidden_sold(key, meta, fills, pools, day, settled, rows)
+        if any(now - _aware(f.ts) < 2 * FILL_TIME_SKEW for f in fills):
+            return False
+        if rows is None:
+            rows = order_rows(self.db, _aware(opened), key)  # read once for every look below
+        sure = unknown = 0.0  # what of the entry filled, or may have, beyond the journal
+        if not settled:
+            # Only what of the entry may really have filled beyond the journal: a rest the
+            # app saw lapse holds nothing.
+            sure, unknown = app_entry_unjournaled(
+                self.db, key, _aware(opened), fills, [], rows=rows
+            )
+        # The app's own sells known to have filled beyond the journal (on a day IBKR no
+        # longer reports) sold the bot's units: they are not held.
+        app_sold = self._app_sold_beyond(key, _aware(opened), fills, rows)
+        args = self._split_args(key, meta, fills, journal=True, rows=rows)  # for every look
+        tol = max(EPS, 1e-6 * held)
+
+        def excess(found: float) -> float:
+            """What is held beyond what the fills explain with `found` of his units."""
+            split = self._bot_split(
+                key, meta, fills, [*pools, (day, found)] if found else pools, args=args
+            )
+            late = 0.0
+            if app_sold > EPS:
+                split, late = less_app_sold(split, app_sold, sure)
+            unseen = 0.0
+            if split.unseen > EPS and not settled:
+                unseen = min(split.unseen, max(0.0, sure + unknown - late))
+            return held - (split.bot + split.owner + unseen + split.hidden)
+
+        found = 0.0
+        more = excess(found)
+        for _ in range(3):
+            if more <= tol:
+                break
+            found += more
+            more = excess(found)
+        if more > tol:
+            # Each look adds only what is still unexplained, while a sale of his today
+            # takes what a pool too small leaves to the bot's units and to units held
+            # before the window (nobody's) first: find the least that explains it all,
+            # between what was found and enough for every sale of another client today.
+            low = found
+            found += more + sum(
+                f.qty
+                for f in fills
+                if f.side == Side.SELL and is_other_client(f) and _aware(f.ts) >= day
+            )
+            for _ in range(60):
+                mid = (low + found) / 2
+                if excess(mid) > tol:
+                    low = mid
+                else:
+                    found = mid
+            found += max(0.0, excess(found))  # the rest within the tolerance, exactly
+        if found <= tol:
+            return True
+        seen = list(self._extra(key).get(OWNER_HIDDEN) or [])
+        seen.append([day.isoformat(), round(found, 10)])
+        self._set_extra(key, **{OWNER_HIDDEN: seen})
+        log.warning("%s: %g held beyond what the fills explain: the owner's", key, found)
+        return True
+
+    def _note_hidden_sold(
+        self,
+        key: str,
+        meta: dict[str, Any],
+        fills: list[Fill],
+        pools: list[tuple[datetime, float]],
+        day: datetime,
+        settled: bool,
+        rows: list[OrderRecord] | None,
+    ) -> bool:
+        """`_note_hidden` of a flat position: the bot never sells more than it bought (its
+        seen buys and what of its entry may really have filled beyond the journal), so
+        another client's sells the split charged to the bot beyond that sold the owner's
+        units no fill shows (bought where IBKR no longer reports). Record them, held before
+        the first such sell, so the replay never journals his sale as the bot's. Only what
+        the split then no longer charges to the bot (an app sell beyond the bot's units
+        stays the app's). From the fills alone: one not reported yet only makes it find
+        less (the entry's buys are bounded by its order rows, an owner buy is his)."""
+        if not any(f.side == Side.SELL and is_other_client(f) for f in fills):
+            return True
+        opened = _aware(meta["opened_at"])
+
+        def over(split: Split) -> float:
+            sold = sum(f.qty for f in split.bot_fills if f.side == Side.SELL)
+            bought = sum(f.qty for f in split.bot_fills if f.side == Side.BUY)
+            return sold - bought - extra
+
+        extra = 0.0
+        if not settled:
+            sure, unknown = app_entry_unjournaled(self.db, key, opened, fills, [], rows=rows)
+            extra = sure + unknown
+        args = self._split_args(key, meta, fills)
+        split = self._bot_split(key, meta, fills, pools, args=args)
+        charged = [f for f in split.bot_fills if f.side == Side.SELL and is_other_client(f)]
+        before = over(split)
+        tol = max(EPS, 1e-6 * before)
+        found = round(min(before, sum(f.qty for f in charged)), 10)
+        if not charged or found <= tol:
+            return True
+        at = min(day, _aware(charged[0].ts))
+        after = over(self._bot_split(key, meta, fills, [*pools, (at, found)], args=args))
+        if before - after < found - tol:
+            return True  # the owner's units do not explain it: leave the split as it is
+        seen = list(self._extra(key).get(OWNER_HIDDEN) or [])
+        seen.append([at.isoformat(), found])
+        self._set_extra(key, **{OWNER_HIDDEN: seen})
+        log.warning("%s: %g sold beyond what the bot bought: the owner's", key, found)
+        return True
+
+    async def _reconstruct(self, key: str, now: datetime, hidden_undecided: bool = False) -> None:
+        """Journal every completed round trip of the bot for `key` since its last journaled
+        exit. Only the bot's own lots make its trips (trader/ownership.split_fills): shares
+        the owner bought next to them are neither paired with them nor journaled. While the
+        bot holds a position, the window starts at its entry: an entry goes out only with
+        the symbol flat at the broker (RiskManager: never add to a position), so nothing
+        bought before it, the owner's included, is part of that position."""
+        last_exit = self._last_exit_for(key)  # also loads the cache _journal_trade keeps
+        meta = self.db.get_position_meta(key)
+        if self._meta_used(key, meta):
+            meta = None  # its position closed and is journaled: later trips are not the bot's
+        start = last_exit
+        journaled: datetime | None = None
+        opened = meta.get("opened_at") if meta else None
+        if opened is not None:
+            entry_from = _aware(opened) - FILL_TIME_SKEW - timedelta(microseconds=1)
+            if start is None or entry_from > start:
+                start = entry_from
+            elif start >= _aware(opened):
+                # A trip of this same position is journaled (a partly filled entry whose
+                # first part exited): replay from its entry, so an owner buy before that
+                # exit stays his, and never journal that trip again.
+                start, journaled = entry_from, last_exit
+        epoch = self._epoch  # fills before it belong to an earlier (simulated) account
+        since = start or now - TRADE_LOOKBACK
+        if epoch is not None:
+            since = max(since, epoch)
+        fills = [
+            f
+            for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+            if f.instrument.key == key
+            and (start is None or _aware(f.ts) > start)
+            and (epoch is None or _aware(f.ts) >= epoch)
+        ]
+        fills.sort(key=lambda f: (f.ts, f.exec_id))
+        fallback = None
+        if meta and meta.get("entry_price"):
+            fallback = (float(meta["entry_price"]), meta.get("opened_at") or now)
+        split = self._bot_split(key, meta, fills, journal=True)
+        trips, open_qty = replay_fills(split.bot_fills, fallback, journaled)
+        self._open_qty[key] = open_qty
+        self._pending_trades.discard(key)
+        # What the trades journaled in this window hold: the trips up to that last exit are
+        # them, but a trip ending in its second beyond them (an exit whose fill came after
+        # that replay, in the same second) is journaled for that part. (A trade keeps its
+        # quantity to 8 decimals: so are the trips compared with it.)
+        done = (
+            sum(
+                tr.qty
+                for tr in self.db.list_trades(since=start, limit=1000)
+                if tr.instrument.key == key
+            )
+            if journaled is not None and start is not None
+            else 0.0
+        )
+        for trip in trips:
+            if journaled is not None and _aware(trip.exit_ts) <= journaled:
+                qty = round(trip.qty, 8)
+                beyond = round(qty - done, 8)
+                if _aware(trip.exit_ts) < journaled or beyond <= 0:
+                    done -= qty
+                    continue
+                if done > EPS:
+                    part = beyond / trip.qty
+                    trip = replace(
+                        trip,
+                        qty=beyond,
+                        cost=trip.cost * part,
+                        proceeds=trip.proceeds * part,
+                        commission=trip.commission * part,
+                    )
+                done = 0.0
+            if any(f.commission <= 0 and now - _aware(f.ts) < COMMISSION_GRACE for f in trip.fills):
+                self._pending_trades.add(key)  # wait briefly for the commission report
+                return
+            if hidden_undecided and any(
+                f.side == Side.SELL and is_other_client(f) for f in trip.fills
+            ):
+                # Another client's sell taken from the bot's units while the owner's units no
+                # fill shows could not be looked for (`_note_hidden`): it may be his sale of
+                # them. Wait until they can be.
+                self._pending_trades.add(key)
+                return
+            if not self._bot_trip(trip, meta):
+                # The owner's own round trip in TWS or IBKR Mobile: account equity has its
+                # P&L, but it is no evidence of the bot and must not move its loss streak.
+                log.info("%s: a round trip the bot did not open; not journaled as its trade", key)
+                assert self._last_exit is not None
+                self._last_exit[key] = _aware(trip.exit_ts)
+                self._close_reasons.pop(key, None)  # a close of that trip, not of the next
+                continue
+            await self._journal_trade(key, trip, meta)
+            if self._meta_used(key, meta):
+                meta = None  # the bot's position closed: what follows is someone else's
+        if meta is None and split.owner_bought > EPS:
+            self._close_reasons.pop(key, None)  # a close of the owner's shares
+
+    def _bot_trip(self, trip: _Trip, meta: dict[str, Any] | None) -> bool:
+        """Whether the bot opened this round trip: a buy is one of its journaled orders, or
+        its position metadata (written before every entry is sent) predates the first buy."""
+        buys = [f for f in trip.fills if f.side == Side.BUY]
+        if not buys:  # a sell matched to the metadata's entry (its fills are not journaled)
+            return meta is not None
+        if any(self.db.get_order_by_broker_id(f.broker_order_id) for f in buys):
+            return True
+        opened = meta.get("opened_at") if meta else None
+        return opened is not None and _aware(opened) <= _aware(buys[0].ts)
+
+    async def _journal_trade(
+        self, key: str, trip: _Trip, meta: dict[str, Any] | None
+    ) -> TradeRecord:
+        assert trip.entry_ts is not None and trip.exit_ts is not None
+        qty = trip.qty
+        entry = trip.cost / qty
+        pnl = trip.proceeds - trip.cost - trip.commission
+        unit = self._unit_risk(key, entry, meta)
+        r_multiple = round(pnl / (unit * qty), 3) if unit else None
+        record = TradeRecord(
+            instrument=Instrument.from_key(key),
+            qty=round(qty, 8),
+            entry_price=round(entry, 6),
+            exit_price=round(trip.proceeds / qty, 6),
+            entry_ts=trip.entry_ts,
+            exit_ts=trip.exit_ts,
+            pnl=round(pnl, 4),
+            commission=round(trip.commission, 4),
+            setup=meta.get("setup") if meta else None,
+            decision_id=meta.get("decision_id") if meta else None,
+            r_multiple=r_multiple,
+            exit_reason=self._exit_reason(key, trip, meta),
+            delayed_data=bool(self._extra(key).get("delayed_data")),
+        )
+        record.id = self.db.insert_trade(record)
+        assert self._last_exit is not None
+        self._last_exit[key] = _aware(trip.exit_ts)
+        exit_ts = _aware(trip.exit_ts)
+        known = self._bot_exit_for(key)  # (a first read seeds from the journal, this trade too)
+        assert self._bot_exit is not None
+        self._bot_exit[key] = max(exit_ts, known) if known is not None else exit_ts
+
+        stats = self._stats_for(trading_day(record.exit_ts))
+        stats.realized_pnl = round(stats.realized_pnl + record.pnl, 4)
+        if record.pnl > 0:
+            stats.wins += 1
+        elif record.pnl < 0:
+            stats.losses += 1
+        self.db.upsert_day(stats)
+        if self._day is not None:  # the streak is a running counter used for sizing now
+            if record.pnl > 0:
+                self._day.loss_streak = 0
+            elif record.pnl < 0:
+                self._day.loss_streak += 1
+            self._save_day()
+        r_text = f", {r_multiple:+.2f}R" if r_multiple is not None else ""
+        log.info(
+            "trade closed: %s %g @ %.4f -> %.4f, P&L %+.2f%s (%s)",
+            key,
+            record.qty,
+            record.entry_price,
+            record.exit_price,
+            record.pnl,
+            r_text,
+            record.exit_reason,
+        )
+        await self._notify(
+            f"Trade closed: {record.instrument.symbol}",
+            f"P&L {record.pnl:+.2f} USD{r_text} ({record.exit_reason})",
+        )
+        return record
+
+    def _exit_reason(self, key: str, trip: _Trip, meta: dict[str, Any] | None) -> str:
+        sell = trip.last_sell
+        reason = self._close_reasons.pop(key, None)
+        if sell is not None and sell.exec_id.startswith(f"{UNREPORTED_EXIT}:"):
+            return "closed at broker (fill not reported; price estimated)"
+        if sell is not None:
+            rec = self.db.get_order_by_broker_id(sell.broker_order_id)
+            if rec is not None and rec.request.side == Side.SELL and rec.request.reason:
+                return rec.request.reason
+        if reason:
+            return reason
+        if sell is not None and meta:
+            target, stop = meta.get("take_profit"), meta.get("stop_loss")
+            if target and sell.price >= target * 0.998:
+                return "take-profit"
+            if stop and sell.price <= stop * 1.002:
+                return "stop-loss"
+        return "closed at broker"
+
+    async def _close_unreported_exit(
+        self,
+        key: str,
+        meta: dict[str, Any],
+        since: datetime,
+        now: datetime,
+        watchdog_sold: bool = False,
+    ) -> bool:
+        """A bot position the broker reads flat (or, with `watchdog_sold`, one the crypto
+        watchdog sold: marked sold flat, or read flat with units of the entry the journal
+        never saw, sold next to the entry's working rest) whose exit fill the journal never
+        got: it filled while the app was down on an earlier day, and IBKR reports only
+        today's executions. Without it the meta (which blocks new entries in the symbol)
+        would stay for good, and a later trip would be paired with the stale lot. After
+        UNREPORTED_EXIT_GRACE, journal the exit at an estimate (the stop, else the entry),
+        dated just after the bot's last fill so it lands on that earlier day (never before a
+        trip of the position already journaled), and tell the owner. Returns True when the
+        position is closed now."""
+        if now - since < UNREPORTED_EXIT_GRACE:
+            return False
+        sold_at = self._watchdog_sale_at(key) if watchdog_sold else None
+        fills = [
+            f
+            for f in self.db.list_fills(since=now - TRADE_LOOKBACK, limit=FILL_QUERY_LIMIT)
+            if f.instrument.key == key and (sold_at is None or _aware(f.ts) <= sold_at)
+        ]
+        today = trading_day_start(trading_day(now))
+        opened = meta.get("opened_at")
+        lot = 0.0  # the bot's units its rows show bought and its own sells sold, no fill of them
+        if not watchdog_sold and opened is not None and _aware(opened) < today:
+            lot = self._sold_unseen_lot(key, meta)
+        if not fills and not watchdog_sold and lot <= EPS:
+            return False
+        last = max(fills, key=lambda f: _aware(f.ts)) if fills else None
+        # The watchdog's sales of an earlier day are never reported now, even when today's
+        # executions show its later ones: those are journaled, the rest is estimated.
+        earlier = (
+            watchdog_last_filled(self.db, key, position_marker(meta), today)
+            if watchdog_sold
+            else None
+        )
+        if last is not None and _aware(last.ts) >= today and earlier is None:
+            return False  # today's executions would still report the exit: wait for it
+        # Acting on a false flat read would cancel the stop of a held position: read again.
+        # (The watchdog's mark already says it sold the bot's position flat: what is held
+        # under the symbol now was bought since, by the owner. Without the mark, read too.)
+        if not sold_by_watchdog(self.db, key, meta) and any(
+            p.instrument.key == key and p.qty > 0 for p in await self.broker.positions()
+        ):
+            self._mismatch_logged.pop(key, None)
+            return False
+        qty = self._open_qty.get(key, 0.0)
+        unseen_sold = self._watchdog_unjournaled(key, meta)[0] if not watchdog_sold else 0.0
+        if unseen_sold <= EPS:
+            qty += lot
+        if unseen_sold > qty + EPS and opened is not None:
+            # The crypto watchdog sold next to the entry's working rest (so never marked it
+            # sold flat), on a day IBKR no longer reports: what it sold of the entry beyond the
+            # journal's lot (its rest that filled while the app was down) is the bot's trade too.
+            start = _aware(opened) - FILL_TIME_SKEW
+            window = [f for f in fills if _aware(f.ts) >= start]
+            split = self._bot_split(key, meta, window)
+            possible = entry_held_unjournaled(self.db, key, _aware(opened), window, [])
+            unseen = split.unseen if possible is None else min(split.unseen, possible)
+            qty = max(qty, min(unseen_sold, qty + unseen))
+        if watchdog_sold:  # the bot's lot is what was open when the watchdog sold
+            # Its own lot, from its entry on (as _reconstruct): an owner lot the journal
+            # still shows open (his sale on a day IBKR no longer reports) is not part of it.
+            epoch = self._epoch
+            start = _aware(opened) - FILL_TIME_SKEW if opened is not None else None
+            window = sorted(
+                (
+                    f
+                    for f in fills
+                    if (epoch is None or _aware(f.ts) >= epoch)
+                    and (start is None or _aware(f.ts) >= start)
+                ),
+                key=lambda f: (f.ts, f.exec_id),
+            )
+            split = self._bot_split(key, meta, window)
+            _, qty = replay_fills(split.bot_fills)
+            # It sold flat, so all it sold was the bot's: what no fill shows (the rest of
+            # the entry filled while the app was down) too, up to what is left of the entry.
+            unseen_sold, sale_at = self._watchdog_unjournaled(key, meta, window)
+            sale_at = earlier or sale_at
+            if sale_at is None or sale_at >= today:
+                if last is None:
+                    return False  # today's executions would still report it
+            else:
+                unseen = split.unseen
+                if unseen > EPS and opened is not None:
+                    # Only what of the entry may really have filled beyond the journal: an
+                    # entry the app saw lapse bought none of the coins the watchdog sold.
+                    possible = entry_held_unjournaled(self.db, key, _aware(opened), window, [])
+                    unseen = unseen if possible is None else min(unseen, possible)
+                qty = max(qty, min(unseen_sold, split.bot + unseen))
+            if qty <= EPS:
+                return True  # nothing of the bot's was open before the sale
+            if (
+                last is not None
+                and sale_at is not None
+                and sale_at < today
+                and (not window or (opened is not None and _aware(last.ts) < _aware(opened)))
+            ):
+                # `last` is no fill of this position (an earlier trip's, or another client's
+                # or the bot's previous trip's inside the clock skew before the entry was
+                # sent, where the estimate would sell nothing of it): date it at the sale,
+                # after the entry was sent.
+                last = None
+        price = meta.get("stop_loss") or meta.get("entry_price") or (last.price if last else 0)
+        if not price:
+            return False
+        if last is not None:
+            at = _aware(last.ts) + timedelta(seconds=1)
+        elif watchdog_sold:
+            at = sale_at
+        else:
+            at = _aware(opened) + timedelta(seconds=1)  # no fill of it at all: after the entry
+        done = self._last_exit_for(key)
+        if watchdog_sold and opened is not None and done is not None and _aware(opened) <= done:
+            # Never before a trip of this position already journaled (its rest sold today):
+            # the replay journals no trip before one it journaled.
+            at = max(at, done + timedelta(seconds=1))
+        exit_fill = Fill(
+            exec_id=f"{UNREPORTED_EXIT}:{key}:{now.isoformat()}",
+            broker_order_id=UNREPORTED_EXIT,
+            instrument=Instrument.from_key(key),
+            side=Side.SELL,
+            qty=qty,
+            price=float(price),
+            ts=at,
+        )
+        self.db.insert_fill(exit_fill)
+        await self._reconstruct(key, now)
+        symbol = exit_fill.instrument.symbol
+        log.warning("%s: exit fill never reported; journaled %g at %g (estimate)", key, qty, price)
+        self.db.audit(
+            "unreported_exit",
+            {"instrument": key, "qty": qty, "price": price, "watchdog": watchdog_sold},
+        )
+        how = (
+            "the crypto watchdog sold it while the app was down"
+            if watchdog_sold
+            else f"IBKR shows no {symbol} position, but its exit filled while the app was down"
+        )
+        await self._notify(
+            f"Exit of {symbol} not reported",
+            f"{how[0].upper()}{how[1:]} on an earlier day and IBKR no longer reports it. The "
+            f"trade is journaled at {price:g} as an estimate: check the real price in IBKR's "
+            f"statements. {symbol} can be traded again.",
+            priority="high",
+            tags=["warning"],
+        )
+        if watchdog_sold:  # anything open after it in the journal is the owner's since
+            return key not in self._pending_trades
+        return self._open_qty.get(key, 0.0) <= EPS and key not in self._pending_trades
+
+    def _watchdog_unjournaled(
+        self, key: str, meta: dict[str, Any], fills: list[Fill] | None = None
+    ) -> tuple[float, datetime | None]:
+        """What the crypto watchdog sold of the bot position `meta` (marked sold flat: its
+        last sell filled in full) that no fill in `fills` (default: the journal's since the
+        entry) shows, and when it last sold (None: no sale recorded)."""
+        opened = meta.get("opened_at")
+        marker = position_marker(meta)
+        sales = watchdog_sales(self.db, key, marker, opened)
+        if sales is None:
+            return 0.0, None
+        first, sold = sales
+        if fills is None:
+            since = _aware(opened) - FILL_TIME_SKEW if opened is not None else first
+            fills = [
+                f
+                for f in self.db.list_fills(since=since, limit=FILL_QUERY_LIMIT)
+                if f.instrument.key == key
+            ]
+        end = watchdog_sales_end(self.db, key, marker)
+        until = end + FILL_TIME_SKEW if end is not None else None
+        rec = read_sales_record(self.db, key, marker) or {}
+        latest = max(
+            (_aware(datetime.fromisoformat(v)) for v in rec.get("at", {}).values()),
+            default=self._watchdog_sale_at(key) or first,
+        )
+        return unreported_sales(sold, fills, first - FILL_TIME_SKEW, until), latest
+
+    def _watchdog_sale_at(self, key: str) -> datetime | None:
+        """When the crypto watchdog last sold `key` (its audit row), if it is recorded."""
+        for row in self.db.list_audit(limit=None, action="watchdog_close"):
+            if row["detail"].get("instrument") == key:
+                stamp = datetime.fromisoformat(row["ts"])
+                return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
+        return None
+
+    async def _journal_watchdog_sale(self, key: str, meta: dict[str, Any], now: datetime) -> bool:
+        """The crypto watchdog sold the bot's part of a position the owner also holds (so it
+        never marked it sold flat), on an earlier day IBKR no longer reports: journal what
+        it saw filled at an estimate, as _close_unreported_exit does for a flat position,
+        so the bot's trade closes and its metadata is released. True when it is. Without
+        the owner's units next to it, everything held is the bot's, still unsold."""
+        opened = meta.get("opened_at")
+        if opened is None or Instrument.from_key(key).asset_class != AssetClass.CRYPTO:
+            return False
+        marker = position_marker(meta)
+        filled = watchdog_filled(self.db, key, marker)  # what it saw done: never a guess
+        sales = watchdog_sales(self.db, key, marker, opened)
+        if filled is None or sales is None:
+            return False
+        first, sold = filled
+        today = trading_day_start(trading_day(now))
+        if first >= today:
+            return False  # today's executions still report it
+        try:  # fresh: an exit of this tick may have sold since the tick read the positions
+            held = next(
+                (p.qty for p in await self.broker.positions() if p.instrument.key == key),
+                0.0,
+            )
+        except BrokerError:
+            return False
+        bot_first = sales[0] - FILL_TIME_SKEW
+        end = watchdog_sales_end(self.db, key, marker)
+        until = end + FILL_TIME_SKEW if end is not None else None
+        fills = [
+            f
+            for f in self.db.list_fills(
+                since=_aware(opened) - FILL_TIME_SKEW, limit=FILL_QUERY_LIMIT
+            )
+            if f.instrument.key == key
+        ]
+        limit = entry_qty(self._extra(key), meta)
+        split = split_fills(
+            fills,
+            bot_first_from=bot_first,
+            bot_first_qty=sales[1],
+            bot_first_until=until,
+            entry=limit,
+            entry_sent=opened,
+        )
+        unseen_sold = unreported_sales(sold, fills, bot_first, until)
+        if not owner_evidence(held, limit, split) and not bought_since(
+            held, limit, less_sold(split, unseen_sold)
+        ):
+            return False
+        # What the bot held when it first sold, too: another client's sell since may have
+        # taken the unseen part of its entry in the split above (the journal replays the
+        # watchdog's sales before it, `_bot_split(journal=True)`).
+        then = split_fills(
+            [f for f in fills if _aware(f.ts) <= first],
+            bot_first_from=bot_first,
+            bot_first_qty=sales[1],
+            bot_first_until=until,
+            entry=limit,
+            entry_sent=opened,
+        )
+        qty = round(min(unseen_sold, max(split.bot + split.unseen, then.bot + then.unseen)), 8)
+        price = meta.get("stop_loss") or meta.get("entry_price")
+        if qty <= EPS or not price:
+            return False
+        # Dated at the latest sale it covers: a later outage's sale gets its own estimate.
+        at = watchdog_last_filled(self.db, key, marker, today) or first
+        ts = at
+        done = self._last_exit_for(key)
+        if done is not None and _aware(opened) <= done:
+            # Never before a trip of this position already journaled (the entry's rest,
+            # bought and sold today): the replay journals no trip before one it journaled.
+            # (Its execution id stays the sale's: journaled once.)
+            ts = max(ts, done + timedelta(seconds=1))
+        estimate = Fill(
+            exec_id=f"{UNREPORTED_EXIT}:{key}:{at.isoformat()}",
+            broker_order_id=UNREPORTED_EXIT,
+            instrument=Instrument.from_key(key),
+            side=Side.SELL,
+            qty=qty,
+            price=float(price),
+            ts=ts,
+        )
+        if not self.db.insert_fill(estimate):
+            return False  # journaled before: what is left of it is the bot's still
+        # (Another client's sell is not journaled as the bot's while his units no fill shows
+        # could not be looked for.)
+        await self._reconstruct(key, now, hidden_undecided=key in self._replay_undecided)
+        symbol = estimate.instrument.symbol
+        log.warning(
+            "%s: the watchdog's sale of %g on an earlier day journaled at %g", key, qty, price
+        )
+        self.db.audit(
+            "unreported_exit",
+            {"instrument": key, "qty": qty, "price": price, "watchdog": True},
+        )
+        await self._notify(
+            f"Exit of {symbol} not reported",
+            f"The crypto watchdog sold the bot's {qty:g} {symbol} while the app was down on an "
+            f"earlier day, and IBKR no longer reports it. The trade is journaled at {price:g} "
+            f"as an estimate: check the real price in IBKR's statements. Your own {symbol} "
+            "was not sold.",
+            priority="high",
+            tags=["warning"],
+        )
+        return self._meta_used(key, meta)
+
+    async def _cleanup_meta(
+        self, now: datetime, positions: list[Position], open_orders: list[OrderRecord]
+    ) -> None:
+        """Forget engine metadata once a position is flat at the broker AND in the fills
+        journal, and cancel exit orders it left behind (e.g. a re-placed stop)."""
+        held = {p.instrument.key for p in positions if p.qty > 0}
+        buying = self._working_buys(open_orders)
+        live: list[OrderRecord] | None = None  # read again: a stop re-placed this tick
+        for key, meta in self.db.all_position_meta().items():
+            # Sold by the crypto watchdog while the app was down, or the bot's trade for it
+            # already journaled: shares held now are not the bot's (they may be the owner's
+            # buy since, which the fills journal counts).
+            sold = sold_by_watchdog(self.db, key, meta)
+            closed = self._meta_used(key, meta)
+            opened = meta.get("opened_at")
+            rows: list[OrderRecord] | None = None  # the app's order rows: read once below
+            if key in held and not sold and not closed and key not in buying:
+                if opened is not None:
+                    rows = order_rows(self.db, _aware(opened), key)
+                # The watchdog's sale no fill shows first: the entry's rest settles only once
+                # it is journaled (from the entry's lot).
+                if await self._journal_watchdog_sale(key, meta, now):
+                    closed = True
+                elif key not in self._pending_trades and self._settle_unseen_rest(
+                    key, meta, positions, now, rows
+                ):
+                    closed = self._meta_used(key, meta)
+            released = sold or closed
+            if (key in held and not released) or key in buying or key in self._pending_trades:
+                self._mismatch_logged.pop(key, None)  # flat reads must be consecutive
+                if key in held and not released and key not in buying:
+                    qty = next(p.qty for p in positions if p.instrument.key == key)
+                    self._note_hidden(key, meta, qty, now, rows)
+                continue
+            # Without a journaled exit this may be an entry whose fills are still in flight.
+            if not closed and opened is not None and now - _aware(opened) < STALE_META_GRACE:
+                continue
+            if key not in self._open_qty:
+                await self._reconstruct(key, now)
+                if key in self._pending_trades:
+                    continue
+            if self._open_qty.get(key, 0.0) > EPS and not released:
+                since = self._mismatch_logged.setdefault(key, now)
+                if since == now:
+                    log.warning("%s: broker shows no position but the fills journal does", key)
+                if not await self._close_unreported_exit(key, meta, since, now):
+                    continue
+            elif (
+                (
+                    sold
+                    # Flat and unmarked, with units of the bot's entry the journal never
+                    # saw: the watchdog sold them next to the entry's working rest (it marks
+                    # a position sold flat only with no entry of the app's working).
+                    or (key not in held and self._entry_unseen_held(key))
+                )
+                and not closed
+                and (
+                    self._open_qty.get(key, 0.0) > EPS
+                    or self._watchdog_unjournaled(key, meta)[0] > EPS
+                )
+            ):
+                # The watchdog's sale fell on an earlier day IBKR no longer reports: journal
+                # the bot's lot at an estimate before forgetting the meta, so the next trip
+                # in the symbol is not paired with it.
+                since = self._mismatch_logged.setdefault(key, now)
+                if not await self._close_unreported_exit(key, meta, since, now, True):
+                    continue
+            elif (
+                key not in held
+                and not released
+                and self._entry_unseen_held(key, sure=True)
+                and self._sold_unseen_lot(key, meta) > EPS
+            ):
+                # Flat: the bot's entry bought units no fill shows (its rows say so) and its
+                # own sells sold them where no fill shows it either (the app was down on that
+                # day): never forgotten without the bot's trade.
+                since = self._mismatch_logged.setdefault(key, now)
+                if not await self._close_unreported_exit(key, meta, since, now):
+                    continue
+            if live is None:
+                try:
+                    live = await self.broker.open_orders()
+                except BrokerError as exc:
+                    log.warning("%s: open orders not read (%s); metadata kept", key, exc)
+                    continue
+            self._mismatch_logged.pop(key, None)
+            for order in live:
+                req = order.request
+                if (
+                    req.instrument.key == key
+                    and req.side == Side.SELL
+                    and order.status in OPEN_ORDER_STATUSES
+                    and order.broker_order_id
+                    and self.broker.can_cancel(order)  # never the owner's own orders
+                ):
+                    await self.broker.cancel_order(order.broker_order_id)
+                    log.info("cancelled leftover exit order %s for %s", order.broker_order_id, key)
+            self.db.delete_position_meta(key)
+            self.db.set_kv(EXTRA_PREFIX + key, "{}")
+            self.db.delete_kv(WATCHDOG_CLOSED_PREFIX + key)
+            self.db.delete_kv(WATCHDOG_SALES_PREFIX + key)
+            self._closing.pop(key, None)
+            self._open_qty.pop(key, None)
+
+    # ------------------------------------------------------------------ signal ledger
+    def _update_signal(self, signal_id: int | None, **fields: Any) -> None:
+        if signal_id is None:
+            return
+        sig = self.db.get_signal(signal_id)
+        if sig is not None:
+            self.db.update_signal(sig.model_copy(update=fields))
+
+    def _revert_signal(self, order_id: int, reason: str) -> None:
+        """An order that never reached the broker: its signal counts as skipped."""
+        for sig in self.db.list_signals(limit=500):
+            if sig.order_id == order_id:
+                self.db.update_signal(
+                    sig.model_copy(update={"taken": False, "skip_reason": reason})
+                )
+                return
+
+    async def _ledger_done(self) -> None:
+        """Wait for a signal-ledger pass that is running (tests)."""
+        if self._ledger_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._ledger_task
+
+    async def _evaluate_signals(self, now: datetime) -> None:
+        """Score matured signals (stocks after their session close, crypto after 24h).
+        Bounded to a few bar requests per pass; data errors are retried later."""
+        if self._last_ledger_at is not None and now - self._last_ledger_at < LEDGER_EVERY:
+            return
+        self._last_ledger_at = now
+        groups: dict[str, list[tuple[SignalRecord, datetime]]] = {}
+        for sig in self.db.unevaluated_signals(before=now, limit=500):
+            ts = _aware(sig.ts)
+            if self._epoch is not None and ts < self._epoch:
+                # From the simulator or another account: this broker's bars are not the
+                # market it fired in. Closed without an outcome.
+                self.db.update_signal(sig.model_copy(update={"evaluated": True}))
+                continue
+            if sig.instrument.asset_class == AssetClass.STOCK:
+                end = market_close_time(trading_day(ts))
+            else:
+                end = ts + CRYPTO_HORIZON
+            if now < end + LEDGER_SETTLE:
+                continue
+            key = sig.instrument.key
+            if now < self._ledger_retry.get(key, now):
+                continue
+            if key in groups or len(groups) < LEDGER_MAX_INSTRUMENTS:
+                groups.setdefault(key, []).append((sig, end))
+        for key, items in groups.items():
+            oldest = min(_aware(s.ts) for s, _ in items)
+            days = min((now - oldest).days + 2, LEDGER_GIVE_UP.days + 1)
+            try:
+                bars = await self.broker.bars(Instrument.from_key(key), "1 min", f"{days} D")
+            except Exception as exc:
+                log.warning("ledger bars for %s failed: %s", key, exc)
+                bars = []
+            missing = False
+            for sig, end in items:
+                scored = score_signal(sig, bars, end)
+                if scored is not None:
+                    self.db.update_signal(scored)
+                elif now - _aware(sig.ts) > LEDGER_GIVE_UP:
+                    self.db.update_signal(sig.model_copy(update={"evaluated": True}))
+                else:
+                    missing = True
+            if missing:  # let other instruments' signals through meanwhile
+                self._ledger_retry[key] = now + LEDGER_RETRY
+
+    # ------------------------------------------------------------------ decision cycle
+    async def run_cycle(self, manual: bool = False) -> DecisionBatch | None:
+        """One decision cycle. Returns the journaled batch, or None when skipped (halted,
+        disconnected, or nothing tradable now). Raises BrokerError when the broker is down."""
+        async with self._cycle_lock:
+            # Fresh account, positions, fills and halts. Shielded: stop() cancelling the cycle
+            # must not cut a halt's flatten or the journal off halfway.
+            tick = asyncio.ensure_future(self.monitor_tick())
+            try:
+                await asyncio.shield(tick)
+            except asyncio.CancelledError:
+                tick.add_done_callback(lambda t: t.cancelled() or t.exception())  # logged there
+                raise
+            now = self._now()
+            self._last_cycle_at = now
+            day = self._today(now)
+            if day.halted:
+                log.info("cycle skipped: trading halted (%s)", day.halt_reason)
+                return None
+            if self._halt_pending is not None:
+                log.info("cycle skipped: halt condition being confirmed (%s)", self._halt_pending)
+                return None
+            if not self.broker.connected or self._account is None:
+                return None
+            if self._fills_journaled_at is None:
+                # As for exits: no decision (a CLOSE above all) on metadata that may describe
+                # a bot position that closed while the app was down.
+                log.info("cycle skipped: fills since the (re)connect not journaled yet")
+                return None
+            universe = await self._universe(now)
+            if not universe:
+                log.info("cycle skipped: nothing tradable now")
+                return None
+            return await self._cycle(now, day, universe, manual)
+
+    async def _universe(self, now: datetime) -> list[Instrument]:
+        settings = self.settings
+        stocks_open = stock_market_open(now)
+        symbols: list[Instrument] = []
+        dynamic_keys: set[str] = set()
+        mover_symbols: set[str] = set()
+        if settings.trade_stocks and stocks_open:
+            names = list(settings.stock_universe)
+            if settings.dynamic_universe:
+                try:
+                    movers = await self.broker.scan_movers(SCANNER_MOVERS)
+                    names += movers
+                    mover_symbols = {s.strip().upper() for s in movers if s.strip()}
+                    dynamic_keys = {
+                        Instrument(symbol=s.strip().upper()).key for s in movers if s.strip()
+                    }
+                except Exception as exc:
+                    log.warning("scan_movers failed: %s", exc)
+            symbols += [Instrument(symbol=s, asset_class=AssetClass.STOCK) for s in names]
+        if settings.trade_crypto:
+            symbols += [
+                Instrument(symbol=s, asset_class=AssetClass.CRYPTO)
+                for s in settings.crypto_universe
+            ]
+        out: dict[str, Instrument] = {}
+        for pos in self._positions:  # always look at held positions so they can be managed
+            stock = pos.instrument.asset_class == AssetClass.STOCK
+            if pos.qty > 0 and (stocks_open or not stock):
+                out.setdefault(pos.instrument.key, pos.instrument)
+        for inst in symbols:
+            symbol = inst.symbol.strip().upper()
+            if not symbol:
+                continue
+            inst = Instrument(symbol=symbol, asset_class=inst.asset_class)
+            if (
+                inst.asset_class == AssetClass.STOCK
+                and symbol in LEVERAGED_ETFS
+                and not self.risk.limits.allow_leveraged_etfs
+            ):
+                self._log_skip_once(symbol, "leveraged/inverse ETF (not allowed in settings)")
+                continue
+            out.setdefault(inst.key, inst)
+        if len(out) > MAX_QUOTE_STREAMS:
+            # More symbols than quote lines would reopen every line each cycle (a held
+            # symbol outside a full universe): the last ones wait, held positions first.
+            for inst in list(out.values())[MAX_QUOTE_STREAMS:]:
+                self._log_skip_once(inst.symbol, f"more than {MAX_QUOTE_STREAMS} quote lines")
+            out = dict(list(out.items())[:MAX_QUOTE_STREAMS])
+        self._cycle_quote_scope = set(out) & dynamic_keys
+        self._cycle_quote_scope_at = now
+        self._cycle_movers = mover_symbols  # kept across a settings save, unlike the scope
+        self._prune_quote_cache(now)
+        return list(out.values())
+
+    def _in_universe(self, inst: Instrument) -> bool:
+        """Whether the current settings still let the bot buy inst: in the owner's lists,
+        or a scanner mover of this cycle while dynamic movers are on."""
+        s = self.settings
+        if inst.asset_class == AssetClass.STOCK:
+            allowed = {x.strip().upper() for x in s.stock_universe}
+            if s.dynamic_universe:
+                allowed |= self._cycle_movers
+        else:
+            allowed = {x.strip().upper() for x in s.crypto_universe}
+        return inst.symbol.strip().upper() in allowed
+
+    def _log_skip_once(self, symbol: str, reason: str) -> None:
+        if (symbol, reason) not in self._skip_logged:
+            self._skip_logged.add((symbol, reason))
+            log.info("universe: skipping %s today: %s", symbol, reason)
+
+    async def _fetch(
+        self, universe: list[Instrument], now: datetime
+    ) -> list[tuple[Instrument, Quote, list[Bar], datetime]]:
+        """Fetch quotes and bars so every emitted setup reaches the signal ledger.
+
+        Each result carries when its quote arrived. The monitor can re-quote a held symbol
+        while the round goes on, so the round keeps its own arrival times.
+        """
+        assert self._account is not None
+        lookback = BAR_LOOKBACK.get(self.settings.bar_size, "5 D")
+        sem = asyncio.Semaphore(FETCH_CONCURRENCY)
+
+        async def one(inst: Instrument) -> tuple[Instrument, Quote, list[Bar], datetime] | None:
+            async with sem:
+                try:
+                    quote = await self.broker.quote(inst)
+                    # The time it arrived: a live quote can tick after this cycle's `now`.
+                    arrived = self._now()
+                    self._track_halt(inst.key, quote, arrived)
+                    bars = await self.broker.bars(inst, self.settings.bar_size, lookback)
+                except Exception as exc:
+                    log.warning("market data for %s failed: %s", inst.key, exc)
+                    return None
+                return inst, quote, bars, arrived
+
+        results = await asyncio.gather(*(one(i) for i in universe))
+        return [r for r in results if r is not None]
+
+    def _not_actionable(self, cand: Candidate, quote: Quote | None, now: datetime) -> str | None:
+        """Check the largest feasible scanner proposal before spending on a decision.
+
+        The final send and approval repeat these checks on fresh broker state. This pass
+        is an eligibility filter, never authorization to send an order.
+        """
+        assert self._account is not None
+        key = cand.instrument.key
+        account = self._with_day_trades(self._account, now)
+        day = self._today(now)
+        decision = AIDecision(
+            action=TradeAction.BUY,
+            symbol=cand.instrument.symbol,
+            asset_class=cand.instrument.asset_class,
+            conviction=cand.score,
+            setup=cand.setup,
+            rationale="scanner eligibility check",
+        )
+        entry = (quote.ask or quote.price) if quote is not None else cand.price
+        # Sized at the higher of the ask and the candidate's price, so every cap still holds
+        # at the candidate's price the order is judged at below (the last can be above the
+        # ask after a downtick).
+        entry = max(entry or 0.0, cand.price or 0.0)
+        qty, notes = self.risk.size_entry(
+            decision=decision,
+            entry=entry,
+            stop=cand.suggested_stop,
+            account=account,
+            positions=self._positions,
+            open_orders=self._open_orders,
+            day=day,
+            broker=self.broker,
+            allow_fractional=self.settings.allow_fractional_stocks,
+        )
+        req = OrderRequest(
+            instrument=cand.instrument,
+            side=Side.BUY,
+            qty=max(qty, EPS),
+            # Judged at the candidate's own price: the entry the rules send and a model's
+            # BUY is validated at. At the ask, a last trade on the bid cut reward:risk
+            # below the minimum on low-ATR names.
+            limit_price=cand.price or entry,
+            stop_loss=cand.suggested_stop,
+            take_profit=cand.suggested_target,
+            setup=cand.setup,
+        )
+        verdict = self.risk.check(
+            req,
+            quote=quote,
+            account=account,
+            positions=self._positions,
+            open_orders=self._open_orders,
+            day=day,
+            mode=self.broker.mode,
+            data_delayed=self.broker.data_delayed,
+            broker=self.broker,
+            now=now,
+            settings=self.settings,
+            last_halt_at=self._halt_seen_at(key),
+        )
+        reasons = list(verdict.reasons) if not verdict.approved else []
+        if qty <= 0:
+            reasons.insert(0, notes[-1])
+        if key in self._pending_trades:
+            reasons.append("previous trade still settling")
+        if key in self._awaiting_approval():
+            reasons.append("already waiting for approval")
+        if self._halt_pending is not None:
+            reasons.append(f"halt condition being confirmed: {self._halt_pending}")
+        if self._owner_closed_today(key, now):
+            reasons.append(f"you closed {cand.instrument.symbol} today")
+        if self.db.get_position_meta(key) is not None and not any(
+            p.instrument.key == key and p.qty > 0 for p in self._positions
+        ):
+            reasons.append(f"an entry for {cand.instrument.symbol} is in flight or still held")
+        return "risk: " + "; ".join(reasons) if reasons else None
+
+    def _pick_maker(self, ctx: DecisionContext) -> tuple[DecisionMaker, str | None, bool]:
+        """(maker, why it is not the configured one, whether it may open positions).
+
+        The configured maker, or the rule-based one (with the reason) when the LLM is
+        disabled, over budget, or has nothing worth deciding. In consensus mode the rules
+        never open a position on their own (a BUY needs both models), so when they stand in
+        for consensus they only manage exits."""
+        configured, _ = self._resolve_decider()
+        if configured is self.rules:
+            return self.rules, None, True
+        if not self.settings.llm_enabled:
+            return self.rules, "LLM disabled", True
+        entries = configured.name != "consensus"
+        budget = self.risk.limits.llm_daily_budget_usd
+        if ctx.day.llm_cost >= budget:
+            if self._fallback_logged != ctx.day.day:
+                self._fallback_logged = ctx.day.day
+                log.warning(
+                    "LLM budget reached ($%.2f of $%.2f): rules-only decisions for today",
+                    ctx.day.llm_cost,
+                    budget,
+                )
+            why = f"LLM budget reached (${ctx.day.llm_cost:.2f} of ${budget:.2f})"
+            return self.rules, why, entries
+        threshold = self.settings.llm_min_candidate_score
+        managed = self.db.all_position_meta()  # positions the owner holds are not managed
+        # A stock held while its market is closed is not worth a call: nothing can be done
+        # for it until the open (its CLOSE is deferred), and overnight calls on crypto hours
+        # would spend the next session's budget.
+        worth = any(c.score >= threshold for c in ctx.candidates) or any(
+            p.qty > 0
+            and p.instrument.key in managed
+            and (p.instrument.asset_class != AssetClass.STOCK or ctx.stock_market_open)
+            for p in ctx.positions
+        )
+        if not worth:
+            return self.rules, "no candidate worth an LLM call", entries
+        return configured, None, True
+
+    async def _cycle(
+        self, now: datetime, day: DayStats, universe: list[Instrument], manual: bool
+    ) -> DecisionBatch:
+        assert self._account is not None
+        data = await self._fetch(universe, now)
+        self._note_data_warning()
+        quotes = {inst.key: quote for inst, quote, _, _ in data}
+        quoted_at = {inst.key: arrived for inst, _, _, arrived in data}
+        market: dict[str, dict[str, float]] = {}
+        candidates: list[Candidate] = []
+        for inst, quote, bars, _ in data:
+            try:
+                market[inst.key] = self.scanner.snapshot(inst, bars, quote)
+                candidates.extend(self.scanner.scan(inst, bars, quote, now))
+            except Exception:
+                log.exception("scanner failed for %s", inst.key)
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        for pos in self._positions:  # the trail's distance survives restarts and halts
+            atr = market.get(pos.instrument.key, {}).get("atr14")
+            if pos.qty > 0 and atr and atr > 0 and self.db.get_position_meta(pos.instrument.key):
+                self._set_extra(pos.instrument.key, atr=atr)
+        self._market = market
+
+        # Signal ledger: one row per instrument+setup per SIGNAL_DEDUPE window.
+        recent = {
+            (s.instrument.key, s.setup): s
+            for s in reversed(self.db.list_signals(limit=500, since=now - SIGNAL_DEDUPE))
+        }
+        logged: list[_Logged] = []
+        # Judge each quote as of when it arrived: not before it (a live quote ticks after the
+        # round's `now`, which is not "the future"), and not after the whole round either (a
+        # slow fetch of another symbol does not make it stale).
+        checked_at = self._now()
+        for cand in candidates:
+            key = cand.instrument.key
+            blocked = self._not_actionable(cand, quotes.get(key), quoted_at.get(key, checked_at))
+            existing = recent.get((cand.instrument.key, cand.setup))
+            if existing is not None and existing.id is not None:
+                logged.append(_Logged(cand, existing.id, False, blocked))
+                continue
+            sig = SignalRecord(
+                ts=now,
+                instrument=cand.instrument,
+                setup=cand.setup,
+                score=cand.score,
+                price=cand.price,
+                stop=cand.suggested_stop,
+                target=cand.suggested_target,
+            )
+            logged.append(_Logged(cand, self.db.insert_signal(sig), True, blocked))
+        actionable = [item.cand for item in logged if item.blocked is None]
+        positions = [p for p in self._positions if p.qty > 0]
+        ctx = DecisionContext(
+            now=now,
+            mode=self.broker.mode,
+            account=self._with_day_trades(self._account, now),
+            positions=positions,
+            candidates=actionable,
+            day=day.model_copy(),
+            loss_baseline=self._halt_eval_day(day).start_equity,
+            commission_plan=self.config.commission_plan,
+            limits=self.risk.effective_limits(),
+            recent_trades=self.db.list_trades(limit=10),
+            market=market,
+            stock_market_open=stock_market_open(now),
+            data_delayed=self.broker.data_delayed,
+        )
+        cycle_settings = self.settings.model_copy(deep=True)
+        maker, why, entries_ok = self._pick_maker(ctx)
+        try:
+            batch = await maker.decide(ctx)
+        except asyncio.CancelledError:
+            self._charge_abandoned_calls(day, maker.name)
+            raise
+        except Exception as exc:
+            log.exception("decision maker %s failed", maker.name)
+            batch = DecisionBatch(maker=maker.name, error=f"{type(exc).__name__}: {exc}")
+        batch.ts = now
+        batch.candidates = actionable
+        if not entries_ok:
+            batch.decisions = [d for d in batch.decisions if d.action != TradeAction.BUY]
+            why = f"{why}; consensus mode: rules manage exits only"
+        if why:
+            batch.market_view = f"[{why}] {batch.market_view}".strip()
+        if manual:
+            batch.market_view = f"[manual] {batch.market_view}".strip()
+        blocked_notes = [
+            f"{item.cand.instrument.symbol}/{item.cand.setup}: {item.blocked}"
+            for item in logged
+            if item.blocked is not None
+        ]
+        if blocked_notes:
+            batch.market_view += " [Entry eligibility: " + " | ".join(blocked_notes) + "]"
+        batch.id = self.db.insert_decision(batch)
+        from trader.capture import capture_cycle
+
+        if self.broker.name != "offline_research":
+            capture_cycle(
+                self.db,
+                ctx.model_copy(update={"candidates": candidates}),
+                quotes,
+                {inst.key: bars for inst, _, bars, _ in data},
+                batch,
+                cycle_settings,
+                quoted_at,
+            )
+        self._add_llm_cost(day.day, batch.cost_usd)
+        self._save_day()
+        # Orders must not be interrupted halfway (e.g. by stop()): shield the execution.
+        outcomes, holds = await asyncio.shield(self._execute(batch, ctx, now))
+
+        consensus = batch.maker == "consensus"
+        label = "rules" if maker is self.rules else "consensus" if consensus else "AI"
+        prefix = "LLM budget; " if why and why.startswith("LLM budget") else ""
+        threshold = self.settings.llm_min_candidate_score
+        bought = any(o.taken for o in outcomes.values())
+        # A batch that only dropped some invalid decisions did not fail: its other
+        # decisions were acted on.
+        failed = (batch.refused or bool(batch.vote_failures)) if batch.votes else is_failure(batch)
+        for item in logged:
+            cand = item.cand
+            key = cand.instrument.key
+            outcome = outcomes.get(key)
+            if item.blocked is not None:
+                skip: str | None = item.blocked
+            elif outcome is not None and outcome.setup in (cand.setup, None):
+                if outcome.taken:
+                    self._update_signal(
+                        item.signal_id,
+                        taken=True,
+                        order_id=outcome.order_id,
+                        decision_id=batch.id,
+                        skip_reason=None,
+                    )
+                    continue
+                skip = outcome.skip_reason
+            elif outcome is not None and outcome.taken:
+                skip = f"same symbol traded via {outcome.setup}"
+            elif key in holds:
+                note = holds[key]
+                # Consensus HOLDs say who stood in the way ("consensus: Grok said HOLD").
+                skip = note if consensus and note.startswith(CONSENSUS_PREFIX) else f"{label}: HOLD"
+            elif outcome is not None:
+                skip = f"same symbol: {outcome.setup} entry not sent ({outcome.skip_reason})"
+            elif cand.score < threshold:
+                skip = f"score {cand.score:.2f} < {threshold:.2f}"
+            elif failed:
+                skip = f"{label}: {'refused' if batch.refused else 'error'}"
+            elif not entries_ok:
+                skip = "consensus mode: no entries without both models"
+            elif bought:
+                skip = "not top candidate"
+            else:
+                skip = f"{label}: no entry"
+            if item.new:
+                self._update_signal(
+                    item.signal_id,
+                    decision_id=batch.id,
+                    skip_reason=prefix + (skip or ""),
+                )
+        return batch
+
+    async def _execute(
+        self, batch: DecisionBatch, ctx: DecisionContext, now: datetime
+    ) -> tuple[dict[str, _BuyOutcome], dict[str, str]]:
+        outcomes: dict[str, _BuyOutcome] = {}
+        holds: dict[str, str] = {}  # instrument -> the HOLD's rationale
+        seen: set[str] = set()
+        placed: list[OrderRecord] = []  # entries sent earlier in this batch
+        for decision in batch.decisions:
+            symbol = decision.symbol.strip().upper()
+            inst = Instrument(symbol=symbol, asset_class=decision.asset_class)
+            if decision.action == TradeAction.HOLD:
+                # Does nothing, so it never claims the instrument: a model may HOLD one
+                # setup of a symbol and BUY another.
+                holds.setdefault(inst.key, decision.rationale)
+                continue
+            if inst.key in seen:
+                log.info("ignoring a second decision for %s in one batch", inst.key)
+                continue
+            seen.add(inst.key)
+            try:
+                if decision.action == TradeAction.BUY:
+                    outcomes[inst.key] = await self._handle_buy(
+                        decision, inst, batch, ctx, placed, now
+                    )
+                else:
+                    await self._handle_close(decision, inst, batch, ctx, now)
+            except BrokerError as exc:
+                log.warning("decision for %s failed: %s", inst.key, exc)
+                self._set_error("decision", f"{inst.symbol}: {exc}")
+                if decision.action == TradeAction.BUY:
+                    outcomes[inst.key] = _BuyOutcome(None, False, skip_reason=f"error: {exc}")
+        return outcomes, holds
+
+    async def _handle_buy(
+        self,
+        decision: AIDecision,
+        inst: Instrument,
+        batch: DecisionBatch,
+        ctx: DecisionContext,
+        placed: list[OrderRecord],
+        now: datetime,
+    ) -> _BuyOutcome:
+        """Size, risk-check and send (or queue for approval) one BUY.
+
+        The decision maker may have thought for minutes, and meanwhile the monitor loop kept
+        running: an earlier entry may have filled, the owner may have approved an order, the
+        symbol may have halted or the entry window may have closed. So under the entry lock
+        the clock, the quote, the account, positions and working orders are read again and
+        the BUY is sized and checked on that fresh state, never on the context the models
+        saw (`now` is when that context was built)."""
+        key = inst.key
+        mine = [c for c in ctx.candidates if c.instrument.key == key]
+        cand = (
+            next((c for c in mine if c.setup == decision.setup), None)
+            if decision.setup is not None
+            else next(iter(sorted(mine, key=lambda c: c.score, reverse=True)), None)
+        )
+        if cand is None:
+            log.warning("BUY %s ignored: not a scanner candidate this cycle", key)
+            return _BuyOutcome(decision.setup, False, skip_reason="not a scanner candidate")
+        if key in self._pending_trades:
+            return _BuyOutcome(cand.setup, False, skip_reason="previous trade still settling")
+        if key in self._awaiting_approval():
+            return _BuyOutcome(cand.setup, False, skip_reason="already waiting for approval")
+        stop = decision.stop_loss or cand.suggested_stop
+        target = decision.take_profit or cand.suggested_target
+        async with self._entry_lock:
+            send_now = self._now()
+            if self._owner_closed_today(key, send_now):  # closed by hand while deciding
+                return _BuyOutcome(cand.setup, False, skip_reason="you closed it today")
+            age = send_now - now
+            if age > DECISION_MAX_AGE:
+                log.warning("BUY %s dropped: decided on data %.0fs old", key, age.total_seconds())
+                return _BuyOutcome(
+                    cand.setup,
+                    False,
+                    skip_reason=f"decision too old ({age.total_seconds():.0f}s after its data)",
+                )
+            quote = await self.broker.quote(inst)
+            send_now = self._now()  # the risk check must not see the quote as from the future
+            self._track_halt(key, quote, send_now)
+            account = self._with_day_trades(await self.broker.account(), send_now)
+            positions = await self.broker.positions()
+            open_orders = self._merge_orders(await self.broker.open_orders(), placed, positions)
+            day = self._today(send_now)
+            entry = decision.limit_price or quote.ask or quote.last
+            if not entry or not math.isfinite(entry) or entry <= 0:
+                return _BuyOutcome(cand.setup, False, skip_reason="no entry price")
+            qty, notes = self.risk.size_entry(
+                decision=decision,
+                entry=entry,
+                stop=stop,
+                account=account,
+                positions=positions,
+                open_orders=open_orders,
+                day=day,
+                broker=self.broker,
+                allow_fractional=self.settings.allow_fractional_stocks,
+            )
+            if qty <= 0:
+                log.info("BUY %s skipped: %s", key, notes[-1])
+                return _BuyOutcome(cand.setup, False, skip_reason=f"risk: {notes[-1]}")
+            req = OrderRequest(
+                instrument=inst,
+                side=Side.BUY,
+                qty=qty,
+                order_type=OrderType.LIMIT,
+                limit_price=entry,
+                stop_loss=stop,
+                take_profit=target,
+                reason=_short(decision.rationale),
+                decision_id=batch.id,
+                setup=cand.setup,
+            )
+            verdict = self.risk.check(
+                req,
+                quote=quote,
+                account=account,
+                positions=positions,
+                open_orders=open_orders,
+                day=day,
+                mode=self.broker.mode,
+                data_delayed=self.broker.data_delayed,
+                broker=self.broker,
+                now=send_now,
+                settings=self.settings,
+                last_halt_at=self._halt_seen_at(key),
+            )
+            reasons = list(verdict.reasons) if not verdict.approved else []
+            if self._halt_pending is not None:
+                reasons.append(f"halt condition being confirmed: {self._halt_pending}")
+            if not self._in_universe(inst):  # the owner removed it while the models thought
+                reasons.append(f"{inst.symbol} was removed from the universe")
+            if not reasons and self.db.get_position_meta(key) is not None:
+                # Metadata is written before every entry is sent and removed only once the
+                # position is flat: an entry is in flight or the position is still held.
+                reasons.append(f"an entry for {inst.symbol} is in flight or still held")
+            if reasons:
+                message = "; ".join(reasons)
+                order_id = self._journal_order(
+                    OrderRecord(request=req, status=OrderStatus.BLOCKED, message=message), send_now
+                )
+                log.info("BUY %s blocked: %s", key, message)
+                return _BuyOutcome(cand.setup, False, order_id, skip_reason=f"risk: {message}")
+            order = verdict.order or req
+            sizing = "; ".join([*notes, *verdict.reasons])
+            if self.shadow:
+                order_id = self._journal_order(
+                    OrderRecord(
+                        request=order,
+                        status=OrderStatus.BLOCKED,
+                        message=f"shadow mode: live trading is not armed ({sizing})",
+                    ),
+                    send_now,
+                )
+                return _BuyOutcome(cand.setup, False, order_id, skip_reason="shadow mode")
+            if not self.settings.autopilot:
+                order_id = self._journal_order(
+                    OrderRecord(
+                        request=order,
+                        status=OrderStatus.PENDING_APPROVAL,
+                        message=f"waiting for approval, expires in 10 min ({sizing})",
+                    ),
+                    send_now,
+                )
+                await self._notify(
+                    f"Approve BUY {inst.symbol}?",
+                    f"{order.qty:g} @ {entry:g}, stop {stop:g}, target {target:g}. "
+                    "Expires in 10 minutes.",
+                    tags=["question"],
+                )
+                return _BuyOutcome(cand.setup, True, order_id)
+            sent = await self._send_entry(order, send_now)
+            order_id = self._journal_order(
+                sent.model_copy(update={"message": _short(f"{sizing}; {sent.message}")}), send_now
+            )
+            if sent.status not in _ACCEPTED:
+                return _BuyOutcome(
+                    cand.setup, False, order_id, skip_reason=f"broker rejected: {sent.message}"
+                )
+            placed.append(
+                sent.model_copy(update={"status": OrderStatus.SUBMITTED, "filled_qty": 0.0})
+            )
+            return _BuyOutcome(cand.setup, True, order_id)
+
+    @staticmethod
+    def _merge_orders(
+        fresh: list[OrderRecord], placed: list[OrderRecord], positions: list[Position]
+    ) -> list[OrderRecord]:
+        """The broker's working orders plus entries sent earlier in this batch that it does
+        not list (yet), without counting one order twice: one whose instrument is held has
+        filled (a BUY never adds to a position), and the position already counts it."""
+        known = {o.broker_order_id for o in fresh if o.broker_order_id}
+        held = {p.instrument.key for p in positions if p.qty > 0}
+        extra = [
+            o
+            for o in placed
+            if (not o.broker_order_id or o.broker_order_id not in known)
+            and o.request.instrument.key not in held
+        ]
+        return fresh + extra
+
+    async def _send_entry(self, order: OrderRequest, now: datetime) -> OrderRecord:
+        """Place an entry. Position metadata is written first, so a position that appears
+        is always managed even if the call fails halfway (stale metadata is cleaned up)."""
+        order = self._traced(order, None)
+        assert order.limit_price is not None and order.stop_loss is not None
+        if self.settings.exits.no_target:  # let winners run: the trailing stop sells
+            order = order.model_copy(update={"take_profit": None})
+        key = order.instrument.key
+        entry, stop = order.limit_price, order.stop_loss
+        self.db.set_position_meta(
+            key,
+            stop_loss=stop,
+            take_profit=order.take_profit,
+            entry_price=entry,
+            initial_risk=(entry - stop) * order.qty,
+            opened_at=now,
+            decision_id=order.decision_id,
+            setup=order.setup,
+        )
+        extra = {
+            "initial_stop": stop,
+            "unit_risk": entry - stop,
+            "best_price": entry,
+            "qty": order.qty,  # the most the bot holds of it (see _bot_cap)
+        }
+        atr = self._market.get(key, {}).get("atr14")
+        if atr and atr > 0:
+            extra["atr"] = atr  # the trailing stop's distance, if no cycle runs later
+        if self._is_delayed_paper_entry(order):
+            extra["delayed_data"] = 1.0  # not evidence of an edge (performance report)
+        self.db.set_kv(EXTRA_PREFIX + key, json.dumps(extra))
+        # Activity: an entry that fills and is stopped out before the next monitor tick
+        # must not read as a cash flow on a quiet account.
+        self._busy_at = now
+        try:
+            placed = await self.broker.place_order(order)
+        except Exception as exc:
+            # Outcome unknown: keep the metadata so a position that did open is managed.
+            log.exception("placing the entry for %s failed", key)
+            return OrderRecord(
+                request=order,
+                status=OrderStatus.REJECTED,
+                message=_short(f"error (outcome unknown, check the broker): {exc}"),
+            )
+        if placed.status not in _ACCEPTED:
+            log.warning("entry for %s not accepted: %s", key, placed.message)
+            self.db.delete_position_meta(key)
+            self.db.set_kv(EXTRA_PREFIX + key, "{}")
+            return placed
+        day = self._today(now)
+        day.trades += 1
+        self._save_day()
+        target_text = _target_text(order.take_profit)
+        log.info(
+            "BUY %s %g @ %g (stop %g, target %s) -> %s",
+            key,
+            order.qty,
+            entry,
+            stop,
+            target_text,
+            placed.status.value,
+        )
+        if PROTECTIVE_REJECTED in (placed.message or ""):
+            # The entry filled but the broker refused its stop: the next monitor pass
+            # re-places it (or alerts that it cannot); the backup stop watches meanwhile.
+            self._arm_reprotect()
+            bought = (
+                f"{placed.filled_qty:g} of {order.qty:g}"
+                if placed.filled_qty < order.qty
+                else f"{order.qty:g}"
+            )
+            await self._notify(
+                f"Unprotected {order.instrument.symbol}",
+                f"Bought {bought} @ {entry:g}, but the broker refused its stop at "
+                f"{stop:g} ({_short(placed.message or '')}). Re-placing it; the engine's "
+                "backup stop watches it meanwhile.",
+                priority="high",
+                tags=["warning"],
+            )
+            return placed
+        if TARGET_REJECTED in (placed.message or ""):
+            target_text += " (refused by the broker: the bot sells there itself)"
+        await self._notify(
+            f"BUY {order.instrument.symbol}",
+            f"{order.qty:g} @ {entry:g}, stop {stop:g}, target {target_text}",
+        )
+        return placed
+
+    async def _handle_close(
+        self,
+        decision: AIDecision,
+        inst: Instrument,
+        batch: DecisionBatch,
+        ctx: DecisionContext,
+        now: datetime,
+    ) -> None:
+        pos = next((p for p in ctx.positions if p.instrument.key == inst.key and p.qty > 0), None)
+        if pos is None:
+            log.info("CLOSE %s ignored: no position", inst.key)
+            return
+        if inst.asset_class == AssetClass.STOCK and not stock_market_open(now):
+            log.info("CLOSE %s deferred: the stock market is closed", inst.key)
+            return
+        meta = self.db.get_position_meta(inst.key)
+        if (
+            meta is None
+            or sold_by_watchdog(self.db, inst.key, meta)
+            or self._meta_used(inst.key, meta)
+        ):
+            # The engine never manages positions it did not open on this account (the
+            # owner's own holdings, a bot position that already closed, or positions
+            # forgotten after an account change). The owner can still close them at the
+            # broker.
+            log.warning("CLOSE %s refused: the bot did not open this position", inst.key)
+            self._journal_order(
+                OrderRecord(
+                    request=OrderRequest(
+                        instrument=inst,
+                        side=Side.SELL,
+                        qty=pos.qty,
+                        order_type=OrderType.MARKET,
+                        is_exit=True,
+                        reason=_short(f"AI close: {decision.rationale}"),
+                        decision_id=batch.id,
+                    ),
+                    status=OrderStatus.BLOCKED,
+                    message="not opened by the bot: the engine never closes it",
+                ),
+                now,
+            )
+            return
+        req = OrderRequest(
+            instrument=inst,
+            side=Side.SELL,
+            qty=pos.qty,
+            order_type=OrderType.MARKET,
+            is_exit=True,
+            reason=_short(f"AI close: {decision.rationale}"),
+            decision_id=batch.id,
+            setup=pos.setup,
+        )
+        # Shadow mode still closes positions the bot opened: exits only reduce risk.
+        if not self.settings.autopilot:
+            if inst.key in self._awaiting_approval():
+                return
+            try:
+                cap = await self._bot_cap(inst)
+            except BrokerError as exc:
+                log.warning("CLOSE %s: the bot's part not read (%s)", inst.key, exc)
+                cap = None
+            if cap is not None and cap.unread:
+                log.warning("CLOSE %s: the broker's executions not read", inst.key)
+                cap = None  # sized when approved (approve_order reads the bot's part again)
+            if cap is not None:
+                if cap.qty <= EPS:
+                    log.info("CLOSE %s: none of it is the bot's", inst.key)
+                    return
+                # The owner is asked to approve selling the bot's part, never his own.
+                req = req.model_copy(update={"qty": min(pos.qty, cap.qty)})
+            self._journal_order(
+                OrderRecord(
+                    request=req,
+                    status=OrderStatus.PENDING_APPROVAL,
+                    message="waiting for approval, expires in 10 min",
+                ),
+                now,
+            )
+            await self._notify(f"Approve CLOSE {inst.symbol}?", req.reason, tags=["question"])
+            return
+        # Under the entry lock and on the send-time clock (the models may have thought for
+        # minutes): a Close pressed meanwhile is seen here, and this one is seen there.
+        async with self._entry_lock:
+            if self._closing_now(inst.key, self._now()):
+                return
+            seq = self._mark_closing(inst.key, req.reason, self._now())
+            cap = await self._bot_cap(inst)
+            if cap is not None and cap.unread:
+                # Undecided, not "none of it is the bot's": nothing is sold, and the monitor
+                # keeps checking the stop (its undecided exit alerts; crypto goes to the
+                # watchdog). The next cycle may ask again.
+                self._unmark_closing(inst.key, seq)
+                log.warning("CLOSE %s: the broker's executions not read; nothing sold", inst.key)
+                return
+            if cap is not None and cap.qty <= EPS:
+                self._note_close(inst.key, None, seq)  # only the owner's shares are held
+                log.info("CLOSE %s: none of it is the bot's", inst.key)
+                return
+            rec = await self._broker_close(
+                inst,
+                reason=req.reason,
+                max_qty=cap.qty if cap else None,
+                keep=cap.keep if cap else 0.0,
+            )
+            self._note_capped_close(inst.key, cap, rec, seq)
+        if rec is not None:
+            req = req.model_copy(update={"qty": rec.request.qty})
+            if rec.request.trace_id:
+                req = req.model_copy(update={"trace_id": rec.request.trace_id})
+            self._journal_order(rec.model_copy(update={"request": req}), now)
+
+
+class _ExitUndecided(BrokerError):
+    """An engine exit not sent: the broker's executions could not be read to size it."""
+
+
+_ACCEPTED = frozenset({OrderStatus.SUBMITTED, OrderStatus.PARTIALLY_FILLED, OrderStatus.FILLED})
+
+
+def build_engine(config: AppConfig, db: Database) -> Engine:
+    """Engine wired from config: SimBroker or IBKRBroker, plus every decision maker the
+    configured API keys allow: Claude (Anthropic key), Grok (xAI key), consensus (both),
+    each with the rule-based maker as its outage fallback, and the rule-based maker itself.
+    settings.decision_mode and settings.llm_enabled are read every cycle, so the owner can
+    switch modes without a restart; a mode whose key is missing falls back with a warning
+    in the status (see Engine._resolve_decider)."""
+    settings = db.get_settings()
+    broker: Broker
+    if config.broker == "sim":
+        from trader.broker.sim import SimBroker
+
+        broker = SimBroker(
+            seed=config.sim_seed,
+            starting_cash=config.sim_starting_cash,
+            commission_plan=config.commission_plan,
+        )
+    else:
+        from trader.broker.ibkr import IBKRBroker
+
+        broker = IBKRBroker(config)
+    rules = RuleBasedDecisionMaker(settings)
+    makers: dict[str, DecisionMaker] = {"rules": rules}
+    anthropic_key = config.anthropic_api_key.get_secret_value() if config.anthropic_api_key else ""
+    if anthropic_key.strip():
+        from trader.strategy.claude import ClaudeDecisionMaker
+
+        makers["claude"] = ClaudeDecisionMaker(
+            api_key=anthropic_key,
+            model=settings.llm_model,
+            effort=settings.llm_effort,
+            fallback=rules,
+        )
+    xai_key = config.xai_api_key.get_secret_value() if config.xai_api_key else ""
+    if xai_key.strip():
+        from trader.strategy.grok import GrokDecisionMaker, GrokPrice
+
+        makers["grok"] = GrokDecisionMaker(
+            api_key=xai_key,
+            model=config.xai_model,
+            fallback=rules,
+            base_url=config.xai_base_url,
+            price=GrokPrice(
+                input=config.xai_price_input,
+                cached_input=config.xai_price_cached_input,
+                output=config.xai_price_output,
+            ),
+        )
+    if "claude" in makers and "grok" in makers:
+        from trader.strategy.consensus import ConsensusDecisionMaker
+
+        makers["consensus"] = ConsensusDecisionMaker(makers["claude"], makers["grok"])
+    engine = Engine(config, db, broker, rules, notifier=Notifier(config, db), makers=makers)
+    _, warning = engine._resolve_decider()
+    if warning:
+        log.warning("decision mode: %s", warning)
+    return engine

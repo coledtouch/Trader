@@ -1,0 +1,7 @@
+# Allow-list: the image only needs the dependency list and the application package.
+# Everything else (.env, data/, .git, tests, the virtualenv) stays out of the build context.
+*
+!requirements.txt
+!trader/
+**/__pycache__
+**/*.py[cod]

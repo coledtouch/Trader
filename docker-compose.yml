@@ -1,0 +1,147 @@
+# AI Trader on one server: trader (web app + engine), ib-gateway (Interactive Brokers) and
+# cloudflared (Cloudflare Tunnel to https://desk.kaxo.dev). See docs/DEPLOY.md.
+#
+# Settings and secrets come from ./.env (copy .env.example). After editing .env, run
+# `docker compose up -d` again: Compose recreates every service whose settings changed.
+#
+# Network exposure: the only published port is 127.0.0.1:8000 (reachable from the server
+# itself, for SSH tunnels and health checks). Docker-published ports bypass ufw, so never
+# publish anything else. IB Gateway's API has no authentication, so it lives on its own
+# private network ("broker") that only the trader and the crypto watchdog join. cloudflared
+# is on "edge" with the trader only: whatever ingress rules the Cloudflare dashboard holds,
+# the tunnel cannot resolve or reach ib-gateway (API ports 4003/4004, VNC 5900) or the
+# watchdog.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  trader:
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    image: ai-trader:local
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    # These describe the container layout and win over the same names in .env.
+    environment:
+      TRADER_HOST: 0.0.0.0
+      TRADER_PORT: "8000"
+      TRADER_DATA_DIR: /data
+      TRADER_IB_HOST: ib-gateway
+    ports:
+      - "127.0.0.1:8000:8000"
+    networks: [edge, broker]
+    volumes:
+      - ./data:/data
+      # Read-write so `docker compose run --rm trader python -m trader setup` can save
+      # TRADER_SECRET_KEY into the host's .env.
+      - ./.env:/app/.env
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    logging: *logging
+
+  crypto-watchdog:
+    # Started with the gateway (COMPOSE_PROFILES=ibkr). Same image and user as trader,
+    # own process so an app crash does not take the crypto stops with it. No published
+    # ports and no edge network: nothing routes to it through the tunnel.
+    profiles: ["ibkr"]
+    build:
+      context: .
+      args:
+        APP_UID: ${APP_UID:-1000}
+        APP_GID: ${APP_GID:-1000}
+    image: ai-trader:local
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      TRADER_DATA_DIR: /data
+      TRADER_IB_HOST: ib-gateway
+    command: ["python", "-m", "trader", "watchdog"]
+    # The image's health check probes the web app on :8000, which this process does not
+    # run, so it would always report "unhealthy". There is no other health signal: off.
+    healthcheck:
+      disable: true
+    # Start order only. The watchdog keeps running if the app container is down, and it
+    # retries the gateway on its own if this dependency is already up.
+    depends_on:
+      ib-gateway:
+        condition: service_started
+    networks: [broker]
+    volumes:
+      - ./data:/data
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 20s
+    logging: *logging
+
+  ib-gateway:
+    # Started only when COMPOSE_PROFILES in .env contains "ibkr" (not needed in sim mode).
+    profiles: ["ibkr"]
+    # Stable channel of https://github.com/gnzsnz/ib-gateway-docker (IB Gateway 10.50.1f,
+    # IBC 3.24.2, released 2026-10-06). Pinned: upgrade deliberately, then test on paper.
+    image: ghcr.io/gnzsnz/ib-gateway:10.50.1f
+    restart: unless-stopped
+    # Only the gateway's own variables are passed in (not the whole .env).
+    environment:
+      TWS_USERID: ${TWS_USERID:-}
+      TWS_PASSWORD: ${TWS_PASSWORD:-}
+      TRADING_MODE: ${TRADING_MODE:-paper}
+      READ_ONLY_API: ${READ_ONLY_API:-no}
+      TWOFA_TIMEOUT_ACTION: ${TWOFA_TIMEOUT_ACTION:-restart}
+      RELOGIN_AFTER_TWOFA_TIMEOUT: ${RELOGIN_AFTER_TWOFA_TIMEOUT:-yes}
+      TWOFA_DEVICE: ${TWOFA_DEVICE:-}
+      AUTO_RESTART_TIME: ${AUTO_RESTART_TIME:-11:45 PM}
+      TWS_COLD_RESTART: ${TWS_COLD_RESTART:-}
+      EXISTING_SESSION_DETECTED_ACTION: ${EXISTING_SESSION_DETECTED_ACTION:-primary}
+      TIME_ZONE: ${TIME_ZONE:-America/New_York}
+      TZ: ${TIME_ZONE:-America/New_York}
+      VNC_SERVER_PASSWORD: ${VNC_SERVER_PASSWORD:-}
+    # API ports inside the broker network: 4004 = paper, 4003 = live (socat relays). No
+    # ports are published. To look at the gateway screen once, see "See the gateway screen
+    # (VNC)" in docs/DEPLOY.md (a temporary docker-compose.override.yml plus an SSH tunnel).
+    networks: [broker]
+    logging: *logging
+
+  cloudflared:
+    # Pinned release (2026-10-05). --no-autoupdate: updates come from changing this tag.
+    image: cloudflare/cloudflared:2026.10.0
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
+    networks: [edge]  # never "broker": the tunnel must not reach the gateway
+    depends_on:
+      trader:
+        condition: service_healthy
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging: *logging
+
+networks:
+  # cloudflared <-> trader (the tunnel's only destination is http://trader:8000)
+  edge: {}
+  # trader and crypto-watchdog <-> ib-gateway. Not `internal: true`: the gateway must
+  # reach IBKR's servers. The watchdog is not on edge, so the tunnel cannot reach it.
+  broker: {}
