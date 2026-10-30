@@ -60,6 +60,15 @@ EPS = 1e-9
 OWNER_HIDDEN = "owner_hidden"
 # Position extra: the unseen rest of the bot's entry is settled (not held, none can come).
 REST_SETTLED = "rest_settled"
+# Position extra: {broker order id: qty} what a working sell of the app's (a bracket child has
+# no order row) was seen to have filled beyond the journal's fills of it, right after the
+# journal caught up with today's executions: sold on a day IBKR no longer reports, which no
+# read shows once the order is done.
+APP_SOLD_UNREPORTED = "app_sold_unreported"
+# Position extra: {broker order id: qty} what each sell of the app's had filled when a close
+# of the app's cancelled it, before or during its cancels (a bracket child has no order row,
+# and a crash before the next journal leaves its fill on a day IBKR no longer reports).
+APP_SELLS_SEEN = "app_sells_seen"
 
 
 @dataclass(frozen=True)
@@ -72,6 +81,8 @@ class Split:
     hidden: float = 0.0  # the owner's units no fill shows (`split_fills(hidden=)`) still held
     bot_fills: list[Fill] = field(default_factory=list)  # the bot's part of each fill
     flat_at: datetime | None = None  # last fill after which neither side held anything
+    entry_seen: float = 0.0  # the bot's buys of its entry that a fill shows
+    unseen_other: float = 0.0  # of the unseen part, what another client's sells took
 
 
 @dataclass(frozen=True)
@@ -109,6 +120,9 @@ def split_fills(
     entry: float | None = None,
     entry_sent: datetime | None = None,
     hidden: Iterable[tuple[datetime, float]] = (),
+    unreported: tuple[datetime, float] | None = None,
+    unseen_cap: float | None = None,
+    reserve: bool = False,
 ) -> Split:
     """Who holds what of one instrument after `fills` (the window from the bot's entry, less
     FILL_TIME_SKEW), in time order. The bot's buys are this app's own executions (the bot
@@ -131,8 +145,19 @@ def split_fills(
 
     `hidden`: units of the owner's that no fill shows (he bought them where IBKR no longer
     reports), each seen held at a time (`OWNER_HIDDEN`): another client's sells after it
-    come out of them after his seen units, before the bot's."""
-    bot = owner = owner_bought = bot_bought = 0.0
+    come out of them after his seen units, before the bot's.
+
+    `unreported`: (when, qty) of sales of the bot's that no fill shows (the crypto watchdog's
+    done sales on a day IBKR no longer reports, before the app journals them at an
+    estimate): at that time they come out of the bot's units, then the unseen part of its
+    entry, so another client's sell after them never takes what they sold. They make no
+    fill of the bot's.
+
+    `unseen_cap`: the most of the entry that may really have filled beyond these fills (an
+    entry the app saw done holds no more than it saw fill). `reserve`: the bot's own sells
+    still to come sell units it holds until then (it never adds to a position), so another
+    client's sell before them never takes those."""
+    bot = owner = owner_bought = bot_bought = unseen_other = 0.0
     pools = sorted([_aware(at), max(0.0, qty)] for at, qty in hidden)
     ordered = sorted(fills, key=lambda f: (_aware(f.ts), f.exec_id))
     sent_at = _aware(entry_sent) if entry_sent is not None else None
@@ -153,13 +178,34 @@ def split_fills(
                 prior, reset = bought, i
     seen = sum(f.qty for f in ordered if f.side == Side.BUY and not is_other_client(f)) - prior
     unseen = max(0.0, entry - seen) if entry is not None else 0.0
+    if unseen_cap is not None:
+        unseen = min(unseen, max(0.0, unseen_cap))
+    # What the bot's own fills from each one on need of the units it holds just before it.
+    need = [0.0] * (len(ordered) + 1)
+    if reserve:
+        for j in range(len(ordered) - 1, reset, -1):
+            g = ordered[j]
+            d = 0.0 if g.qty <= EPS or is_other_client(g) else g.qty
+            need[j] = max(0.0, (d if g.side == Side.SELL else -d) + need[j + 1])
     out: list[Fill] = []
     flat_at: datetime | None = None
     start = _aware(bot_first_from) if bot_first_from is not None else None
     until = _aware(bot_first_until) if bot_first_until is not None else None
     budget = None if bot_first_qty is None else max(0.0, bot_first_qty) + _tol(bot_first_qty)
     trip = 0.0  # the bot's buys since its previous trip
-    for i, f in enumerate(ordered):
+    pending = None if unreported is None else (_aware(unreported[0]), max(0.0, unreported[1]))
+    for i, f in enumerate([*ordered, None]):
+        if pending is not None and (f is None or _aware(f.ts) > pending[0]):
+            at, q = pending
+            pending = None
+            a = min(q, bot)
+            bot -= a
+            u = min(q - a, unseen)
+            unseen -= u
+            if start is not None and budget is not None and at >= start:
+                budget -= min(q, budget)  # part of what the watchdog sold, as its estimate
+        if f is None:
+            break
         q = f.qty
         if q <= EPS:
             continue
@@ -201,10 +247,15 @@ def split_fills(
             ):
                 lead = q if budget is None else min(q, budget)
                 charge = True
-            a = min(lead, bot)
+            # Another client's sell never takes what the bot's own later sells sold.
+            room = max(0.0, bot + unseen - need[i + 1]) if other else bot + unseen
+            a = min(lead, bot, room)
             bot -= a
-            u = min(lead - a, unseen)
+            u = min(lead - a, unseen, room - a)
             unseen -= u
+            room -= a + u
+            if charge:
+                unseen_other += u
             if charge and budget is not None:
                 budget -= a + u  # only what it took of the bot's may have been the watchdog's
             b = min(lead - a - u, owner)
@@ -223,10 +274,11 @@ def split_fills(
                         h = min(rest - o, pool[1])
                         pool[1] -= h
                         o += h
-                a = min(rest - o, bot)
+                a = min(rest - o, bot, room)
                 bot -= a
-                u = min(rest - o - a, unseen)
+                u = min(rest - o - a, unseen, room - a)
                 unseen -= u
+                unseen_other += u
                 # Beyond those, units held from before the window were sold: nobody's here.
                 on_bot += a + u
         if on_bot > EPS:
@@ -248,6 +300,8 @@ def split_fills(
         hidden=sum(pool[1] for pool in pools),
         bot_fills=out,
         flat_at=flat_at,
+        entry_seen=seen,
+        unseen_other=unseen_other,
     )
 
 
@@ -285,6 +339,17 @@ def less_sold(split: Split, sold: float) -> Split:
     from_bot = min(max(0.0, sold), split.bot)
     from_unseen = min(max(0.0, sold) - from_bot, split.unseen)
     return dataclasses.replace(split, bot=split.bot - from_bot, unseen=split.unseen - from_unseen)
+
+
+def less_app_sold(split: Split, sold: float, filled: float) -> tuple[Split, float]:
+    """`split` after the app's own sales no fill in it shows (`sold`:
+    app_sold_beyond_journal): they came out of the bot's units, among them the part of its
+    entry the app saw fill beyond those fills (`filled`: app_entry_unjournaled's sure part),
+    which counts as the bot's first. Returns the split and that part (taken from
+    `Split.unseen`)."""
+    late = min(split.unseen, max(0.0, filled))
+    moved = dataclasses.replace(split, bot=split.bot + late, unseen=split.unseen - late)
+    return less_sold(moved, sold), late
 
 
 def read_extra(db: Database, key: str) -> dict[str, Any]:
@@ -487,17 +552,21 @@ def unreported_sales(
     sold: float, fills: Iterable[Fill], first: datetime, until: datetime | None = None
 ) -> float:
     """The part of the watchdog's sales (`sold`, from `first` on) no fill shows: another
-    client's sells since then are at least that much of it. An earlier day's sale IBKR no
-    longer reports still came out of the bot's units."""
+    client's sells since then (until `until`) are at least that much of it, and so is the
+    app's estimate of them (dated after a trip of the position journaled since, it may be
+    later than `until`). An earlier day's sale IBKR no longer reports still came out of the
+    bot's units."""
     start = _aware(first)
     end = _aware(until) if until is not None else None
     seen = sum(
         f.qty
         for f in fills
         if f.side == Side.SELL
-        and (is_other_client(f) or f.broker_order_id == UNREPORTED_EXIT)
         and _aware(f.ts) >= start
-        and (end is None or _aware(f.ts) <= end)
+        and (
+            f.broker_order_id == UNREPORTED_EXIT
+            or (is_other_client(f) and (end is None or _aware(f.ts) <= end))
+        )
     )
     return max(0.0, sold - seen)
 
@@ -515,18 +584,54 @@ def sent_at(db: Database, rec: OrderRecord) -> datetime:
     return created
 
 
+def order_rows(db: Database, opened: datetime, key: str | None = None) -> list[OrderRecord]:
+    """The app's order rows (of `key`, or of every instrument) that the reads below may need
+    for a bot position opened at `opened`, its entry's included (an approved entry's row is
+    as old as its proposal): one read of the orders table, handed to each of them as
+    `rows=`."""
+    since = _aware(opened) - FILL_TIME_SKEW - APPROVAL_TTL
+    return [
+        rec
+        for rec in db.list_orders_since(since)
+        if key is None or rec.request.instrument.key == key
+    ]
+
+
+def rows_since(
+    db: Database, rows: Iterable[OrderRecord] | None, since: datetime
+) -> list[OrderRecord]:
+    """The app's order rows created at or after `since`: out of `rows` (`order_rows`, read
+    once for several reads), else read from the orders table."""
+    if rows is None:
+        return db.list_orders_since(since)
+    bound = _aware(since)
+    return [rec for rec in rows if _aware(rec.created_at) >= bound]
+
+
 def app_entry_unjournaled(
     db: Database,
     key: str,
     opened: datetime,
     fills: Iterable[Fill],
     working: Iterable[OrderRecord],
+    *,
+    rows: Iterable[OrderRecord] | None = None,
 ) -> tuple[float, float]:
     """What the bot's entry for this position filled beyond the journal's fills of it, as
     (sure, unknown). Sure: what the broker reports filled of an entry still working (by
     its tag), or what the app saw filled of one it saw done. Unknown: the rest of an entry
     the app last saw working that the broker no longer lists (it filled, lapsed or was
     cancelled while the app was down), or that the engine forgot before it was done."""
+    return _entry_unjournaled(key, _app_entries(db, key, opened, rows), fills, working)
+
+
+def _entry_unjournaled(
+    key: str,
+    entries: Iterable[OrderRecord],
+    fills: Iterable[Fill],
+    working: Iterable[OrderRecord],
+) -> tuple[float, float]:
+    """app_entry_unjournaled of the entry's order rows (`_app_entries`)."""
     journaled: dict[str, float] = {}
     for f in fills:
         if f.side == Side.BUY and not is_other_client(f):
@@ -542,20 +647,10 @@ def app_entry_unjournaled(
         ):
             listed[req.trace_id] = listed.get(req.trace_id, 0.0) + order.filled_qty
     sure = unknown = 0.0
-    since = _aware(opened) - FILL_TIME_SKEW
-    # An approved entry's row is as old as its proposal: read back to the oldest that could
-    # still be sent, and keep the rows sent since the position opened.
-    for rec in db.list_orders_since(since - APPROVAL_TTL):
-        req = rec.request
-        if (
-            req.instrument.key != key
-            or req.side != Side.BUY
-            or req.is_exit
-            or not rec.broker_order_id
-            or (req.trace_id or "").startswith(WATCHDOG_TAG_PREFIX)
-            or sent_at(db, rec) < since
-        ):
+    for rec in entries:
+        if not rec.broker_order_id:
             continue
+        req = rec.request
         seen = journaled.get(rec.broker_order_id, 0.0)
         tag = order_trace_id(rec.id, req.trace_id)
         if tag in listed:
@@ -569,7 +664,134 @@ def app_entry_unjournaled(
     return sure, unknown
 
 
-def app_sold_unjournaled(db: Database, key: str, opened: datetime, fills: Iterable[Fill]) -> bool:
+def _app_entries(
+    db: Database, key: str, opened: datetime, rows: Iterable[OrderRecord] | None = None
+) -> list[OrderRecord]:
+    """The app's order rows of the bot's entry for this position (and of its previous trip
+    inside the clock skew), the crypto watchdog's own orders left out."""
+    since = _aware(opened) - FILL_TIME_SKEW
+    # An approved entry's row is as old as its proposal: read back to the oldest that could
+    # still be sent, and keep the rows sent since the position opened.
+    return [
+        rec
+        for rec in rows_since(db, rows, since - APPROVAL_TTL)
+        if rec.request.instrument.key == key
+        and rec.request.side == Side.BUY
+        and not rec.request.is_exit
+        and not (rec.request.trace_id or "").startswith(WATCHDOG_TAG_PREFIX)
+        and sent_at(db, rec) >= since
+    ]
+
+
+def entry_held_unjournaled(
+    db: Database,
+    key: str,
+    opened: datetime,
+    fills: Iterable[Fill],
+    working: Iterable[OrderRecord],
+    *,
+    rows: Iterable[OrderRecord] | None = None,
+) -> float | None:
+    """The most of the bot's entry that may be held beyond the journal's fills of it: what
+    the broker reports filled of it still working, what the app saw filled of it done, and
+    the part whose fill is unknown (`app_entry_unjournaled`). An entry still working that
+    filled nothing, or one the app saw lapse, holds nothing unseen, whatever its quantity.
+    None when the app's order journal cannot say: no row of its entry sent, or one whose
+    send failed with no broker order id (its outcome unknown). Rows never sent (blocked,
+    waiting for approval, an approval cancelled or expired) say nothing either way."""
+    entries = _app_entries(db, key, opened, rows)
+    sent = [rec for rec in entries if rec.broker_order_id or rec.status == OrderStatus.REJECTED]
+    if not sent or any(not rec.broker_order_id for rec in sent):
+        return None
+    sure, unknown = _entry_unjournaled(key, entries, fills, working)
+    return sure + unknown
+
+
+def app_sold_beyond_journal(
+    db: Database,
+    key: str,
+    opened: datetime,
+    fills: Iterable[Fill],
+    working: Iterable[OrderRecord] = (),
+    *,
+    own: Iterable[OrderRecord] = (),
+    rows: Iterable[OrderRecord] | None = None,
+    unreported: Mapping[str, Any] | None = None,
+    seen: Mapping[str, Any] | None = None,
+) -> float:
+    """What the app's own sells for this bot position are known to have filled beyond the
+    fills read of them (`fills`): what the app saw filled of one (its order row), or what
+    the broker reports filled of one still working. The app went down before the journal
+    caught up, or the fill fell on a day IBKR no longer reports: those units of the bot's
+    are sold all the same. `working`: the broker's open orders as another client sees them
+    (the crypto watchdog: the app's orders by their tag); `own`: the app's working orders on
+    its own connection (by their order id: a bracket child has no order row of its own);
+    `unreported`: what the app saw such an order fill beyond the journal while it worked
+    (`APP_SOLD_UNREPORTED`, by order id: kept once the order is done and no read shows it);
+    `seen`: what a close of the app's saw such an order had filled when it cancelled it
+    (`APP_SELLS_SEEN`, by order id, counted like its order row). A sell whose fill is
+    unknown (last seen working, or forgotten) counts only for what was seen filled of it
+    (see app_sold_unjournaled). The crypto watchdog's sells are not the app's."""
+    journaled: dict[str, float] = {}
+    estimated: dict[str, float] = {}  # of those, what the app journaled of `unreported`
+    for f in fills:
+        if f.side == Side.SELL and not is_other_client(f):
+            journaled[f.broker_order_id] = journaled.get(f.broker_order_id, 0.0) + f.qty
+            if f.exec_id.startswith(f"{UNREPORTED_EXIT}:"):
+                estimated[f.broker_order_id] = estimated.get(f.broker_order_id, 0.0) + f.qty
+    filled: dict[str, float] = {}
+    tags: dict[str, str] = {}
+    since = _aware(opened) - FILL_TIME_SKEW
+    for rec in rows_since(db, rows, since):
+        req = rec.request
+        if (
+            req.instrument.key != key
+            or req.side != Side.SELL
+            or (req.trace_id or "").startswith(WATCHDOG_TAG_PREFIX)
+            or not rec.broker_order_id
+            or rec.status == OrderStatus.REJECTED
+        ):
+            continue
+        filled[rec.broker_order_id] = max(filled.get(rec.broker_order_id, 0.0), rec.filled_qty)
+        tags[order_trace_id(rec.id, req.trace_id)] = rec.broker_order_id
+    for order, by_tag in [*((o, True) for o in working), *((o, False) for o in own)]:
+        req = order.request
+        if (
+            order.status not in OPEN_ORDER_STATUSES
+            or req.side != Side.SELL
+            or req.instrument.key != key
+            or (req.trace_id or "").startswith(WATCHDOG_TAG_PREFIX)
+        ):
+            continue
+        oid = tags.get(req.trace_id or "") if by_tag else order.broker_order_id
+        if oid and not oid.startswith(OTHER_CLIENT_PREFIX):
+            filled[oid] = max(filled.get(oid, 0.0), order.filled_qty)
+    for oid, qty in (seen or {}).items():
+        # What a close's cancels saw a sell of the app's had filled (`APP_SELLS_SEEN`).
+        if isinstance(qty, int | float) and not str(oid).startswith(OTHER_CLIENT_PREFIX):
+            filled[str(oid)] = max(filled.get(str(oid), 0.0), float(qty))
+    kept: dict[str, float] = {}
+    for oid, qty in (unreported or {}).items():
+        if isinstance(qty, int | float) and not str(oid).startswith(OTHER_CLIENT_PREFIX):
+            kept[str(oid)] = float(qty)
+    return sum(
+        max(
+            0.0,
+            filled.get(oid, 0.0) - journaled.get(oid, 0.0),
+            kept.get(oid, 0.0) - estimated.get(oid, 0.0),
+        )
+        for oid in {*filled, *kept}
+    )
+
+
+def app_sold_unjournaled(
+    db: Database,
+    key: str,
+    opened: datetime,
+    fills: Iterable[Fill],
+    *,
+    rows: Iterable[OrderRecord] | None = None,
+) -> bool:
     """A sell of the app's for this bot position the journal may not show yet: one still
     working (its fills may come), one that filled beyond what the journal shows of it, or
     one the engine stopped tracking before the journal showed all of it (its fill unknown).
@@ -581,7 +803,7 @@ def app_sold_unjournaled(db: Database, key: str, opened: datetime, fills: Iterab
     for f in own:
         journaled[f.broker_order_id] = journaled.get(f.broker_order_id, 0.0) + f.qty
     since = _aware(opened) - FILL_TIME_SKEW
-    for rec in db.list_orders_since(since):
+    for rec in rows_since(db, rows, since):
         req = rec.request
         if (
             req.instrument.key != key

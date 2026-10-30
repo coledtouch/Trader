@@ -54,13 +54,16 @@ from trader.ownership import (
     REST_SETTLED,
     WATCHDOG_TAG_PREFIX,
     app_entry_unjournaled,
+    app_sold_beyond_journal,
     app_sold_unjournaled,
     bought_since,
+    entry_held_unjournaled,
     entry_qty,
     for_sizing,
     is_other_client,
     less_sold,
     note_watchdog_sale,
+    order_rows,
     owner_evidence,
     read_extra,
     read_hidden,
@@ -373,6 +376,7 @@ class CryptoWatchdog:
         # A key no longer managed (sold, or not the bot's) starts its stop count afresh.
         keys = {p.instrument.key for p in managed}
         self._below_stop = {k: n for k, n in self._below_stop.items() if k in keys}
+        await self._keep_done_sales(metas, keys)
         marks = await self._marks(managed)
         # The broker answered: note when this connection came up (a gap of several polls
         # without a successful tick counts as an outage too, e.g. IBKR error 1100/1102).
@@ -394,9 +398,22 @@ class CryptoWatchdog:
         closes: list[Close] = []
         unknown: list[str] = []  # symbols to sell whose bot part is unknown
         self._unsure.clear()
+        rows: list[OrderRecord] | None = None  # the app's order rows: read once per poll
         for pos in managed:
             key = pos.instrument.key
-            own = await self._own_qty(key, metas[key], pos.qty, open_orders)
+            if not unhealthy and not killed:
+                # The app is alive: nothing is sold this poll, so the bot's part is not
+                # needed (only what this process's done sells filled is kept, for the app).
+                await self._sent_qty(key, metas[key])
+                continue
+            if rows is None:
+                starts = [
+                    opened
+                    for opened in (metas[p.instrument.key].get("opened_at") for p in managed)
+                    if isinstance(opened, datetime)
+                ]
+                rows = order_rows(self.db, min(starts)) if starts else []
+            own = await self._own_qty(key, metas[key], pos.qty, open_orders, rows)
             if own is not None and own <= QTY_EPS:
                 if key in self._unsure:
                     kind, _ = self._why(pos, metas[key], marks.get(key), unhealthy, flatten, killed)
@@ -487,7 +504,12 @@ class CryptoWatchdog:
             log.info("%s: sold flat by the watchdog; a later buy is not the bot's", key)
 
     async def _own_qty(
-        self, key: str, meta: dict[str, Any], held: float, open_orders: list[OrderRecord]
+        self,
+        key: str,
+        meta: dict[str, Any],
+        held: float,
+        open_orders: list[OrderRecord],
+        rows: list[OrderRecord],
     ) -> float | None:
         """Most this process may still sell of a bot position, or None (all of it, as
         before). With the owner's coins next to the bot's: the bot's part from the journal
@@ -496,7 +518,8 @@ class CryptoWatchdog:
         filled since, less what this process sent to sell of it, and never into the
         owner's journaled coins while an exit of the app's may have sold the bot's unseen.
         Part of the entry whose fill is unknown, with less held than both sides' units,
-        marks the key unsure (the owner is told)."""
+        marks the key unsure (the owner is told). `rows`: the app's order rows of this poll
+        (`order_rows`)."""
         opened = meta.get("opened_at")
         if not isinstance(opened, datetime):
             return None
@@ -526,10 +549,21 @@ class CryptoWatchdog:
         raw = split_fills(fills, entry=limit, entry_sent=opened, hidden=read_hidden(extra))
         if extra.get(REST_SETTLED):
             raw = dataclasses.replace(raw, unseen=0.0)  # the entry's rest is not held
+        # Of the entry's part no journaled fill shows, only what the broker (or the app)
+        # says may have filled beyond the journal is held: an entry still working that
+        # filled nothing, or one the app saw lapse, holds none of it, so the owner's coins
+        # bought since (no journaled fill shows them either) are never taken for it.
+        possible = entry_held_unjournaled(self.db, key, opened, fills, open_orders, rows=rows)
+        if possible is not None and raw.unseen > possible:
+            raw = dataclasses.replace(raw, unseen=max(0.0, possible))
         split = for_sizing(raw, extra)
+        # The app's own sells its order rows (or the broker, for one still working) say
+        # filled beyond the journal (the app went down before the journal caught up): those
+        # units of the bot's are sold, whatever is held now.
+        app_sold = app_sold_beyond_journal(self.db, key, opened, fills, open_orders, rows=rows)
         # More held than the bot can still hold once its known sales are off: bought since.
         filled = watchdog_filled(self.db, key, marker)
-        after = less_sold(split, filled[1]) if filled is not None else split
+        after = less_sold(split, (filled[1] if filled is not None else 0.0) + app_sold)
         if not owner_evidence(held, limit, split) and not bought_since(held, limit, after):
             return None
         if cut is not None:
@@ -539,11 +573,11 @@ class CryptoWatchdog:
         # The broker's word on the bot's entry beyond the journal (it filled while the app
         # was down): the bot's, even when the owner sold some of his meanwhile (less held
         # than both sides' journaled units would otherwise hide it).
-        late, unknown = app_entry_unjournaled(self.db, key, opened, fills, open_orders)
+        late, unknown = app_entry_unjournaled(self.db, key, opened, fills, open_orders, rows=rows)
         late = min(raw.unseen, late)
         if late > QTY_EPS:
             raw = dataclasses.replace(raw, bot=raw.bot + late, unseen=raw.unseen - late)
-        raw = less_sold(raw, sent)
+        raw = less_sold(raw, sent + app_sold)
         vanished = min(unknown, raw.unseen)
         known = raw.bot + raw.owner + raw.hidden
         if vanished > QTY_EPS and abs(held - (known + vanished)) > QTY_EPS:
@@ -555,7 +589,7 @@ class CryptoWatchdog:
         if cap is None:
             return None
         mine = min(cap.qty, held)
-        if held - cap.keep < mine and app_sold_unjournaled(self.db, key, opened, fills):
+        if held - cap.keep < mine and app_sold_unjournaled(self.db, key, opened, fills, rows=rows):
             # Less held than the bot's and the owner's journaled units: an exit of the
             # app's the journal never saw may have sold the bot's. Never the owner's.
             mine = held - cap.keep
@@ -598,6 +632,19 @@ class CryptoWatchdog:
             else:
                 total += float(qty)
         return total
+
+    async def _keep_done_sales(self, metas: dict[str, dict[str, Any]], managed: set[str]) -> None:
+        """A bot position no longer managed (sold flat, or read flat) still has its sells'
+        record kept as they finish: until every one of them is done, the app takes another
+        client's sells since the first as maybe this process's own, with no end."""
+        for key, meta in metas.items():
+            rec = read_sales_record(self.db, key, position_marker(meta))
+            if (
+                key not in managed
+                and rec is not None
+                and set(rec["orders"]) - set(rec.get("done", []))
+            ):
+                await self._sent_qty(key, meta)
 
     def _forget_sold(self, key: str) -> None:
         self._sold.pop(key, None)

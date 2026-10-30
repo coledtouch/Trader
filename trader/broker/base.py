@@ -230,6 +230,7 @@ class Broker(ABC):
         max_qty: float | None = None,
         keep: float = 0.0,
     ) -> OrderRecord | None:
+        self._sells_seen[instrument.key] = {}  # what this close's own look sees, only
         if max_qty is not None and max_qty <= 1e-9:
             return None  # nothing to sell: never cancel the stop of a held position
         positions = {p.instrument.key: p for p in await self.positions()}
@@ -259,6 +260,7 @@ class Broker(ABC):
                         continue  # still working: never counted as a stop to put back
                     if order.request.side == Side.SELL:
                         filled_before[order.broker_order_id] = order.filled_qty
+                        self._saw_sell(instrument, order.broker_order_id, order.filled_qty)
                     await self.cancel_order(order.broker_order_id)
                     cancelled.add(order.broker_order_id)
                     if order.request.side == Side.SELL and order.request.stop_loss is not None:
@@ -266,6 +268,7 @@ class Broker(ABC):
             if pos is None or pos.qty <= 0:
                 return None
             working = await self.open_orders()
+            now_held = held
             if max_qty is not None:
                 # A bracket child may have filled during the cancels: size again on a fresh
                 # read, so the sell never reaches the owner's units.
@@ -277,25 +280,33 @@ class Broker(ABC):
                     ),
                     0.0,
                 )
-                # What this app's own sells (a bracket child) filled during the cancels
-                # came out of the bot's units, whatever the read shows (it may lag them,
-                # or an earlier lag may have caught up).
-                sold = 0.0
-                for oid, before in filled_before.items():
-                    done = await self.order_status(oid)
-                    if done is not None:
-                        sold += max(0.0, done.filled_qty - before)
+            # What this app's own sells (a bracket child) filled during the cancels came
+            # out of the bot's units, whatever the read shows (it may lag them, or an
+            # earlier lag may have caught up). Without a cap too: neither the sell nor a
+            # stop put back for a refused one is sized from the read before the cancels
+            # (such a stop would sell units bought since, the owner's).
+            sold = await self._sold_during_cancels(instrument, filled_before)
+            if max_qty is not None:
                 qty = self._capped(instrument, now_held, max(0.0, max_qty - sold), keep)
-                if qty <= 1e-9:
-                    return None
-                req = req.model_copy(update={"qty": qty})
+            else:
+                qty = self._capped(instrument, held, held - sold, 0.0)
+            if qty <= 1e-9:
+                return None
+            req = req.model_copy(update={"qty": qty})  # last: nothing after it raises
         except BrokerError:
             # A stop may already be cancelled (here, or by flatten_all's cancel_all): never
             # leave a held position without it, nor with two (a stop next to another sell
-            # or stop of this app's could sell the shares twice).
+            # or stop of this app's could sell the shares twice). `req` is still sized
+            # from the read before the cancels: the stop covers what is left of it.
             if stops and pos is not None and pos.qty > 0:
                 if not await self._covered(instrument, cancelled):
-                    await self._put_stop_back(req, max(stops))
+                    try:
+                        left = req.qty - await self._sold_during_cancels(instrument, filled_before)
+                    except BrokerError:
+                        left = req.qty
+                    left = self._capped(instrument, req.qty, left, 0.0)
+                    if left > 1e-9:
+                        await self._put_stop_back(req.model_copy(update={"qty": left}), max(stops))
             raise
         # Another close of this app (a monitor exit, KILL, an approved close) may have sent
         # its market sell while this one was cancelling: never send a second one (a short).
@@ -365,6 +376,34 @@ class Broker(ABC):
         if errors:
             raise PartialFlattenError("; ".join(errors), results)
         return results
+
+    @property
+    def _sells_seen(self) -> dict[str, dict[str, float]]:
+        return self.__dict__.setdefault("_sells_seen_by_key", {})
+
+    def _saw_sell(self, instrument: Instrument, oid: str, filled: float) -> None:
+        """A close saw this app's sell `oid` had filled `filled` (kept for `sells_seen`)."""
+        seen = self._sells_seen.setdefault(instrument.key, {})
+        seen[oid] = max(seen.get(oid, 0.0), filled)
+
+    def sells_seen(self, instrument: Instrument) -> dict[str, float]:
+        """What this app's sells of `instrument` (by broker id) were seen to have filled by
+        the last close's cancels, before and during them (a bracket child has no order
+        row): taken once."""
+        return self._sells_seen.pop(instrument.key, {})
+
+    async def _sold_during_cancels(
+        self, instrument: Instrument, filled_before: dict[str, float]
+    ) -> float:
+        """What this app's sells listed before a close's cancels (by broker id, with what
+        each had filled then) filled since."""
+        sold = 0.0
+        for oid, before in filled_before.items():
+            done = await self.order_status(oid)
+            if done is not None:
+                self._saw_sell(instrument, oid, done.filled_qty)
+                sold += max(0.0, done.filled_qty - before)
+        return sold
 
     def _capped(self, instrument: Instrument, held: float, max_qty: float, keep: float) -> float:
         raw = min(max_qty, held - keep)

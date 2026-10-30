@@ -35,7 +35,7 @@ from trader.models import (
     Side,
     TradeAction,
 )
-from trader.ownership import EXTRA_PREFIX, REST_SETTLED, split_fills
+from trader.ownership import EXTRA_PREFIX, REST_SETTLED, Cap, split_fills
 from trader.timeutil import trading_day, trading_day_start
 from trader.watchdog import CryptoWatchdog, sold_by_watchdog
 
@@ -562,8 +562,9 @@ def test_a_sale_in_the_watchdogs_window_never_credits_the_bot_over_its_entry() -
 async def test_an_unreported_target_sale_never_lets_close_sell_his_shares(db, config) -> None:
     """Wednesday, the app down from the bot's entry on: the entry fills 24 F, its target
     sells 14 of them and the owner buys 24; he sells 12 just after midnight (the only fill
-    Thursday's executions show). Thursday the target sells the bot's last 10 and he buys 10
-    more: all 22 held are his, and Close sells none of them."""
+    Thursday's executions show). Thursday the bot's Close sells only its 10; instead the
+    target sells them and he buys 10 more: all 22 held are his. The bot's trade is
+    journaled in full (Wednesday's 14 at an estimate) and none of his is sold."""
     h = await harness(db, config, now=datetime(2026, 10, 28, 15, 0, tzinfo=UTC), mode=Mode.PAPER,
                       exits={"time_stop_minutes": 0})  # fmt: skip
     entry, total = await _resting_entry(h)
@@ -579,16 +580,18 @@ async def test_an_unreported_target_sale_never_lets_close_sell_his_shares(db, co
     owner_sells(h, F, 12, 10.3)
     h.engine = _restart_next_morning(h, config)
     await ticks(h, 3, seconds=15)
+    assert await h.engine._bot_cap(F) == Cap(qty=10, keep=12)
     h.clock.advance(minutes=1)
     _part(h.broker, f"{entry}-TP", 10, 10.5)
     stop.status = OrderStatus.CANCELLED  # OCA: the target filled, the stop is cancelled
     owner_buys(h, F, 10, 10.5)
     await ticks(h, 4, seconds=15)
     assert h.broker.pos["STK:F"][0] == 22
-    with pytest.raises(ValueError, match="none of the 22 F held is the bot's"):
-        await h.engine.close_position("STK:F")
-    assert h.broker.pos["STK:F"][0] == 22
     assert bot_sells(h, "STK:F") == []
+    trades = db.list_trades()
+    assert sorted(t.qty for t in trades) == [10, 14]
+    assert all(t.exit_price == 10.5 for t in trades)
+    assert db.get_position_meta("STK:F") is None  # none of what is held is the bot's
 
 
 async def test_his_sale_seen_first_after_a_restart_is_never_a_bot_trade(db, config) -> None:
